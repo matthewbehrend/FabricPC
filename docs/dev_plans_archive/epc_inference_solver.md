@@ -11,14 +11,15 @@ Along the way it fixes two latent defects the design exposed: (1) `InferenceBase
 ePC solves the DAG; state-based PC (sPC, today's settling path) refines around cycles; a cycle can instead be unrolled into ePC's own graph. Both cycle paths are built this quarter. Symbols: `T` = settling ticks per update in sPC alone, `T1` = ePC steps, `T2` = sPC refinement steps, `U` = unrolled cycle traversals, `(H)` = a Hopfield (recurrent) node.
 
 **1 — Composable inference schedule.** Solvers are schedule entries composed per weight update, not trainer modes:
-
+While sPC optimizes the exact graph as-is, ePC is a warm-started approximation of the energy minimization on cyclic graphs. Even with unrolling of the cycles, ePC is an approximation of the graph to the extent of the unrolling. For arbitrary graphs, is warm start with ePC helpful, and at what depth? Experiments are needed to form user guidance on choice of inference suited to the graph architecture.
 ```
 schedule = [ ePC(T1), sPC(T2), WeightUpdate ]
 
 clamp ──► ePC: T1 steps ──► sPC: T2 steps ──────────► weight update ──► next batch
           solves the DAG,   minimizes full-graph
           back-edges        energy, back-edges in;
-          excluded          warm-started from ePC's solution
+          excluded or       warm-started from ePC's solution
+          unrolled
 ```
 
 **2 — Where the error lives.** From a feedforward start, sPC moves error one hop per tick with per-hop damping: after `T` ticks the error profile decays exponentially from the output clamp and deep layers have seen almost nothing. ePC pushes the output error through the full depth in every step, so ~5 steps leave signal at every layer. What remains is the residual the back-edges introduce; it enters at the cycle, diffuses a few local hops per sPC tick, and the Hopfield node falls onto its fixed-point attractor within a few iterations:
@@ -48,7 +49,11 @@ a ──► b ──► c ──► d              a ──► b₀ ──► c�
       └─────┘                    the back-edge c→b becomes the feedforward edge c₀→b₁
 ```
 
-Which path for cyclic graphs is settled by cycle depth in a particular topology and comparative refine-vs-unroll measurements.
+Implementation is PC-faithful:
+- Errors are tied between unrolled cycles by construction: the relaxed pytree in `EPCInference.forward_value_and_grad` keys ε by node name (one leaf per node), `GraphState` carries one `NodeState` per node, and `forward_from_error` re-injects the carried `state.error` on every visit. The numbered subscripts illustrate repeated forward passes through a node (e.g. b0 and b1) while the same error_b term is injected to each.
+- Because each visit overwrites the node's single `NodeState`, node *i*'s energy term enters the total E once, evaluated at the final visit's derived state. E is therefore the cyclic graph's own Σ_i E_i evaluated at the U-traversal derived point — not a sum over unroll copies.
+
+Which inference schedule for cyclic graphs is settled by cycle depth in a particular topology and comparative refine-vs-unroll measurements. There's also a middle ground of unrolled ePC + sPC that is also possible with the composable solvers. Depth of the cycles will be meaningful to both inference solvers as it impacts sPC signal decay and ePC unrolling cost. 
 
 
 ## Formulation
@@ -60,13 +65,13 @@ sPC relaxes z_latent with ε derived (`error = z_latent − z_mu`, recomputed in
 Node partition in ePC (computed at trace time from static structure + clamp keys):
 - **clamped, in_degree > 0**: z_latent stays the clamp; `forward()` refreshes z_mu/error/energy; `energy(clamp, z_mu)` is the output loss; gradient reaches upstream ε through z_mu.
 - **in_degree == 0, clamped** (data/token sources): untouched constants, never differentiated (int dtypes stay out of the AD pytree).
-- **in_degree == 0, unclamped** (top-down priors): z_latent itself is the relaxed variable (the bijection covers only predicted nodes); enters the AD pytree under `"z_latent"`; its self-energy E(z, z) is excluded from the differentiated total, matching sPC's branch-1 zero self-grad. Gradient arrives through downstream z_mu.
-- **out_degree == 0, unclamped** (eval readout): ε frozen at 0, z_latent ← z_mu, energy 0 — byte-for-byte the existing `nodes/base.py:514-529` semantics.
+- **in_degree == 0, unclamped** (top-down priors): Computes z_latent = z_mu + error for this node like other nodes. Initialize z_latent from distribution and then z_mu ← z_latent. This provides the same pattern of initial error=0 in feed-forward initializtion without forcing z_latent=0. Unclamped terminal input nodes are typically intedned to be initialized from a distribution rather than inputting zeros to the network.
+- **out_degree == 0, unclamped** (eval readout): ε reamins a 0 in absence of a gradient, z_latent ← z_mu, Forcing error=0 and energy=0 is too strong an assumption (breaks hopfield output nodes) - relax it in `nodes/base.py:514-529` where it originated.
 - **all others**: ε-relaxed.
 
 At ε = 0 the derived states equal `FeedforwardStateInit`'s output, so the paper's zero-init is the existing default initializer for free.
 
-muPC: `scale_inputs` applies inside the differentiated forward exactly where the sPC loop applies it, and the global AD supplies the chain-rule factors automatically. The gradient preconditioners (`jacobian_gain` in `topdown_grad_scale`, `self_grad_scale`) are per-hop conditioners targeting the signal decay ePC eliminates; they are deliberately not replicated (decided; documented on `EPCInference`). `scale_weight_grads` at learning time is untouched.
+muPC: `scale_inputs` applies inside the differentiated forward exactly where the sPC loop applies it, and the global AD supplies the chain-rule factors automatically. The gradient preconditioners (`jacobian_gain` in `topdown_grad_scale`, `self_grad_scale`) are per-hop conditioners for sPC; they are deliberately not replicated in ePC which is a global backward pass (decided; documented on `EPCInference`). `scale_weight_grads` at learning time is untouched.
 
 Cyclic graphs: the forward-from-errors pass iterates `structure.schedule` (below). Repeated visits of a cycle member recompute z_mu from the latest source latents and re-derive z_latent with the *same* ε — ePC on the unrolled network with tied errors; the single AD pass differentiates through all repeats. StorkeyHopfield needs no special handling: its z_mu comes purely from the input probe and its self-recurrence enters only through the Hopfield energy term on its own z_latent, which the derived forward evaluates at z_mu + ε (verified against `nodes/storkey_hopfield.py:333-419`).
 
@@ -173,10 +178,12 @@ Tracking (`inference_tracking.py`): both variants iterate `structure.config["inf
 
 ## Component 6 — Benchmark: ePC vs sPC on resnet18/CIFAR-10
 
+Both wall-clock comparisons read off one sweep of T1 — ePC inference steps per minibatch (`infer_steps`), against sPC's `--spc_steps` inference steps per minibatch. All arms train the same `--num_epochs`, so each arm is one point (total training wall-clock, final test accuracy) and the T1 grid — not training checkpoints — sets the granularity of the time axis.
+
 - `examples/resnet18_cifar10_demo.py`: `build_resnet18(...)` takes a required `inference: InferenceBase` replacing the `infer_steps`/`eta_infer` kwargs and the hardcoded `InferenceSGDNormClip` (:321-323); migrate `_create_mupc_model` and `run_single_mupc` (CLI behavior and docstring reference numbers unchanged).
-- New `examples/epc_spc_resnet18_compare.py` (importlib load of the demo builder, per `examples/PC_backprop_compare.py:52-58`). CLI: `--mode {paired,convergence}`, `--n_trials 3`, `--num_epochs 2`, `--batch_size 256`, `--spc_steps 120`, `--spc_eta 0.1`, `--epc_steps 10`, `--epc_eta 0.1`, `--lr`, `--weight_decay`, `--track_steps 120`.
-  - **paired** (default, decided): `ABExperiment` with arms `ePC-{steps}` / `sPC-{steps}` sharing `train_pcn`/`evaluate_pcn`, one adamw warmup-cosine optimizer built from `num_epochs * len(train_loader)`, `data_loader_factory` seeding `Cifar10Loader` per trial; `print_summary()` gives paired t-test, Cohen's d, wall-clock/epoch ratio. n=3 ≈ 1 h on the reference 3090; ePC 10 steps vs sPC 120 is simultaneously the equal-epochs and near-equal-wall-clock comparison.
-  - **convergence** (single seed, no training): identical params/initial state for both solvers on one test batch; `run_inference_with_history` per solver; report energy-vs-step, sPC final energy E*, ePC steps-to-reach ≤ E*, and post-warmup per-step wall-clock.
+- New `examples/epc_spc_resnet18_compare.py` (importlib load of the demo builder, per `examples/PC_backprop_compare.py:52-58`). CLI: `--mode {sweep,convergence}` (default `sweep`), `--n_trials 3`, `--num_epochs 2`, `--batch_size 256`, `--spc_steps 120`, `--spc_eta 0.1`, `--epc_eta 0.1`, `--lr`, `--weight_decay`, `--epc_step_sweep 1,2,3,4,5,6,7,8,9,10,16,32,64,128`, `--track_steps 120`.
+  - **sweep** (default) — one `PlannedMultiContrastExperiment` with an arm per T1 in `--epc_step_sweep` plus an sPC-`{spc_steps}` baseline arm, empty contrast family (the runner supplies the paired trial loop; `TrialResult.metric_value`/`train_time` already carry everything needed), all arms at the same `--num_epochs` and each arm's adamw warmup-cosine schedule from `num_epochs × len(train_loader)`. Grid: dense 1–10 where accuracy moves fastest, log-spaced 16–128 above; 128 > `spc_steps` so sPC's wall-clock lands inside the ePC time range (if ePC-128 still finishes faster than sPC-120, extend the grid — the interpolation needs the sPC time point bracketed). Derived per-trial metrics: (i) **accuracy at equal wall-clock** — linear interpolation of the trial's ePC (train_time, accuracy) points at the trial's sPC train_time; (ii) **wall-clock to equal accuracy** — the smallest-T1 arm whose accuracy ≥ the trial's sPC accuracy, reporting its train_time and the ratio to sPC's. Paired t-test and Cohen's d on both across trials via `fabricpc.experiments.statistics` (`paired_ttest`, `cohens_d`). Chart (plotly, output convention of `examples/scaling/scaling_analysis_plots.py:943-950`): x = T1 on a log axis; top panel y = final test accuracy with mean ± SE error bars over trials and the sPC baseline as a horizontal line with SE band; bottom panel y = total training wall-clock per arm with sPC's as the horizontal reference — the equal-wall-clock crossing and the time-to-equal-accuracy gap are both readable off the two panels. Written to `epc_step_sweep.html` (+ `.png` when kaleido is installed, matching the scaling script's guard). Cost: per-minibatch inference steps summed across arms = 295 (ePC grid) + 120 (sPC) ≈ 3.5× a lone sPC-120 run per trial; n=3 ≈ 3 h on the reference 3090.
+  - **convergence** (single seed, no training): identical params/initial state for both solvers on one test batch; `run_inference_with_history` per solver. Reports **per-node** energy-vs-step, not the global sum: total energy is dominated by output-adjacent nodes (the energy imbalance reported in Pinchetti et al.'s PC benchmarking paper, arXiv 2407.01163), so a global curve can read as sPC near-convergence while deep nodes have received no gradient signal. Plot: log10 per-node energy vs step, one line per node colored by schedule depth, side-by-side sPC/ePC panels (per-node series come directly from the per-step history dicts). The global sum is retained for exactly one purpose: **E\*** = sPC's final total energy, with ePC's steps-to-reach ≤ E\* as the head-to-head criterion. Also reports post-warmup per-step wall-clock for both solvers and their ratio — the direct measurement of the per-step cost multiple.
 
 ## File-by-file change list
 
@@ -200,15 +207,23 @@ Sequencing: (1) dispatch refactor + tracking segments + test migrations — pure
 1. `pytest tests/` green at each sequencing step.
 2. `python examples/mnist_cyclic_graph.py` runs with the explicit `UnrolledCycleScheduler` and trains.
 3. `python examples/resnet18_cifar10_demo.py` (unchanged defaults) reproduces the documented single-run behavior.
-4. `python examples/epc_spc_resnet18_compare.py --mode convergence` — energy-vs-step curves and steps-to-equal-energy on one batch (minutes).
-5. `python examples/epc_spc_resnet18_compare.py --mode paired --n_trials 3` (~1 h on the reference 3090) — paired accuracy/time comparison; paste the results table into the script docstring per house convention.
+4. `python examples/epc_spc_resnet18_compare.py --mode convergence` — per-node energy-vs-step panels, ePC steps-to-reach ≤ E*, and measured post-warmup per-step wall-clock for both solvers, on one batch (minutes).
+5. `python examples/epc_spc_resnet18_compare.py --mode sweep --n_trials 3` (~3 h on the reference 3090) — accuracy-vs-T1 chart written to `epc_step_sweep.html`/`.png`, plus paired accuracy-at-equal-wall-clock and wall-clock-to-equal-accuracy tables; paste the tables into the script docstring per house convention.
 
-## Decisions taken (user-confirmed 2026-08-14)
+## Decisions taken
+
+User-confirmed 2026-08-14:
 
 1. Default `DAGScheduler` raises `GraphCycleError` on cyclic graphs, directing users to select a cycle-capable scheduler explicitly even for a degenerate single-visit schedule.
 2. New `NodeBase.forward_from_error` sibling method (not a mode on `forward_and_latent_grads`).
 3. ePC applies muPC forward scaling only; gradient preconditioners are not replicated.
-4. Benchmark defaults: paired n_trials=3 plus convergence mode.
+4. Benchmark defaults: n_trials=3; `sweep` and `convergence` modes (revised 2026-08-18, below).
+
+Benchmark revisions, user-directed 2026-08-18:
+
+5. No step-count/wall-clock equivalence is assumed between ePC and sPC. Per-step costs are close (a reference torch ePC ran ~20% slower per step than sPC), so ePC's ~10× fewer steps make it far cheaper per weight update, not wall-clock-equal at 10-vs-120 steps. The benchmark measures wall-clock and compares accuracy at equal measured wall-clock (primary), plus wall-clock to reach equal accuracy.
+6. Convergence mode reports energy per node, not only globally: the global sum is dominated by output-adjacent nodes (the energy imbalance in Pinchetti et al.'s PC benchmarking, arXiv 2407.01163), which can read as sPC near-convergence while deep nodes have received no gradient signal. The global E* is retained solely as the ePC steps-to-threshold criterion.
+7. The T1 sweep is the benchmark's time axis. T1 = ePC inference steps per minibatch; each T1 trained at fixed `--num_epochs` is one (total wall-clock, final accuracy) point, so the grid `1,2,…,10,16,32,64,128` — not training checkpoints — sets the time-axis granularity, and both wall-clock comparisons interpolate along the sweep. The sweep chart is task performance across the full grid against the sPC baseline.
 
 ## Alternatives considered
 
@@ -219,3 +234,4 @@ Sequencing: (1) dispatch refactor + tracking segments + test migrations — pure
 - **Schedule location**: chosen new `schedule` field beside `node_order` (each consumer takes the semantically right projection; logging readers untouched; muPC misuse blocked by dup-raise). Rejected: replace `node_order` (every one-visit consumer must dedup); stash in `structure.config` (core topology data stringly-typed).
 - **Unroll algorithm**: chosen Tarjan SCC + Kahn-on-condensation + entry-first intra-SCC BFS (minimal schedule length, exact DAG equality, deterministic). Rejected: repeat full sweep K times (multiplies ePC forward cost on the acyclic majority); feedback-arc-set removal (back edges never carry information, fails the requirement).
 - **Node energy at derived point**: chosen second `forward()` call (CSE-deduped). Rejected: `energy_functional` directly (silently drops in-forward energy terms like StorkeyHopfield's); splitting the node contract into predict()/energy() (whole-node-class migration, out of scope).
+- **Equal-wall-clock mechanism**: chosen the T1 sweep as the time axis — every arm trains the same `--num_epochs`, each T1 yields one (total wall-clock, final accuracy) point, both comparisons interpolate along the sweep, and `TrialResult.metric_value`/`train_time` already carry all the data. Rejected: per-epoch checkpoint curves with budget-matched epoch counts (ties the time axis to checkpoint/minibatch cadence, which is not the quantity under study, and needs a calibration pass plus a `TrialResult` extension); wall-clock stopping rule inside `train_pcn` (perturbs the shared trainer for one benchmark; nondeterministic epoch boundaries break trial pairing and warmup-cosine schedule construction); assumed step-count parity between ePC-10 and sPC-120 (struck 2026-08-18 — per-step costs are close, so the ratio must be measured); bespoke trial loop in the compare script (duplicates `PlannedMultiContrastExperiment`'s pairing-by-seed machinery).
