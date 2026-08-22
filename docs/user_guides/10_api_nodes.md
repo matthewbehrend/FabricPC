@@ -2,6 +2,17 @@
 
 All node types extend `NodeBase` from `fabricpc.nodes.base`.
 
+## The node contract
+
+A node implements two computation methods:
+
+- **`predict(params, inputs, state, node_info) -> (z_mu, aux)`** — all parameterized computation: the prediction `z_mu` (shape `(batch,) + node_info.shape`) plus `aux`, an arbitrary pytree of intermediates for `energy()` (`None` if unused). `predict` may read the node's own `state`, but under `EPCInference` the state carries the previous step's values, so `z_mu` is always evaluated at the carried state.
+- **`energy(params, inputs, state, aux, node_info) -> (batch,)`** — per-sample energy at `(state.z_latent, state.z_mu)`. The default scores the node's energy functional; override to add terms (`StorkeyHopfield`'s attractor term).
+
+Everything else is base-owned and **not an override point**: the error pair (`pair_error`: `error = z_latent - z_mu`; `pair_latent`: `z_latent = z_mu + error` — one volume-preserving bijection shared by both inference parameterizations) and the assembly templates `forward` (predict → pair → energy), `forward_with_aux` (also surfacing `aux`), and `forward_from_error` (the ePC derive direction). Source nodes (`in_degree == 0`) never reach `predict`: the templates mirror `z_mu <- z_latent` (cast to `z_mu`'s float dtype) with zero error.
+
+**The aux pattern.** aux carries intermediates that depend only on `params` and `inputs`: `Linear` returns its `pre_activation` (consumed by `LinearExplicitGrad`'s analytic gradients); `StorkeyHopfield` returns its prepared `(W, strength)`. An energy term that needs the node's own `z_latent` reads `state.z_latent` inside `energy()` — the `StorkeyHopfield` attractor term is the worked example. **The anti-pattern**: an aux entry computed from `state.z_latent` in `predict`. aux is snapshotted at `predict` time — under ePC, before `z_latent` is derived — so such an entry freezes the carried latent into an energy otherwise evaluated at the derived latent, and the two solvers minimize different energies. See the [Writing Custom Nodes guide](06_custom_nodes.md#the-aux-pattern).
+
 ## Linear
 
 `fabricpc.nodes.Linear`

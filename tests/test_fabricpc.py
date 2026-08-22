@@ -15,7 +15,7 @@ from fabricpc.core.types import NodeState, NodeParams, GraphState
 from fabricpc.core.learning import compute_local_weight_gradients
 from fabricpc.graph_initialization import initialize_params
 from fabricpc.graph_initialization.state_initializer import initialize_graph_state
-from fabricpc.core.inference import InferenceSGD
+from fabricpc.core.inference import InferenceSGD, run_inference
 import optax
 from fabricpc.training import make_train_step
 from fabricpc.nodes import Linear
@@ -560,3 +560,100 @@ class TestFractionalEpochs:
 
         assert len(iters_half) < len(iters_full)
         assert len(iters_half) == 1  # 0.5 * 2 batches = 1 batch
+
+
+class TestUnclampedReadoutRelaxation:
+    """Regression for the deleted readout-forcing branch: an unclamped
+    out_degree == 0 node takes the ordinary relaxation path — error =
+    z_latent - z_mu, energy as forward() assigns, latent_grad not forcibly
+    zeroed — and predictions still read z_mu."""
+
+    def _readout_graph(self):
+        inp = IdentityNode(shape=(6,), name="inp")
+        hidden = Linear(shape=(8,), activation=TanhActivation(), name="hidden")
+        readout = Linear(shape=(4,), name="readout")
+        return graph(
+            nodes=[inp, hidden, readout],
+            edges=[
+                Edge(source=inp, target=hidden.slot("in")),
+                Edge(source=hidden, target=readout.slot("in")),
+            ],
+            task_map=TaskMap(x=inp, y=readout),
+            inference=InferenceSGD(eta_infer=0.05, infer_steps=5),
+        )
+
+    def test_readout_keeps_error_and_latent_grad(self, rng_key):
+        structure = self._readout_graph()
+        params = initialize_params(structure, rng_key)
+        batch_size = 4
+        x = jax.random.normal(rng_key, (batch_size, 6))
+        clamps = {"inp": x}  # readout unclamped: evaluation mode
+
+        state = initialize_graph_state(
+            structure, batch_size, rng_key, clamps, params=params
+        )
+
+        # Direct contract check: forward_and_latent_grads does not modify
+        # latent_grad — a sentinel value must survive.
+        info = structure.nodes["readout"].node_info
+        sentinel = jnp.full((batch_size, 4), 3.25)
+        readout_state = state.nodes["readout"]._replace(
+            z_latent=jax.random.normal(jax.random.PRNGKey(3), (batch_size, 4)),
+            latent_grad=sentinel,
+        )
+        inputs = {info.in_edges[0]: state.nodes["hidden"].z_latent}
+        new_state, _, self_grad = Linear.forward_and_latent_grads(
+            params.nodes["readout"], inputs, readout_state, info, is_clamped=False
+        )
+        assert jnp.array_equal(new_state.latent_grad, sentinel)
+        # Error and energy are the ordinary pair, not forced to zero.
+        assert jnp.allclose(new_state.error, readout_state.z_latent - new_state.z_mu)
+        assert not jnp.allclose(new_state.energy, 0.0)
+        # The readout receives its own relaxation gradient.
+        assert not jnp.allclose(self_grad, 0.0)
+
+        # End to end: predictions still read z_mu, and the readout keeps the
+        # error invariant after inference.
+        final_state = run_inference(params, state, clamps, structure)
+        readout_final = final_state.nodes["readout"]
+        assert jnp.allclose(
+            readout_final.error, readout_final.z_latent - readout_final.z_mu
+        )
+        assert not jnp.any(jnp.isnan(readout_final.z_mu))
+
+    def test_storkey_hopfield_readout_settles_on_attractor(self, rng_key):
+        from fabricpc.nodes import StorkeyHopfield
+
+        probe = IdentityNode(shape=(6,), name="probe")
+        hop = StorkeyHopfield(
+            shape=(6,), name="hop", hopfield_strength=2.0, use_bias=False
+        )
+        structure = graph(
+            nodes=[probe, hop],
+            edges=[Edge(source=probe, target=hop.slot("in"))],
+            task_map=TaskMap(x=probe, y=hop),
+            inference=InferenceSGD(eta_infer=0.05, infer_steps=10),
+        )
+        params = initialize_params(structure, rng_key)
+        batch_size = 4
+        x = jax.random.normal(rng_key, (batch_size, 6))
+        clamps = {"probe": x}
+
+        state = initialize_graph_state(
+            structure, batch_size, rng_key, clamps, params=params
+        )
+        init_latent = state.nodes["hop"].z_latent
+        final_state = run_inference(params, state, clamps, structure)
+        hop_final = final_state.nodes["hop"]
+
+        # The attractor energy term survives (previously forced to 0) and
+        # differs from the pure PC term.
+        energy_obj = structure.nodes["hop"].node_info.energy
+        pc_energy = type(energy_obj).energy(
+            hop_final.z_latent, hop_final.z_mu, energy_obj.config
+        )
+        assert not jnp.allclose(hop_final.energy, pc_energy)
+        # The readout relaxed (previously pinned to z_mu each step by the
+        # forcing branch).
+        assert not jnp.allclose(hop_final.z_latent, init_latent)
+        assert not jnp.any(jnp.isnan(hop_final.z_latent))

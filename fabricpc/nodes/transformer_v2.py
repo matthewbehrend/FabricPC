@@ -83,12 +83,12 @@ class EmbeddingNode(NodeBase):
         return NodeParams(weights=weights, biases={})
 
     @staticmethod
-    def forward(
+    def predict(
         params: NodeParams,
         inputs: Dict[str, jnp.ndarray],
         state: NodeState,
         node_info: NodeInfo,
-    ) -> NodeState:
+    ) -> Tuple[jnp.ndarray, None]:
         edge_key = list(inputs.keys())[0]
         indices = inputs[edge_key]
 
@@ -99,12 +99,7 @@ class EmbeddingNode(NodeBase):
         # Source-node clamps now propagate dtype through state init, so callers
         # should clamp with int (e.g. jnp.int32), not float.
         z_mu = params.weights["embeddings"][indices]
-
-        error = state.z_latent - z_mu
-        state = state._replace(z_mu=z_mu, error=error)
-
-        state = node_info.node_class.energy_functional(state, node_info)
-        return state
+        return z_mu, None
 
     @staticmethod
     def forward_and_latent_grads(params, inputs, state, node_info, is_clamped=False):
@@ -193,7 +188,7 @@ class MhaResidualNode(NodeBase):
         return NodeParams(weights, biases)
 
     @staticmethod
-    def forward(params, inputs, state, node_info):
+    def predict(params, inputs, state, node_info):
         x = inputs[next(k for k in inputs if k.endswith(":in"))]
         skip_key = next((k for k in inputs if k.endswith(":skip")), None)
         skip = inputs[skip_key] if skip_key else x
@@ -234,11 +229,7 @@ class MhaResidualNode(NodeBase):
         mha = proj(mha, "W_o", "b_o")
 
         z_mu = skip + mha
-        error = state.z_latent - z_mu
-
-        state = state._replace(z_mu=z_mu, error=error)
-        state = node_info.node_class.energy_functional(state, node_info)
-        return state
+        return z_mu, None
 
 
 # ==============================================================================
@@ -291,18 +282,14 @@ class LnMlp1Node(NodeBase):
         return NodeParams(weights, biases)
 
     @staticmethod
-    def forward(params, inputs, state, node_info):
+    def predict(params, inputs, state, node_info):
         x = inputs[list(inputs.keys())[0]]
         x_norm = layernorm(x, params.weights["ln_gamma"], params.biases["ln_beta"])
         h = jnp.dot(x_norm, params.weights["W_ff1"]) + params.biases["b_ff1"]
 
         act_obj = node_info.activation
         z_mu = type(act_obj).forward(h, act_obj.config)
-
-        error = state.z_latent - z_mu
-        state = state._replace(z_mu=z_mu, error=error)
-        state = node_info.node_class.energy_functional(state, node_info)
-        return state
+        return z_mu, None
 
 
 # ==============================================================================
@@ -352,17 +339,13 @@ class Mlp2ResidualNode(NodeBase):
         return NodeParams(weights, {"b_ff2": jnp.zeros((embed_dim,))})
 
     @staticmethod
-    def forward(params, inputs, state, node_info):
+    def predict(params, inputs, state, node_info):
         mlp1_in = next(val for key, val in inputs.items() if key.endswith(":in"))
         res_in = next(val for key, val in inputs.items() if key.endswith(":residual"))
 
         mlp2 = jnp.dot(mlp1_in, params.weights["W_ff2"]) + params.biases["b_ff2"]
         z_mu = res_in + mlp2
-
-        error = state.z_latent - z_mu
-        state = state._replace(z_mu=z_mu, error=error)
-        state = node_info.node_class.energy_functional(state, node_info)
-        return state
+        return z_mu, None
 
 
 # ==============================================================================
@@ -409,14 +392,10 @@ class VocabProjectionNode(NodeBase):
         return NodeParams(weights, {"b_out": jnp.zeros((vocab,))})
 
     @staticmethod
-    def forward(params, inputs, state, node_info):
+    def predict(params, inputs, state, node_info):
         x = inputs[list(inputs.keys())[0]]
         logits = jnp.dot(x, params.weights["W_out"]) + params.biases["b_out"]
 
         act_obj = node_info.activation
         z_mu = type(act_obj).forward(logits, act_obj.config)
-
-        error = state.z_latent - z_mu
-        state = state._replace(z_mu=z_mu, error=error)
-        state = node_info.node_class.energy_functional(state, node_info)
-        return state
+        return z_mu, None

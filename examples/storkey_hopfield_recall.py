@@ -134,9 +134,11 @@ class HopfieldRecallLoader:
 def build_recall_graph(D, hopfield_strength=1.0, infer_steps=20, eta_infer=0.05):
     """Build 3-node recall graph: probe -> hopfield -> output.
 
-    The StorkeyHopfield node must be an internal node (not the output node)
-    so that its full energy + gradient computation runs during unclamped
-    inference. See base.py:382-400.
+    An unclamped readout now takes the ordinary relaxation path (error =
+    z_latent - z_mu, energy as the node assigns), so a StorkeyHopfield
+    readout would also settle onto its attractor. This graph keeps the
+    Hopfield node internal with a separate output node so recall quality is
+    read from a plain projection of the settled attractor state.
     """
     probe = IdentityNode(shape=(D,), name="probe")
     hopfield = StorkeyHopfield(

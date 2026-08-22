@@ -331,56 +331,25 @@ class StorkeyHopfield(NodeBase):
         return W
 
     @staticmethod
-    def accumulate_hopfield_energy(
-        state: NodeState,
-        W: jnp.ndarray,
-        strength: jax.Array,
-    ) -> NodeState:
-        """Add Hopfield attractor energy E = (s/2D) z^T (W^2 - W) z to state.
-
-        The Hopfield energy pulls z toward stored patterns (attractors in
-        z-space). Combined with the PC energy (which pulls z toward the
-        upstream prediction mu), the equilibrium z* is the PC-optimal
-        compromise between top-down expectation and internal memory prior.
-
-        The gradient dE_hop/dz = (s/D)(W^2 - W)z is computed automatically
-        via autodiff in forward_and_latent_grads().
-
-        Args:
-            state: NodeState with z_latent set.
-            W: Prepared (D, D) Hopfield weight matrix.
-            strength: Scalar hopfield_strength (learnable jnp.array or fixed float).
-
-        Returns:
-            Updated NodeState with Hopfield energy added.
-        """
-        z = state.z_latent  # (batch, ..., D)
-        wz = z @ W  # (batch, ..., D)
-        D = z.shape[-1]
-        E_hopfield = (0.5 / D) * jnp.sum(wz * (wz - z), axis=-1)  # (1/2D) z^T(W^2-W)z
-        return state._replace(
-            energy=state.energy + strength * E_hopfield,
-        )
-
-    @staticmethod
-    def forward(
+    def predict(
         params: NodeParams,
         inputs: Dict[str, jnp.ndarray],
         state: NodeState,
         node_info: NodeInfo,
-    ) -> NodeState:
+    ) -> Tuple[jnp.ndarray, Tuple[jnp.ndarray, jax.Array]]:
         """
-        Forward pass: compute z_mu from probe, then combined energy.
+        Prediction: compute z_mu from the input probe.
 
         z_mu = activation(probe/(1+s) + (probe @ W)*s/(1+s) + bias)
 
         where s = hopfield_strength. At s=0 z_mu = activation(probe)
         (identity pass-through); at large s z_mu ≈ activation(probe @ W).
 
-        Energy = E_pc(z, z_mu) + s * E_hop(W, z)
-
-        Attractor dynamics are provided by the Hopfield energy gradient
-        (s/D)(W^2 - W)z accumulated to latent_grad.
+        Returns:
+            Tuple of (z_mu, (W, strength)): the prepared weight matrix and
+            effective strength feed the Hopfield attractor term in
+            ``energy()``. Both depend only on params and config, so the aux
+            snapshot is valid under both solver directions.
         """
         config = node_info.node_config
 
@@ -409,13 +378,32 @@ class StorkeyHopfield(NodeBase):
 
         activation = node_info.activation
         z_mu = type(activation).forward(pre_activation, activation.config)
-        error = state.z_latent - z_mu
+        return z_mu, (W, strength)
 
-        state = state._replace(z_mu=z_mu, error=error)
+    @staticmethod
+    def energy(
+        params: NodeParams,
+        inputs: Dict[str, jnp.ndarray],
+        state: NodeState,
+        aux: Tuple[jnp.ndarray, jax.Array],
+        node_info: NodeInfo,
+    ) -> jnp.ndarray:
+        """Combined energy: E_pc(z, z_mu) + s * E_hop(W, z).
 
-        # Standard PC energy, then add the Hopfield attractor energy on top.
-        node_class = node_info.node_class
-        state = node_class.energy_functional(state, node_info)
-        state = StorkeyHopfield.accumulate_hopfield_energy(state, W, strength)
+        The Hopfield attractor term E_hop = (1/2D) z^T (W^2 - W) z pulls z
+        toward stored patterns (attractors in z-space). Combined with the PC
+        energy (which pulls z toward the upstream prediction mu), the
+        equilibrium z* is the PC-optimal compromise between top-down
+        expectation and internal memory prior. It reads ``state.z_latent``
+        here — the z_latent-dependent-term rule — so both solver directions
+        evaluate it at the same latent as the PC term. The gradient
+        dE_hop/dz = (s/D)(W^2 - W)z arrives via autodiff.
+        """
+        W, strength = aux
+        energy = NodeBase.energy(params, inputs, state, aux, node_info)
 
-        return state
+        z = state.z_latent  # (batch, ..., D)
+        wz = z @ W  # (batch, ..., D)
+        D = z.shape[-1]
+        E_hopfield = (0.5 / D) * jnp.sum(wz * (wz - z), axis=-1)  # (1/2D) z^T(W^2-W)z
+        return energy + strength * E_hopfield

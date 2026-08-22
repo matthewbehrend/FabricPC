@@ -4,19 +4,20 @@ Test that custom nodes defined outside the fabricpc package can be used
 in FabricPC graphs.
 
 This test verifies the external custom-node extension contract: an external
-package can subclass NodeBase, implement get_slots/initialize_params/forward,
-and integrate with FabricPC's graph construction, parameter initialization,
-state initialization, default autodiff gradient paths, and the
-``run_inference`` inference loop.
+package can subclass NodeBase, implement get_slots/initialize_params/predict
+(plus an optional energy override), and integrate with FabricPC's graph
+construction, parameter initialization, state initialization, default
+autodiff gradient paths, and the ``run_inference`` inference loop.
 
 The custom node defined here (``ScaledSumNode``) is intentionally minimal:
 each incoming edge contributes a learned scalar gain on the source's
 z_latent; gains are summed elementwise; a learned bias is added; an
 activation is applied. Inputs must match the node's output shape (the
-contract is strict — no silent reshape). The node also reads an
-``energy_weight`` value from ``node_info.node_config``, demonstrating the
-``**extra_config`` channel that external nodes use for trace-time-static
-per-node configuration.
+contract is strict — no silent reshape). The node's ``energy`` override
+weights the functional default by an ``energy_weight`` value from
+``node_info.node_config``, demonstrating both the custom-energy-term
+surface and the ``**extra_config`` channel that external nodes use for
+trace-time-static per-node configuration.
 
 Scope note: this file uses the same import pattern an external package
 would use, but the tests live alongside the fabricpc package. The test
@@ -48,8 +49,9 @@ class ScaledSumNode(NodeBase):
     Minimal custom node defined outside fabricpc to exercise the extension
     contract.
 
-    Forward: z_mu = activation( sum_e(scale_e * x_e) + bias ) * 1
-    Energy: GaussianEnergy(z_latent, z_mu) multiplied by node_config["energy_weight"].
+    Predict: z_mu = activation( sum_e(scale_e * x_e) + bias )
+    Energy: GaussianEnergy(z_latent, z_mu) multiplied by node_config["energy_weight"]
+    via an ``energy()`` override.
 
     Per-edge weights are learned scalars stored in ``params.weights[edge_key]``.
     Bias is a learned vector stored at ``params.biases["b"]``. Input shapes
@@ -57,7 +59,7 @@ class ScaledSumNode(NodeBase):
     ``initialize_params`` time.
 
     The energy multiplier is read from ``node_info.node_config["energy_weight"]``
-    at forward time. This is the supported ``**extra_config`` surface for
+    in ``energy()``. This is the supported ``**extra_config`` surface for
     trace-time-static per-node configuration.
     """
 
@@ -120,13 +122,13 @@ class ScaledSumNode(NodeBase):
         return NodeParams(weights=weights, biases={"b": bias})
 
     @staticmethod
-    def forward(
+    def predict(
         params: NodeParams,
         inputs: Dict[str, jnp.ndarray],
         state: NodeState,
         node_info: NodeInfo,
-    ) -> NodeState:
-        """Five-step forward per the NodeBase.forward docstring contract."""
+    ) -> Tuple[jnp.ndarray, None]:
+        """Prediction per the NodeBase.predict contract."""
         batch_size = state.z_latent.shape[0]
         out_shape = node_info.shape
 
@@ -138,20 +140,19 @@ class ScaledSumNode(NodeBase):
 
         activation = node_info.activation
         z_mu = type(activation).forward(pre_activation, activation.config)
-        error = state.z_latent - z_mu
+        return z_mu, None
 
-        state = state._replace(
-            z_mu=z_mu,
-            error=error,
-        )
-
-        state = node_info.node_class.energy_functional(state, node_info)
-
-        energy_weight = node_info.node_config.get("energy_weight", 1.0)
-        weighted_energy = state.energy * energy_weight
-        state = state._replace(energy=weighted_energy)
-
-        return state
+    @staticmethod
+    def energy(
+        params: NodeParams,
+        inputs: Dict[str, jnp.ndarray],
+        state: NodeState,
+        aux: None,
+        node_info: NodeInfo,
+    ) -> jnp.ndarray:
+        """Custom energy term: the functional default weighted by config."""
+        energy = NodeBase.energy(params, inputs, state, aux, node_info)
+        return energy * node_info.node_config.get("energy_weight", 1.0)
 
 
 def _build_simple_graph(shape=(8,)):

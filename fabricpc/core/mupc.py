@@ -103,7 +103,7 @@ class MuPCScalingFactors:
         forward_scale: Per-edge forward scaling factor (a_l).
             Applied to inputs before the node's forward() call.
         self_grad_scale: Scalar scaling for the node's self-gradient (dE/dz_self).
-            Applied in energy_functional().
+            Applied by the inference loop to the autodiff self-gradient.
         topdown_grad_scale: Per-edge scaling for the top-down gradient to
             presynaptic nodes. Equals a * jacobian_gain, combining chain rule
             correction (a) with Jacobian compensation (jacobian_gain) for
@@ -422,7 +422,7 @@ def compute_mupc_scalings(
             weight_grad_scale[edge_key] = 1.0
 
         # Self-gradient scaling: 1.0
-        # The self-gradient (dE/dz from energy_functional) is already O(1)
+        # The self-gradient (dE/dz from the node's energy) is already O(1)
         # when the forward scaling maintains O(1) activations.
         self_grad_scale = 1.0
 

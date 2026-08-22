@@ -629,16 +629,13 @@ class TestSkipConnectionScaling:
                 return NodeParams(weights, {})
 
             @staticmethod
-            def forward(params, inputs, state, node_info):
+            def predict(params, inputs, state, node_info):
                 import jax.numpy as jnp
 
                 x = inputs[next(k for k in inputs if k.endswith(":in"))]
                 edge_key = next(k for k in params.weights if ":in" in k)
                 z_mu = jnp.matmul(x, params.weights[edge_key])
-                error = state.z_latent - z_mu
-                state = state._replace(z_mu=z_mu, error=error)
-                state = node_info.node_class.energy_functional(state, node_info)
-                return state
+                return z_mu, None
 
         # Build graph: x -> meta_node (with meta slot) -> y
         # Also connect a "meta" source to meta_node's meta slot

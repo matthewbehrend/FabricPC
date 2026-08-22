@@ -1,5 +1,13 @@
 # Changelog
 
+## [unreleased]
+ePC (error-based predictive coding)
+
+### Breaking changes
+- The custom-node contract splits `forward()` into `predict()` and `energy()`. A node now implements `predict(params, inputs, state, node_info) -> (z_mu, aux)` — the parameterized prediction plus an optional pytree of intermediates — and, only when it adds energy terms, overrides `energy(params, inputs, state, aux, node_info) -> (batch,)`. The error pair (`error = z_latent - z_mu` and its inverse `z_latent = z_mu + error`) and the assembly templates (`forward`, `forward_with_aux`, `forward_from_error`) are base-owned and no longer node code: one prediction pass now serves both the state-based solvers and the error-parameterized `EPCInference`, which derives `z_latent` from the relaxed error and cannot tolerate a node body that recomputes the pair itself. `NodeBase.energy_functional` is deleted; its body is the default `energy()`. Migration: delete the `error`/`_replace`/`energy_functional` tail from each `forward()` body, rename it `predict`, and return `(z_mu, aux)`; move any post-hoc energy patching into an `energy()` override. See `docs/user_guides/06_custom_nodes.md`.
+- Unclamped readout nodes (`out_degree == 0`, no clamp) are no longer forced to `error = 0`, `energy = 0` with `z_latent` overwritten by `z_mu` during inference: they take the ordinary relaxation path, so energy terms a readout assigns (a StorkeyHopfield readout's attractor term) survive and the readout settles like any other node. Eval accuracy is unchanged (predictions read `z_mu`); reported eval energy now includes readout energy that was previously zeroed.
+- Cyclic graphs require an explicit `graph(..., unroll=U)`; construction raises `GraphCycleError` instead of printing a warning and silently dropping cycle members (and everything downstream) from the topological order. `GraphStructure` gains a `schedule` field — the full visit schedule at the chosen unroll degree — walked by feedforward initialization and ePC state derivation; `node_order` is its first-occurrence deduplication.
+
 ## [0.5.2] - 2026-09-08
 
 Per-batch diagnostics run as `train` callbacks instead of custom training

@@ -87,19 +87,21 @@ class Linear(FlattenInputMixin, NodeBase):
         return {"in": SlotSpec(name="in", is_multi_input=True)}
 
     @staticmethod
-    def _forward_with_preact(
+    def predict(
         params: NodeParams,
         inputs: Dict[str, jnp.ndarray],
         state: NodeState,
         node_info: NodeInfo,
-    ) -> tuple[NodeState, jnp.ndarray]:
-        """Internal forward returning (state, pre_activation).
+    ) -> Tuple[jnp.ndarray, jnp.ndarray]:
+        """
+        Linear transformation with activation.
 
-        Shared between Linear.forward (which discards pre_activation) and
-        LinearExplicitGrad's gradient methods (which thread pre_activation
-        into f'(z) for the gain-modulated error). Not for use by other node
-        types — LinearResidual, StorkeyHopfield, and Transformer compute
-        pre_activation differently and override forward directly.
+        When flatten_input=False (default): applies matmul on last axis only.
+        When flatten_input=True: flattens all dimensions for dense behavior.
+
+        Returns:
+            Tuple of (z_mu, pre_activation). The pre_activation aux feeds
+            LinearExplicitGrad's analytic f'(z) gain-modulated error.
         """
         batch_size = state.z_latent.shape[0]
         out_shape = node_info.shape
@@ -120,13 +122,7 @@ class Linear(FlattenInputMixin, NodeBase):
 
         activation = node_info.activation
         z_mu = type(activation).forward(pre_activation, activation.config)
-        error = state.z_latent - z_mu
-        state = state._replace(z_mu=z_mu, error=error)
-
-        node_class = node_info.node_class
-        state = node_class.energy_functional(state, node_info)
-
-        return state, pre_activation
+        return z_mu, pre_activation
 
     @staticmethod
     def initialize_params(
@@ -197,32 +193,3 @@ class Linear(FlattenInputMixin, NodeBase):
             )  # TODO allow configurable bias initialization across all nodes that use bias; default to zeros init; use the initializer object and seed key_b
 
         return NodeParams(weights=weights_dict, biases={"b": b} if use_bias else {})
-
-    @staticmethod
-    def forward(
-        params: NodeParams,
-        inputs: Dict[str, jnp.ndarray],
-        state: NodeState,
-        node_info: NodeInfo,
-    ) -> NodeState:
-        """
-        Linear transformation with activation.
-
-        Forward pass through the node, returning the updated state.
-        Computes:
-            forward pass -> compute error -> compute per-sample energy
-
-        When flatten_input=False (default): applies matmul on last axis only.
-        When flatten_input=True: flattens all dimensions for dense behavior.
-
-        Args:
-            params: Node parameters (weights, biases)
-            inputs: Dictionary mapping edge keys to input tensors
-            state: NodeState for this node
-            node_info: NodeInfo object (contains activation instance, energy instance, etc.)
-
-        Returns:
-            NodeState
-        """
-        state, _ = Linear._forward_with_preact(params, inputs, state, node_info)
-        return state
