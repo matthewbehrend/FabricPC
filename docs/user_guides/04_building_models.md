@@ -463,13 +463,34 @@ input ──→ hidden1 ──→ hidden2 ──→ output
             └───────────────────┘
 ```
 
+A cyclic graph requires an explicit `unroll` argument: the builder raises `GraphCycleError` without it. `unroll=U` fixes the visit schedule (`structure.schedule`) so that each cycle's members are traversed `U` times per forward pass — feedforward initialization and ePC state derivation both walk this schedule, with a back edge reading the value its source produced on the previous traversal. `unroll=1` visits each cycle member once.
+
 ```python
-# Cyclic connection
-Edge(source=hidden1, target=hidden2.slot("in"))
-Edge(source=hidden2, target=hidden1.slot("in"))
+from fabricpc.graph_assembly import graph, TaskMap
+from fabricpc.core.topology import Edge
+from fabricpc.core.inference import InferenceSGD
+from fabricpc.nodes import IdentityNode, Linear
+
+inp = IdentityNode(shape=(16,), name="input")
+hidden1 = Linear(shape=(32,), name="hidden1")
+hidden2 = Linear(shape=(32,), name="hidden2")
+output = Linear(shape=(4,), name="output")
+
+structure = graph(
+    nodes=[inp, hidden1, hidden2, output],
+    edges=[
+        Edge(source=inp, target=hidden1.slot("in")),
+        Edge(source=hidden1, target=hidden2.slot("in")),
+        Edge(source=hidden2, target=hidden1.slot("in")),  # cyclic connection
+        Edge(source=hidden2, target=output.slot("in")),
+    ],
+    task_map=TaskMap(x=inp, y=output),
+    inference=InferenceSGD(eta_infer=0.05, infer_steps=20),
+    unroll=2,
+)
 ```
 
-The builder will emit a warning about topological sort when cycles are detected. Cyclic graphs may require more inference steps for information to propagate around the loops and reach equilibrium.
+Cyclic graphs may require more inference steps for information to propagate around the loops and reach equilibrium.
 
 ## Shape Conventions
 

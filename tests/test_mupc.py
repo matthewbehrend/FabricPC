@@ -1104,3 +1104,111 @@ class TestEndToEnd:
         assert (
             energy_f < energy_0
         ), f"Energy did not decrease: {energy_0:.6f} -> {energy_f:.6f}"
+
+
+class TestScheduleHardening:
+    """muPC consumes the unique node order, never the unrolled schedule."""
+
+    def test_duplicate_node_order_raises(self, linear_chain_with_mupc):
+        from fabricpc.core.mupc import (
+            _count_skip_connections_depth,
+            compute_mupc_scalings,
+        )
+
+        s = linear_chain_with_mupc
+        duplicated = ["x", "h", "h", "y"]
+        with pytest.raises(ValueError, match="duplicate"):
+            compute_mupc_scalings(s.nodes, s.edges, MuPCConfig(), duplicated)
+        with pytest.raises(ValueError, match="duplicate"):
+            _count_skip_connections_depth(s.nodes, s.edges, duplicated)
+
+
+class TestCyclicGraphScaling:
+    """graph(..., unroll=U) makes cyclic graphs orderable, so muPC attaches
+    scalings to cycle members; the depth L is per merge node, not per visit."""
+
+    def test_cycle_members_get_scalings_with_correct_k_slot(self):
+        x = IdentityNode(shape=(6,), name="x")
+        a = Linear(
+            shape=(8,),
+            name="a",
+            activation=IdentityActivation(),
+            weight_init=MuPCInitializer(),
+        )
+        b = Linear(
+            shape=(8,),
+            name="b",
+            activation=IdentityActivation(),
+            weight_init=MuPCInitializer(),
+        )
+        y = Linear(
+            shape=(4,),
+            name="y",
+            activation=IdentityActivation(),
+            weight_init=MuPCInitializer(),
+        )
+        structure = graph(
+            nodes=[x, a, b, y],
+            edges=[
+                Edge(source=x, target=a.slot("in")),
+                Edge(source=a, target=b.slot("in")),
+                Edge(source=b, target=a.slot("in")),
+                Edge(source=b, target=y.slot("in")),
+            ],
+            task_map=TaskMap(x=x, y=y),
+            inference=InferenceSGD(eta_infer=0.05, infer_steps=1),
+            scaling=MuPCConfig(),
+            unroll=2,
+        )
+
+        a_scaling = structure.nodes["a"].node_info.scaling_config
+        b_scaling = structure.nodes["b"].node_info.scaling_config
+        assert isinstance(a_scaling, MuPCScalingFactors)
+        assert isinstance(b_scaling, MuPCScalingFactors)
+        # a's "in" slot has two in-neighbors (x plus the back edge from b):
+        # K_slot = 2, v = source fan_in, identity gain = 1.
+        assert abs(a_scaling.forward_scale["x->a:in"] - 1.0 / math.sqrt(6 * 2)) < 1e-10
+        assert abs(a_scaling.forward_scale["b->a:in"] - 1.0 / math.sqrt(8 * 2)) < 1e-10
+        # b has the single in-edge from a: K_slot = 1.
+        assert abs(b_scaling.forward_scale["a->b:in"] - 1.0 / math.sqrt(8 * 1)) < 1e-10
+
+    @pytest.mark.parametrize("unroll", [1, 5])
+    def test_merge_in_cycle_depth_independent_of_unroll(self, unroll):
+        """Two merges (one inside the cycle) give L = 2 at any unroll degree:
+        depth models one merge-sum energy term per merge node, regardless of
+        how many times the schedule visits it."""
+        from fabricpc.nodes.skip_connection import SkipConnection
+
+        x = IdentityNode(shape=(10,), name="x")
+        h0 = Linear(shape=(10,), name="h0", weight_init=MuPCInitializer())
+        s0 = SkipConnection(shape=(10,), name="s0")
+        h1 = Linear(shape=(10,), name="h1", weight_init=MuPCInitializer())
+        s1 = SkipConnection(shape=(10,), name="s1")
+        h2 = Linear(shape=(10,), name="h2", weight_init=MuPCInitializer())
+        y = Linear(shape=(5,), name="y", weight_init=MuPCInitializer())
+        structure = graph(
+            nodes=[x, h0, s0, h1, s1, h2, y],
+            edges=[
+                Edge(source=x, target=h0.slot("in")),
+                Edge(source=x, target=s0.slot("skip")),  # stream
+                Edge(source=h0, target=s0.slot("in")),  # branch -> merge 1
+                Edge(source=s0, target=h1.slot("in")),
+                Edge(source=s0, target=s1.slot("skip")),  # stream
+                Edge(source=h1, target=s1.slot("in")),  # branch -> merge 2
+                Edge(source=s1, target=h2.slot("in")),
+                Edge(
+                    source=h2, target=h1.slot("in")
+                ),  # back edge: cycle h1->s1->h2->h1
+                Edge(source=s1, target=y.slot("in")),
+            ],
+            task_map=TaskMap(x=x, y=y),
+            inference=InferenceSGD(),
+            scaling=MuPCConfig(),
+            unroll=unroll,
+        )
+        # Merge branch edges: v=1 (weightless sum), K_slot=1, L=2
+        # -> a = 1/sqrt(2), identical at every unroll degree.
+        a_s0 = structure.nodes["s0"].node_info.scaling_config.forward_scale["h0->s0:in"]
+        a_s1 = structure.nodes["s1"].node_info.scaling_config.forward_scale["h1->s1:in"]
+        assert abs(a_s0 - 1.0 / math.sqrt(2)) < 1e-10
+        assert abs(a_s1 - 1.0 / math.sqrt(2)) < 1e-10

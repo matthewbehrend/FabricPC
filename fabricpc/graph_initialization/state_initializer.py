@@ -265,8 +265,11 @@ class FeedforwardStateInit(StateInitBase):
         state = GraphState(nodes=node_state_dict, batch_size=batch_size)
         state = set_latents_to_clamps(state, clamps)
 
-        # Second pass: feedforward propagation in topological order
-        for node_name in structure.node_order:
+        # Second pass: feedforward propagation along the visit schedule. On
+        # cyclic graphs built with graph(..., unroll=U) cycle members repeat
+        # U times, so initialization is the derived forward at error = 0 on
+        # the same schedule EPCInference.derive_states iterates.
+        for node_name in structure.schedule:
             node = structure.nodes[node_name]
             node_info = node.node_info
 
@@ -381,6 +384,21 @@ def initialize_graph_state(
     if state_init is None:
         state_init = structure.config["graph_state_initializer"]
 
-    return type(state_init).initialize_state(
+    state = type(state_init).initialize_state(
         structure, batch_size, rng_key, clamps, state_init.config, params
     )
+
+    # Shared post-pass: in_degree == 0 nodes have no in-edges to project a
+    # z_mu, so initialization assigns it — z_mu <- z_latent, cast to z_mu's
+    # float dtype so int token clamps keep the float-only carry. This gives
+    # error = z_latent - z_mu = 0 at init for every source node under every
+    # initializer, the invariant both solver families start from.
+    for node_name, node in structure.nodes.items():
+        if node.node_info.in_degree == 0:
+            node_state = state.nodes[node_name]
+            node_state = node_state._replace(
+                z_mu=node_state.z_latent.astype(node_state.z_mu.dtype)
+            )
+            state = state._replace(nodes={**state.nodes, node_name: node_state})
+
+    return state

@@ -335,3 +335,188 @@ class TestFeedforwardZeroError:
             assert jnp.allclose(
                 original, final, atol=1e-5
             ), f"Node {node_name} changed after inference despite zero error: max_diff={max_diff}"
+
+
+def _two_source_graph():
+    """Two sources (one clamped, one an unclamped prior) -> hidden -> output."""
+    inp = Linear(shape=(12,), name="inp")
+    prior = Linear(shape=(6,), name="prior")
+    hidden = Linear(shape=(8,), activation=ReLUActivation(), name="hidden")
+    output = Linear(shape=(4,), name="output")
+    return graph(
+        nodes=[inp, prior, hidden, output],
+        edges=[
+            Edge(source=inp, target=hidden.slot("in")),
+            Edge(source=prior, target=hidden.slot("in")),
+            Edge(source=hidden, target=output.slot("in")),
+        ],
+        task_map=TaskMap(x=inp, y=output),
+        inference=InferenceSGD(),
+    )
+
+
+class TestSourceZmuInvariant:
+    """The shared post-pass in initialize_graph_state assigns z_mu <- z_latent
+    (cast to z_mu's float dtype) for every in_degree == 0 node, so
+    error = z_latent - z_mu = 0 holds at init under every initializer."""
+
+    @pytest.mark.parametrize(
+        "state_init",
+        [
+            GlobalStateInit(initializer=NormalInitializer(std=0.1)),
+            NodeDistributionStateInit(),
+            FeedforwardStateInit(),
+        ],
+        ids=["global", "node_distribution", "feedforward"],
+    )
+    def test_source_zmu_mirrors_latent(self, state_init, rng_key):
+        structure = _two_source_graph()
+        params = initialize_params(structure, rng_key)
+        batch_size = 4
+        x = jax.random.normal(rng_key, (batch_size, 12))
+        y = jax.random.normal(jax.random.PRNGKey(1), (batch_size, 4))
+        clamps = {"inp": x, "output": y}
+
+        state = initialize_graph_state(
+            structure,
+            batch_size,
+            rng_key,
+            clamps,
+            state_init=state_init,
+            params=params,
+        )
+
+        # Both the clamped source and the unclamped prior leave init with
+        # z_mu mirroring z_latent and zero error.
+        for name in ("inp", "prior"):
+            node_state = state.nodes[name]
+            assert jnp.array_equal(
+                node_state.z_mu, node_state.z_latent.astype(node_state.z_mu.dtype)
+            ), f"{name}: z_mu != z_latent at init"
+            assert jnp.all(node_state.error == 0), f"{name}: error != 0 at init"
+
+    def test_int_clamped_source_zmu_stays_float(self, rng_key):
+        """An int source clamp mirrors into z_mu cast to float, keeping the
+        float-only carry invariant."""
+        structure = _two_source_graph()
+        params = initialize_params(structure, rng_key)
+        batch_size = 4
+        x = jnp.arange(batch_size * 12, dtype=jnp.int32).reshape(batch_size, 12)
+        clamps = {"inp": x}
+
+        state = initialize_graph_state(
+            structure,
+            batch_size,
+            rng_key,
+            clamps,
+            state_init=GlobalStateInit(initializer=NormalInitializer(std=0.1)),
+            params=params,
+        )
+
+        node_state = state.nodes["inp"]
+        assert node_state.z_latent.dtype == jnp.int32
+        assert jnp.issubdtype(node_state.z_mu.dtype, jnp.floating)
+        assert jnp.array_equal(node_state.z_mu, x.astype(node_state.z_mu.dtype))
+        assert jnp.all(node_state.error == 0)
+
+
+def _cycle_graph(unroll):
+    """x -> a <-> b -> y with the 2-node cycle unrolled `unroll` times."""
+    from fabricpc.core.activations import TanhActivation
+    from fabricpc.nodes.identity import IdentityNode
+
+    w_init = NormalInitializer(std=0.1)
+    x = IdentityNode(shape=(6,), name="x")
+    a = Linear(shape=(8,), name="a", activation=TanhActivation(), weight_init=w_init)
+    b = Linear(shape=(8,), name="b", activation=TanhActivation(), weight_init=w_init)
+    y = Linear(
+        shape=(4,), name="y", activation=IdentityActivation(), weight_init=w_init
+    )
+    return graph(
+        nodes=[x, a, b, y],
+        edges=[
+            Edge(source=x, target=a.slot("in")),
+            Edge(source=a, target=b.slot("in")),
+            Edge(source=b, target=a.slot("in")),
+            Edge(source=b, target=y.slot("in")),
+        ],
+        task_map=TaskMap(x=x, y=y),
+        inference=InferenceSGD(eta_infer=0.05, infer_steps=1),
+        unroll=unroll,
+    )
+
+
+class TestFeedforwardThroughCycles:
+    """FeedforwardStateInit pass 2 walks structure.schedule, so cyclic graphs
+    get true feedforward initialization through the cycle."""
+
+    def test_cycle_feedforward_matches_manual_replay(self, rng_key):
+        structure = _cycle_graph(unroll=2)
+        params = initialize_params(structure, rng_key)
+        batch_size = 3
+        x = jax.random.normal(rng_key, (batch_size, 6))
+        clamps = {"x": x}
+
+        state = initialize_graph_state(
+            structure,
+            batch_size,
+            rng_key,
+            clamps,
+            state_init=FeedforwardStateInit(),
+            params=params,
+        )
+
+        # Pass 1 of FeedforwardStateInit draws each node's latent_init with
+        # the same rng split NodeDistributionStateInit uses, so that
+        # initializer reproduces the pre-propagation latents.
+        pass1 = initialize_graph_state(
+            structure,
+            batch_size,
+            rng_key,
+            clamps,
+            state_init=NodeDistributionStateInit(),
+            params=params,
+        )
+
+        z = {name: pass1.nodes[name].z_latent for name in structure.nodes}
+        for node_name in structure.schedule:
+            info = structure.nodes[node_name].node_info
+            if info.in_degree == 0:
+                continue
+            inputs = {ek: z[structure.edges[ek].source] for ek in info.in_edges}
+            projected = info.node_class.forward(
+                params.nodes[node_name], inputs, pass1.nodes[node_name], info
+            )
+            if node_name not in clamps:
+                z[node_name] = projected.z_mu
+
+        for node_name in structure.nodes:
+            assert jnp.allclose(
+                state.nodes[node_name].z_latent, z[node_name], atol=1e-6
+            ), f"{node_name}: feedforward init != manual schedule replay"
+
+    def test_unroll_degree_changes_init(self, rng_key):
+        """U=2 propagates one more traversal through the cycle than U=1, so
+        the initialized latents differ (propagation proof)."""
+        batch_size = 3
+        x = jax.random.normal(rng_key, (batch_size, 6))
+        clamps = {"x": x}
+
+        states = {}
+        for unroll in (1, 2):
+            structure = _cycle_graph(unroll=unroll)
+            params = initialize_params(structure, rng_key)
+            states[unroll] = initialize_graph_state(
+                structure,
+                batch_size,
+                rng_key,
+                clamps,
+                state_init=FeedforwardStateInit(),
+                params=params,
+            )
+
+        for node_name in ("a", "y"):
+            assert not jnp.allclose(
+                states[1].nodes[node_name].z_latent,
+                states[2].nodes[node_name].z_latent,
+            ), f"{node_name}: U=2 init should differ from U=1"

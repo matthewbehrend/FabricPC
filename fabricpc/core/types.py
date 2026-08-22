@@ -156,14 +156,17 @@ class GraphStructure(NamedTuple):
         nodes: Dictionary mapping node names to NodeBase instances (with node_info attribute)
         edges: Dictionary mapping edge keys to EdgeInfo
         task_map: Dictionary mapping task names to node names
-        node_order: Topological order for forward pass
+        node_order: Unique topological node order — first_occurrence_order(schedule)
+        schedule: Full node visit schedule; on cyclic graphs built with
+            graph(..., unroll=U), cycle members repeat U times
         config: Graph configuration
     """
 
     nodes: Dict[str, Any]  # Dict[str, NodeBase] - node instances with node_info
     edges: Dict[str, EdgeInfo]
     task_map: Dict[str, str]
-    node_order: Tuple[str, ...]  # Topological sort for inference
+    node_order: Tuple[str, ...]  # Unique node order (one entry per node)
+    schedule: Tuple[str, ...]  # Visit schedule (cycle members may repeat)
     config: Dict[str, Any]  # Graph configuration
 
     def __repr__(self) -> str:
@@ -212,6 +215,11 @@ tree_util.register_pytree_node(
 # GraphStructure is static, so we register it as having no dynamic components
 tree_util.register_pytree_node(
     GraphStructure,
-    lambda gs: ((), (gs.nodes, gs.edges, gs.task_map, gs.node_order, gs.config)),
+    # Aux tuple order must match the NamedTuple field order: the unflatten
+    # below rebuilds positionally.
+    lambda gs: (
+        (),
+        (gs.nodes, gs.edges, gs.task_map, gs.node_order, gs.schedule, gs.config),
+    ),
     lambda aux, _: GraphStructure(*aux),  # Reconstruct from aux data
 )

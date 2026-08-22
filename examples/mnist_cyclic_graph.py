@@ -103,6 +103,7 @@ def create_lateral_model(rng_key):
         ],
         task_map=TaskMap(x=pixels, y=output),
         inference=InferenceSGD(eta_infer=0.15, infer_steps=50),
+        unroll=2,
     )
     params = initialize_params(structure, rng_key)
     return params, structure
@@ -138,7 +139,7 @@ def main():
     print("=" * 70)
     print("Dataset: MNIST")
     print(
-        "Cyclic Graph: 784 -> [256 + 256_lat] -> [64 + 64_lat] -> 10  (6 nodes, 7 edges)"
+        "Cyclic Graph: 784 -> [256 -> 64 -> 64_lat -> 256 cycle] -> 10  (5 nodes, 5 edges)"
     )
     print("MLP:     784 -> 256 -> 64 -> 10                         (4 nodes, 3 edges)")
     print("Training: Predictive Coding (both arms)")
