@@ -31,10 +31,16 @@ def rng_key():
     return jax.random.PRNGKey(42)
 
 
-def with_inference(structure, **kwargs):
-    """Return structure with modified inference config for testing."""
+def with_inference(structure, inference=None, **kwargs):
+    """Return structure with modified inference config for testing.
+
+    Pass an ``InferenceBase`` object via ``inference``, or keyword arguments
+    to construct an ``InferenceSGD``.
+    """
     new_config = dict(structure.config)
-    new_config["inference"] = InferenceSGD(**kwargs)
+    new_config["inference"] = (
+        inference if inference is not None else InferenceSGD(**kwargs)
+    )
     return structure._replace(config=new_config)
 
 

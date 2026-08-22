@@ -2,6 +2,15 @@
 
 This module provides alternative inference and training functions that
 collect intermediate states for detailed tracking and debugging.
+
+Both history variants iterate ``structure.config["inference"].segments()``,
+so composed schedules (e.g. an ePC segment followed by an sPC segment) are
+tracked segment by segment and the per-step metric stacks are concatenated
+along the step axis. Metric semantics are per-segment: ``latent_grad_norm``
+is the norm of whatever that segment's solver accumulates into
+``latent_grad`` — under state-based solvers the one-hop dE/dz_latent, under
+``EPCInference`` the full-forward gradient of the total energy with respect
+to the relaxed errors.
 """
 
 from typing import Callable, Dict, List, Tuple, cast
@@ -53,45 +62,48 @@ def run_inference_with_history(
             - final_state: GraphState after convergence
             - state_history: List of dicts containing key metrics per step
     """
-    # Get infer_steps from structure's inference config
-    inference_obj = structure.config["inference"]
-    inference_cls = type(inference_obj)
-    config = inference_obj.config
-    infer_steps = config["infer_steps"]
+    state = initial_state
+    segment_metrics = []
+    for solver, n_steps in structure.config["inference"].segments():
+        solver_cls = type(solver)
+        config = solver.config
 
-    def scan_fn(
-        state: GraphState, _: None
-    ) -> Tuple[GraphState, Dict[str, Dict[str, jnp.ndarray]]]:
-        new_state = inference_cls.inference_step(
-            params, state, clamps, structure, config
-        )
-        # Extract key metrics for history (lightweight)
-        # Reduce over batch dimension to get scalar metrics per step
-        step_metrics = {
-            node_name: {
-                "energy": jnp.mean(node_state.energy),
-                "latent_grad_norm": jnp.mean(
-                    jnp.linalg.norm(node_state.latent_grad, axis=-1)
-                ),
-                "error_norm": jnp.mean(jnp.linalg.norm(node_state.error, axis=-1)),
-                "z_latent_mean": jnp.mean(node_state.z_latent),
-                "z_latent_std": jnp.mean(jnp.std(node_state.z_latent, axis=-1)),
+        def scan_fn(
+            state: GraphState, _: None
+        ) -> Tuple[GraphState, Dict[str, Dict[str, jnp.ndarray]]]:
+            new_state = solver_cls.inference_step(
+                params, state, clamps, structure, config
+            )
+            # Extract key metrics for history (lightweight)
+            # Reduce over batch dimension to get scalar metrics per step
+            step_metrics = {
+                node_name: {
+                    "energy": jnp.mean(node_state.energy),
+                    "latent_grad_norm": jnp.mean(
+                        jnp.linalg.norm(node_state.latent_grad, axis=-1)
+                    ),
+                    "error_norm": jnp.mean(jnp.linalg.norm(node_state.error, axis=-1)),
+                    "z_latent_mean": jnp.mean(node_state.z_latent),
+                    "z_latent_std": jnp.mean(jnp.std(node_state.z_latent, axis=-1)),
+                }
+                for node_name, node_state in new_state.nodes.items()
             }
-            for node_name, node_state in new_state.nodes.items()
-        }
-        return new_state, step_metrics
+            return new_state, step_metrics
 
-    # Run inference with scan to collect history
-    final_state, all_metrics = jax.lax.scan(
-        scan_fn,
-        initial_state,
-        xs=None,
-        length=infer_steps,
+        state = solver_cls.begin_segment(params, state, clamps, structure)
+        state, metrics = jax.lax.scan(scan_fn, state, xs=None, length=n_steps)
+        state = solver_cls.finalize_state(params, state, clamps, structure)
+        segment_metrics.append(metrics)
+
+    # Concatenate per-segment stacks along the step axis. The metric
+    # structure (node names, metric keys) is identical across segments.
+    all_metrics = jax.tree_util.tree_map(
+        lambda *xs: jnp.concatenate(xs, axis=0), *segment_metrics
     )
 
     # Return stacked metrics - unstacking must happen outside JIT
-    # all_metrics is a nested dict with stacked arrays of shape (infer_steps,)
-    return final_state, all_metrics
+    # all_metrics is a nested dict with stacked arrays of shape (total_steps,)
+    return state, all_metrics
 
 
 def _unstack_metrics(
@@ -180,6 +192,21 @@ def make_inference_history(
         )
         return final_state, states
 
+    """ ePC branch had this on old tracking API:
+    history: List[GraphState] = []
+    state = initial_state
+    
+    for solver, n_steps in structure.config["inference"].segments():
+        solver_cls = type(solver)
+        config = solver.config
+        state = solver_cls.begin_segment(params, state, clamps, structure)
+        for _ in range(n_steps):
+            state = solver_cls.inference_step(params, state, clamps, structure, config)
+            history.append(state)
+        state = solver_cls.finalize_state(params, state, clamps, structure)
+    
+    return state, history
+    """
     return jax.jit(history)
 
 

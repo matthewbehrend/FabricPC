@@ -182,12 +182,12 @@ class TestInference:
         assert isinstance(initial_state.nodes, dict)
 
         struct_1step = with_inference(structure, eta_infer=0.1, infer_steps=1)
-        state_after_1_step = type(struct_1step.config["inference"]).run_inference(
+        state_after_1_step = struct_1step.config["inference"].run_inference(
             params, initial_state, clamps, struct_1step
         )
 
         struct_20step = with_inference(structure, eta_infer=0.1, infer_steps=20)
-        final_state = type(struct_20step.config["inference"]).run_inference(
+        final_state = struct_20step.config["inference"].run_inference(
             params, initial_state, clamps, struct_20step
         )
 
@@ -224,7 +224,7 @@ class TestInference:
             params=params,
         )
         struct_10step = with_inference(structure, eta_infer=0.1, infer_steps=10)
-        final_state = type(struct_10step.config["inference"]).run_inference(
+        final_state = struct_10step.config["inference"].run_inference(
             params, initial_state, clamps, struct_10step
         )
 
@@ -422,7 +422,7 @@ class TestComplexGraphs:
         )
 
         struct_mod = with_inference(structure, eta_infer=0.1, infer_steps=10)
-        final_state = type(struct_mod.config["inference"]).run_inference(
+        final_state = struct_mod.config["inference"].run_inference(
             params, state, clamps, struct_mod
         )
 

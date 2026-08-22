@@ -1,0 +1,56 @@
+# ePC inference solver — implementation execution plan
+
+## Context
+
+The design is complete and reviewed: `docs/dev_plans_archive/epc_inference_solver.md` (final state at commit 72a8582). That document remains the authoritative specification for all six components — the predict/pair/energy node-contract split, `EPCInference`, `InferenceSchedule`, the unrolled topological schedule, the five bundled defect fixes, and the resnet18 benchmark. This plan records the pre-implementation verification of that document against HEAD, the deviations found, and the execution order.
+
+Verification result: nearly every file/line reference in the design doc is exact against the current tree. Nothing has been implemented — no `EPCInference`, `InferenceSchedule`, `GraphCycleError`, `first_occurrence_order`, `schedule` field, or `unroll` parameter exists anywhere. Test baseline: 339 passed in ~151 s on CPU (`python -m pytest tests/`; no pytest config file; `tests/conftest.py:14` pins the CPU platform). The reference RTX 3090 is this machine.
+
+## Verified deviations and implementation notes
+
+Findings from the verification pass that adjust *how* the design is implemented; none changes *what* is implemented.
+
+1. **`GraphStructure` unflatten is a positional splat** (`core/types.py:215-216`, `GraphStructure(*aux)`). Inserting `schedule` after `node_order` requires the NamedTuple field list, the flatten aux tuple, and the unflatten to change in the same positions in the same edit; a mismatch mis-binds fields silently.
+2. **sPC's per-step loops iterate `structure.nodes` (insertion order), not `node_order`** (`core/inference.py:127, :154, :215`). Two consequences: the planned "insertion-order independence of one-step grads" test in `test_inference_epc.py` asserts an ePC-only property, and the sPC-equivalence fixture must declare its nodes in topological order so both solvers traverse the same sequence.
+3. **The init post-pass must cast** (already specified in the design: z_mu ← z_latent cast to z_mu's float dtype for `in_degree == 0` nodes). Confirmed live: `tests/test_transformer_nodes.py:207` clamps a source node with int32; an uncast copy would put an int leaf into the fori_loop carry, breaking the float-carry invariant (`state_initializer.py:137-146`).
+4. **`with_inference` has two callers beyond the doc's migration list**: `tests/test_storkey_hopfield.py:117, :133`. The new signature `with_inference(structure, inference=None, **kwargs)` is backward compatible; those sites need no edit.
+5. **`docs/user_guides/04_building_models.md:472`** states "the builder will emit a warning about topological sort when cycles are detected" — rewrite for `GraphCycleError` alongside the complete `graph(..., unroll=U)` example (the snippet at :465-469 is the two bare `Edge(...)` lines the design doc names).
+6. **`tests/test_inference_order.py:60-63`**: `_force_self_grad_scale`'s rationale comment ("compute_mupc_scalings returns None for non-orderable nodes") goes stale once `unroll` makes cyclic graphs orderable; update the comment when adding the explicit `unroll` to `_build_cycle`.
+7. **No node registry exists.** `test_node_contract.py`'s audit must walk `NodeBase.__subclasses__()` recursively: a direct walk misses `LinearExplicitGrad` (subclass of `Linear`) and `MaxPool`/`AvgPool` (subclasses of `_PoolBase`); `_PoolBase` is unexported but defines `forward` and owns the pooling migration.
+8. **`EmbeddingNode.forward_and_latent_grads`** (`transformer_v2.py:110`) declares `is_clamped=False` as a defaulted parameter, unlike the base's required positional. Unaffected by the split; preserve when migrating the file.
+9. **No kaleido guard precedent exists in the repo** (`scaling_analysis_plots.py` and `mlp_scaling.py` call `write_image` unconditionally). The compare script introduces the guard as designed.
+10. **Line drift (cosmetic):** `train_backprop.py`'s `value_and_grad` is at :119; the readout forcing branch is `base.py:514-530` (its :524 `latent_grad=jnp.zeros_like(...)` and :530 shape source are inside the deleted range); `linear_explicit_grad.py` overrides start at :48 and :114.
+11. **muPC hardening targets confirmed:** `mupc.py:294` falls back to insertion order when `node_order=None`, and `skip_counts.get(source, 0)` (`:232`) masks not-yet-computed predecessors. The planned duplicate-entry raise goes in both `compute_mupc_scalings` and `_count_skip_connections_depth`.
+12. **`test_doc_snippets.py` mechanism:** AST-parse per fence, execute top-level imports, signature-bind calls resolving to fabricpc callables. The rewritten guide-06 example spans five separately checked fences — each must parse standalone; the new `graph(..., unroll=U)` example is signature-bound, so it is written after the code change it documents.
+13. **`InferenceBase` stores config as a plain `MappingProxyType`** (`inference.py:83-84`), not `FrozenConfig` — so `InferenceSchedule` holding solver objects in config works as designed; do not migrate `InferenceBase` to `FrozenConfig`.
+
+## Execution order — six steps, one commit each, full suite green at each gate
+
+Sequencing per the design doc; files per its file-by-file list plus the notes above.
+
+**Step 1 — dispatch refactor + segment hooks + tracking + test migrations** (pure refactor). `core/inference.py` (classmethod templates; instance `run_inference`; `begin_segment`/`finalize_state`/`segments()` hooks), `utils/dashboarding/inference_tracking.py` (segment iteration replacing both `config["infer_steps"]` reads at :54 and :147), `tests/conftest.py` (`with_inference(structure, inference=None, **kwargs)`), migrated static-form calls in `tests/test_fabricpc.py` (:185, :190, :227, :428), `tests/test_ndim_shapes.py` (:64, :105, :152), `tests/test_auto_node_grad.py` (:315, :318). Gate: suite green, single-solver tracking byte-identical.
+
+**Step 2 — generalized topological schedule.** `graph_construction.py` (`_topological_sort(nodes, edges, unroll=None)`: Kahn unchanged on DAGs; `GraphCycleError` on cycles without `unroll`; Tarjan SCC + Kahn-on-condensation + entry-first intra-SCC BFS with `unroll=U`; `first_occurrence_order`; `graph(..., unroll=None)` validated ≥ 1, recorded in `gs_config`), `graph_assembly/__init__.py` (export `GraphCycleError`), `core/types.py` (`schedule` field + pytree, note 1), `state_initializer.py` (pass 2 iterates `structure.schedule`; shared z_mu ← z_latent post-pass in `initialize_graph_state`, note 3), `core/mupc.py` (dup-raise hardening, note 11), cyclic call sites gain explicit `unroll` (`tests/test_inference_order.py` `_build_cycle` + note 6; `examples/mnist_cyclic_graph.py`, also fix the :143 summary print — 5 nodes / 5 edges, not 6/7), `docs/user_guides/04_building_models.md` (note 5). New `tests/test_topological_schedule.py`; additions to `test_state_initializer.py` and `test_mupc.py` per the doc's test plan.
+
+**Step 3 — node contract split** (pure refactor; gate: suite green with **no test-expectation edits** — sPC bit-identity). `nodes/base.py`: `predict`/`energy` contract, base-owned `pair_error`/`pair_latent`/`forward_with_aux`/`forward`/`forward_from_error` templates verbatim from the design doc; `energy_functional` deleted into the default `energy()`; source branch of `forward_and_latent_grads` delegates to the template `forward`; unclamped-readout forcing branch (:514-530) deleted. The 13 library `forward()` bodies become `predict()` (`linear.py` deletes `_forward_with_preact`; `_PoolBase` owns pooling; `storkey_hopfield.py`'s `accumulate_hopfield_energy` becomes the `energy()` override with today's op order preserved); `linear_explicit_grad.py` overrides call `forward_with_aux`. External custom nodes: `examples/jpc_fc_resnet_compare.py` (3), `tests/test_external_custom_node.py` (`ScaledSumNode` energy-weighting → `energy()` override), `tests/test_mupc.py:632`. `examples/storkey_hopfield_recall.py:137-142` comment rewritten (stale `base.py:382-400` reference; the constraint is removed). Docs: `06_custom_nodes.md` rewritten around the two-method contract (note 12), `10_api_nodes.md` gains the contract + aux pattern/anti-pattern section (net-new content), `CHANGELOG.md` breaking-change entry. New `tests/test_node_contract.py` (note 7); `test_fabricpc.py` additions for the sPC readout fix.
+
+**Step 4 — `EPCInference`.** New `fabricpc/core/inference_epc.py` (`_relaxed_errors`, `derive_states` over `structure.schedule`, `forward_value_and_grad` with one global `value_and_grad` over the ε pytree accumulating into `latent_grad`, `compute_new_error`, raising `compute_new_latent`, identity `begin_segment`, `finalize_state` detached rebuild; η default 1e-3 with tuning docstring; muPC decision documented). `core/__init__.py` exports `EPCInference`. `core/types.py` docstrings for `error`/`latent_grad` (:118, :120, :127). New `tests/test_inference_epc.py` per the doc's test plan (notes 2 and 3 shape the equivalence fixture).
+
+**Step 5 — `InferenceSchedule`.** In `core/inference.py`: constructor validation, folding `run_inference`, flattening `segments()`, raising per-step stubs. Export from `core/__init__.py`. New `tests/test_inference_schedule.py`. Docs: `12_api_inference.md` (both new solvers, schedule composition, per-segment `latent_grad` semantics), `03_how_predictive_coding_works.md` (ePC alongside sPC in the inner loop).
+
+**Step 6 — benchmark.** `examples/resnet18_cifar10_demo.py`: `build_resnet18(...)` takes required `inference: InferenceBase` replacing the keyword-only `infer_steps`/`eta_infer` (:232-240) and the hardcoded `InferenceSGDNormClip` (:321-323); migrate `_create_mupc_model`/`run_single_mupc`, CLI behavior unchanged. New `examples/epc_spc_resnet18_compare.py` per the doc's Component 6 (importlib load per `PC_backprop_compare.py:52-58`; `PlannedMultiContrastExperiment` with empty contrast list — verified accepted; `paired_ttest`/`cohens_d`; plotly html always, png behind the kaleido guard).
+
+Commit messages via a temporary file in the project root, one commit per step.
+
+## Verification
+
+1. `python -m pytest tests/` green at every step gate; step 3 with no expectation edits on pre-existing tests.
+2. `python examples/mnist_cyclic_graph.py` with explicit `unroll` trains; expected behavior drift, not regression (today `node_order == ("pixels",)` makes feedforward init a no-op; after migration the cycle gets true feedforward init and muPC scalings, shifting the loss curve).
+3. `python examples/resnet18_cifar10_demo.py` (unchanged defaults) reproduces documented single-run behavior.
+4. `python examples/epc_spc_resnet18_compare.py --mode convergence` — per-node energy-vs-step panels, ePC steps-to-reach ≤ E*, measured per-step wall-clock ratio (minutes, on the 3090).
+5. Reduced smoke sweep proving the pipeline end-to-end: `--mode sweep --n_trials 1 --num_epochs 1 --epc_step_sweep 2,8`. **User decision:** the full 5-trial ~5 h sweep is left to the user to launch; the script docstring gets the tables placeholder and instructions.
+
+## Scope decisions (user-confirmed 2026-08-21)
+
+- Benchmark: convergence mode + reduced smoke sweep in this task; full 5 h sweep run by the user later.
+- Commits: one per sequencing step on `matthew_cedric/epc`.

@@ -61,7 +61,7 @@ class TestNDimShapes:
             structure, batch_size, rng_key, clamps=clamps, params=params
         )
         struct_mod = with_inference(structure, eta_infer=0.1, infer_steps=5)
-        final_state = type(struct_mod.config["inference"]).run_inference(
+        final_state = struct_mod.config["inference"].run_inference(
             params, state, clamps, struct_mod
         )
 
@@ -102,7 +102,7 @@ class TestNDimShapes:
             structure, batch_size, rng_key, clamps=clamps, params=params
         )
         struct_mod = with_inference(structure, eta_infer=0.1, infer_steps=5)
-        final_state = type(struct_mod.config["inference"]).run_inference(
+        final_state = struct_mod.config["inference"].run_inference(
             params, state, clamps, struct_mod
         )
 
@@ -149,7 +149,7 @@ class TestNDimShapes:
             structure, batch_size, rng_key, clamps=clamps, params=params
         )
         struct_mod = with_inference(structure, eta_infer=0.1, infer_steps=5)
-        final_state = type(struct_mod.config["inference"]).run_inference(
+        final_state = struct_mod.config["inference"].run_inference(
             params, state, clamps, struct_mod
         )
 

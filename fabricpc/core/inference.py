@@ -7,7 +7,7 @@ This module provides:
 - run_inference: Convenience function wrapping the class-based API
 
 Inference algorithms control how latent states are updated during the
-inference loop. The primary extension point is `latent_update()`.
+inference loop. The primary extension point is `compute_new_latent()`.
 
 Usage:
     from fabricpc.core.inference import InferenceSGD
@@ -73,18 +73,21 @@ class InferenceBase(ABC):
     Abstract base class for inference algorithms.
 
     Inference algorithms control how latent states are updated during the
-    inference loop. The primary extension point is `latent_update()`.
+    inference loop. The primary extension point is `compute_new_latent()`.
 
-    Custom inference algorithms extend this class:
+    Custom inference algorithms extend this class.
 
-    All computation methods are static for JAX compatibility (pure functions, no state).
+    Computation methods are classmethods dispatching on ``cls`` (pure
+    functions of their arguments, no instance state); ``run_inference`` is an
+    instance method because it reads ``self.config``.
     """
 
     def __init__(self, **config):
         self.config = types.MappingProxyType(config)  # Immutable dictionary
 
-    @staticmethod
+    @classmethod
     def inference_step(
+        cls,
         params: GraphParams,
         state: GraphState,
         clamps: Dict[str, jnp.ndarray],
@@ -97,9 +100,6 @@ class InferenceBase(ABC):
         Override for algorithms that need a different phase structure
         (e.g., momentum that accumulates across steps).
         """
-        inference_obj = structure.config["inference"]
-        cls = type(inference_obj)
-
         # Phase 1: Zero the latent gradients
         state = cls.zero_grads(params, state, clamps, structure)
 
@@ -131,8 +131,9 @@ class InferenceBase(ABC):
 
         return state
 
-    @staticmethod
+    @classmethod
     def forward_value_and_grad(
+        cls,
         params: GraphParams,
         state: GraphState,
         clamps: Dict[str, jnp.ndarray],
@@ -198,8 +199,9 @@ class InferenceBase(ABC):
 
         return state
 
-    @staticmethod
+    @classmethod
     def update_latents(
+        cls,
         params: GraphParams,
         state: GraphState,
         clamps: Dict[str, jnp.ndarray],
@@ -209,9 +211,6 @@ class InferenceBase(ABC):
         """
         Update latent states for each node based on the accumulated latent gradients.
         """
-        inference_obj = structure.config["inference"]
-        cls = type(inference_obj)
-
         for node_name in structure.nodes:
             node_state = state.nodes[node_name]
 
@@ -242,8 +241,52 @@ class InferenceBase(ABC):
         """
         pass
 
-    @staticmethod
+    @classmethod
+    def begin_segment(
+        cls,
+        params: GraphParams,
+        state: GraphState,
+        clamps: Dict[str, jnp.ndarray],
+        structure: GraphStructure,
+    ) -> GraphState:
+        """
+        Segment-boundary hook run before this solver's first inference step.
+
+        The default is identity: the incoming z_latent/z_mu/error are taken
+        exactly as the previous segment (or the initializer) left them.
+        """
+        return state
+
+    @classmethod
+    def finalize_state(
+        cls,
+        params: GraphParams,
+        state: GraphState,
+        clamps: Dict[str, jnp.ndarray],
+        structure: GraphStructure,
+    ) -> GraphState:
+        """
+        Segment-boundary hook run after this solver's last inference step.
+
+        The default is identity. Solvers whose per-step state is not the
+        consumable final state override this (e.g. a rebuild so downstream
+        weight updates and dashboards read a self-consistent state).
+        """
+        return state
+
+    def segments(self):
+        """
+        The (solver, steps) segments this inference object executes.
+
+        A plain solver is a single segment of its own ``infer_steps``.
+        Schedule objects override this to flatten their component solvers,
+        so per-step consumers (e.g. tracking) can iterate segments instead
+        of assuming one global step count.
+        """
+        return ((self, int(self.config["infer_steps"])),)
+
     def run_inference(
+        self,
         params: GraphParams,
         initial_state: GraphState,
         clamps: Dict[str, jnp.ndarray],
@@ -255,19 +298,18 @@ class InferenceBase(ABC):
         Override for scan-based tracking, adaptive stopping, etc.
         infer_steps is read from self.config['infer_steps'].
         """
-        inference_obj = structure.config["inference"]
-        inference_cls = type(inference_obj)
-        config = inference_obj.config
+        cls = type(self)
+        config = self.config
         infer_steps = config["infer_steps"]
 
+        state = cls.begin_segment(params, initial_state, clamps, structure)
+
         def body_fn(t, state):
-            return inference_cls.inference_step(
-                params, state, clamps, structure, config
-            )
+            return cls.inference_step(params, state, clamps, structure, config)
 
         # Use lax.fori_loop for efficiency
-        final_state = jax.lax.fori_loop(0, infer_steps, body_fn, initial_state)
-        return final_state
+        state = jax.lax.fori_loop(0, infer_steps, body_fn, state)
+        return cls.finalize_state(params, state, clamps, structure)
 
 
 # =============================================================================
@@ -371,8 +413,8 @@ def run_inference(
     Run inference using the algorithm object stored in the graph structure.
 
     Convenience wrapper that extracts the inference object from
-    ``structure.config["inference"]`` and delegates to its class's
-    static ``run_inference`` method.
+    ``structure.config["inference"]`` and delegates to its
+    ``run_inference`` method.
 
     Args:
         params: Graph parameters.
@@ -384,6 +426,4 @@ def run_inference(
         Converged graph state after inference.
     """
     inference_object = structure.config["inference"]
-    return type(inference_object).run_inference(
-        params, initial_state, clamps, structure
-    )
+    return inference_object.run_inference(params, initial_state, clamps, structure)
