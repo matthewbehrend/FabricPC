@@ -69,13 +69,13 @@ Error-parameterized predictive coding (ePC, Goemaere et al., arXiv 2505.20137). 
 ```python
 from fabricpc.core.inference_epc import EPCInference
 
-inference = EPCInference(eta_infer=1e-3, infer_steps=5, latent_decay=0.0)
+inference = EPCInference(eta_infer=1e-2, infer_steps=5, latent_decay=0.0)
 structure = graph(..., inference=inference)
 ```
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `eta_infer` | `float` | `1e-3` | Inference rate on ε — tune like a weight learning rate (see below) |
+| `eta_infer` | `float` | `1e-2` | Inference rate on ε — tune like a weight learning rate (see below) |
 | `infer_steps` | `int` | `5` | Number of inference iterations |
 | `latent_decay` | `float` | `0.0` | Weight decay on the relaxed errors |
 
@@ -86,7 +86,7 @@ latent_grad = d(total energy of in_degree > 0 nodes)/d(error)   # one global rev
 error_new = error * (1 - eta * latent_decay) - eta * latent_grad
 ```
 
-The ε gradient is taken through the full network's transfer function — a change in one node's ε moves every downstream derived latent — so `eta_infer` must be tuned like a weight learning rate, not like sPC's local rate: sPC's typical 0.05–0.1 overshoots the minimum along the global gradient. Start from the weight optimizer's rate.
+The ε gradient is taken through the full network's transfer function — a change in one node's ε moves every downstream derived latent — so `eta_infer` must be tuned like a weight learning rate, not like sPC's local rate: sPC's typical 0.05–0.1 can overshoot the minimum along the global gradient. The default 1e-2 comes from the measured resnet18/CIFAR-10 convergence (`examples/epc_spc_resnet18_compare.py --mode convergence`): reaching sPC-120's final total energy took 105 steps at 1e-3, 12 at 1e-2, and 5 at 3e-2.
 
 On cyclic graphs, ePC minimizes the unrolled approximation of the graph energy fixed by `graph(..., unroll=U)`; state-based solvers minimize the exact graph energy as-is. Memory: each ePC step's single reverse pass stores activations for the whole derived forward (depth × unroll), backprop-scale rather than sPC's per-node closures.
 
@@ -99,7 +99,7 @@ from fabricpc.core.inference import InferenceSGD, InferenceSchedule
 from fabricpc.core.inference_epc import EPCInference
 
 inference = InferenceSchedule(
-    EPCInference(eta_infer=1e-3, infer_steps=5),
+    EPCInference(eta_infer=1e-2, infer_steps=5),
     InferenceSGD(eta_infer=0.05, infer_steps=20),
 )
 ```

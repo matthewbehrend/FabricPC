@@ -93,6 +93,13 @@ _spec.loader.exec_module(_demo)
 # =============================================================================
 
 
+def resolve_epc_eta(args):
+    """--epc_eta, falling back to EPCInference's constructor default."""
+    if args.epc_eta is not None:
+        return args.epc_eta
+    return EPCInference().config["eta_infer"]
+
+
 def make_model_factory(inference, activation_name):
     activation = _demo.get_activation(activation_name)
 
@@ -148,7 +155,7 @@ def _write_chart(fig, stem):
 
 def run_sweep(args):
     epc_steps = [int(s) for s in args.epc_step_sweep.split(",")]
-    epc_eta = args.epc_eta if args.epc_eta is not None else args.lr
+    epc_eta = resolve_epc_eta(args)
     spc_name = f"sPC-{args.spc_steps}"
 
     steps_per_epoch = len(
@@ -384,7 +391,7 @@ def _plot_sweep(results, epc_steps, spc_name, n_trials):
 
 
 def run_convergence(args):
-    epc_eta = args.epc_eta if args.epc_eta is not None else args.lr
+    epc_eta = resolve_epc_eta(args)
     activation = _demo.get_activation(args.activation)
     track_steps = args.track_steps
 
@@ -554,8 +561,9 @@ def parse_args():
         "--epc_eta",
         type=float,
         default=None,
-        help="ePC inference rate (default: use --lr; the epsilon step descends "
-        "the full-transfer-function gradient, so tune from the weight LR)",
+        help="ePC inference rate (default: EPCInference's default, 1e-2; the "
+        "epsilon step descends the full-transfer-function gradient, so tune "
+        "it like a weight learning rate)",
     )
     parser.add_argument("--lr", type=float, default=0.001)
     parser.add_argument("--weight_decay", type=float, default=0.01)

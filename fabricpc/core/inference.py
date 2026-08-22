@@ -404,7 +404,7 @@ class InferenceSchedule(InferenceBase):
 
     Usage:
         inference = InferenceSchedule(
-            EPCInference(eta_infer=1e-3, infer_steps=5),
+            EPCInference(eta_infer=1e-2, infer_steps=5),
             InferenceSGD(eta_infer=0.05, infer_steps=20),
         )
 

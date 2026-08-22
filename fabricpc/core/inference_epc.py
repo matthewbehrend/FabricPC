@@ -48,20 +48,24 @@ class EPCInference(InferenceBase):
     ePC inference: relax the prediction errors, derive the latents.
 
     Args:
-        eta_infer: Inference rate on ε (default: 1e-3). The ε gradient is
+        eta_infer: Inference rate on ε (default: 1e-2). The ε gradient is
             taken through the full network's transfer function — a change in
             one node's ε moves every downstream derived latent — so tune it
-            like a weight learning rate, starting from the weight optimizer's
-            (the demos' adamw uses 1e-3), not like sPC's local rate: sPC's
+            like a weight learning rate, not like sPC's local rate: sPC's
             typical 0.05-0.1 conditions a per-node step against that node's
-            own energy and overshoots the minimum along the global gradient.
+            own energy and can overshoot the minimum along the global
+            gradient. Measured on the resnet18/CIFAR-10 demo
+            (examples/epc_spc_resnet18_compare.py --mode convergence),
+            reaching sPC-120's final total energy took 105 steps at 1e-3,
+            12 at 1e-2, and 5 at 3e-2, so the default sits an order of
+            magnitude above the demos' adamw weight rate.
         infer_steps: Number of inference iterations (default: 5). One
             reverse pass per step reaches every layer, so a few steps replace
             sPC's hundreds on deep DAGs.
         latent_decay: Decay factor on ε in the update (default: 0.0).
     """
 
-    def __init__(self, eta_infer=1e-3, infer_steps=5, latent_decay=0.0):
+    def __init__(self, eta_infer=1e-2, infer_steps=5, latent_decay=0.0):
         super().__init__(
             eta_infer=eta_infer, infer_steps=infer_steps, latent_decay=latent_decay
         )
