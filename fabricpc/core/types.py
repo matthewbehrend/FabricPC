@@ -115,16 +115,21 @@ class NodeState(NamedTuple):
     Attributes:
         z_latent: Latent states (what the network infers)
         z_mu: Predicted expectations (what the network predicts)
-        error: Prediction errors (z_latent - z_mu)
+        error: Prediction errors (z_latent - z_mu); under ``EPCInference``
+            the first-class relaxed variable ε, with z_latent derived as
+            z_mu + ε
         energy: Energy
-        latent_grad: Gradients w.r.t. latent states for inference updates
+        latent_grad: Gradient accumulator for inference updates — under
+            state-based solvers the one-hop accumulated dE/dz_latent; under
+            ``EPCInference`` the gradient of the total energy w.r.t. ε
+            through the full derived forward
     """
 
     z_latent: jnp.ndarray
     z_mu: jnp.ndarray
     error: jnp.ndarray
     energy: jnp.ndarray  # per-sample energy, shape (batch_size,)
-    latent_grad: jnp.ndarray  # For local gradient accumulation
+    latent_grad: jnp.ndarray  # accumulator: sPC dE/dz_latent, ePC dE/depsilon
 
 
 class GraphState(NamedTuple):

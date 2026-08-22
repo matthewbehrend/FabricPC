@@ -1,0 +1,647 @@
+"""
+Tests for EPCInference — error-parameterized predictive coding.
+
+ePC relaxes the prediction errors ε and derives the latents by a forward
+pass along ``structure.schedule`` (z_latent = z_mu + ε), taking one global
+``jax.value_and_grad`` of the total in_degree > 0 energy with respect to the
+ε pytree per step. These tests pin: the ε = 0 <-> feedforward-init
+correspondence, gradient correctness against the closed form and a
+hand-rolled ``jax.grad``, energy descent, the sPC equilibrium equivalence
+(including an unclamped top-down prior — the case that distinguishes
+ε-relaxed sources from frozen ones), the ``forward_from_error`` branch
+coverage (clamped/unclamped x source/internal), cyclic warm-start
+semantics, muPC input scaling, insertion-order independence, and the
+z_latent = z_mu + ε invariant of the finalized state.
+"""
+
+import jax
+import jax.numpy as jnp
+import pytest
+
+from fabricpc.core.activations import (
+    IdentityActivation,
+    SoftmaxActivation,
+    TanhActivation,
+)
+from fabricpc.core.energy import CrossEntropyEnergy
+from fabricpc.core.inference import InferenceSGD, run_inference
+from fabricpc.core.inference_epc import EPCInference
+from fabricpc.core.initializers import NormalInitializer
+from fabricpc.core.learning import compute_local_weight_gradients
+from fabricpc.core.mupc import MuPCConfig
+from fabricpc.core.state_ops import update_node_in_state
+from fabricpc.core.topology import Edge
+from fabricpc.core.types import GraphState
+from fabricpc.graph_assembly import TaskMap, graph
+from fabricpc.graph_initialization import initialize_params
+from fabricpc.graph_initialization.state_initializer import initialize_graph_state
+from fabricpc.nodes import Linear, StorkeyHopfield
+from fabricpc.nodes.identity import IdentityNode
+
+W_INIT = NormalInitializer(std=0.3)
+
+
+def _chain(inference=None, scaling=None):
+    """x (Identity source) -> h (Linear) -> y (Linear), identity activations."""
+    x = IdentityNode(shape=(5,), name="x")
+    h = Linear(
+        shape=(4,), name="h", activation=IdentityActivation(), weight_init=W_INIT
+    )
+    y = Linear(
+        shape=(3,), name="y", activation=IdentityActivation(), weight_init=W_INIT
+    )
+    return graph(
+        nodes=[x, h, y],
+        edges=[
+            Edge(source=x, target=h.slot("in")),
+            Edge(source=h, target=y.slot("in")),
+        ],
+        task_map=TaskMap(x=x, y=y),
+        inference=inference or EPCInference(eta_infer=0.05, infer_steps=5),
+        scaling=scaling,
+    )
+
+
+def _total_energy(state, structure):
+    return sum(
+        jnp.sum(state.nodes[name].energy)
+        for name in structure.nodes
+        if structure.nodes[name].node_info.in_degree > 0
+    )
+
+
+class TestZeroErrorIsFeedforward:
+    @pytest.mark.parametrize("clamp_output", [False, True])
+    def test_derive_states_preserves_feedforward_init(self, rng_key, clamp_output):
+        """At ε = 0 the derived states equal FeedforwardStateInit's output:
+        initialization is the derived forward at zero error."""
+        structure = _chain()
+        params = initialize_params(structure, rng_key)
+        batch_size = 4
+        x = jax.random.normal(rng_key, (batch_size, 5))
+        clamps = {"x": x}
+        if clamp_output:
+            clamps["y"] = jax.random.normal(jax.random.PRNGKey(1), (batch_size, 3))
+
+        state = initialize_graph_state(
+            structure, batch_size, rng_key, clamps, params=params
+        )
+        derived = EPCInference.derive_states(params, state, clamps, structure)
+
+        for name in structure.nodes:
+            assert jnp.allclose(
+                derived.nodes[name].z_latent, state.nodes[name].z_latent, atol=1e-6
+            ), f"{name}: derive_states at ε=0 moved z_latent off the feedforward init"
+        if not clamp_output:
+            assert jnp.allclose(
+                derived.nodes["y"].z_latent, derived.nodes["y"].z_mu, atol=1e-6
+            )
+
+
+class TestGradientCorrectness:
+    def _setup(self, rng_key):
+        structure = _chain()
+        params = initialize_params(structure, rng_key)
+        batch_size = 4
+        x = jax.random.normal(rng_key, (batch_size, 5))
+        y = jax.random.normal(jax.random.PRNGKey(1), (batch_size, 3))
+        clamps = {"x": x, "y": y}
+        state = initialize_graph_state(
+            structure, batch_size, rng_key, clamps, params=params
+        )
+        # Seed a nonzero relaxed error on the single unclamped node.
+        eps = jax.random.normal(jax.random.PRNGKey(2), (batch_size, 4))
+        state = update_node_in_state(state, "h", error=eps)
+        return structure, params, clamps, state, x, y, eps
+
+    def test_matches_closed_form(self, rng_key):
+        """2-layer linear chain: ∇_ε E = ε_h - residual @ W_yᵀ, where the
+        residual is y - z_mu_y at the derived latent z_h = μ_h + ε_h."""
+        structure, params, clamps, state, x, y, eps = self._setup(rng_key)
+
+        new_state = EPCInference.forward_value_and_grad(
+            params, state, clamps, structure
+        )
+
+        W_h = params.nodes["h"].weights["x->h:in"]
+        b_h = params.nodes["h"].biases["b"]
+        W_y = params.nodes["y"].weights["h->y:in"]
+        b_y = params.nodes["y"].biases["b"]
+        mu_h = x @ W_h + b_h
+        z_h = mu_h + eps
+        residual = y - (z_h @ W_y + b_y)
+        expected = eps - residual @ W_y.T
+
+        assert jnp.allclose(new_state.nodes["h"].latent_grad, expected, atol=1e-5)
+
+    def test_matches_hand_rolled_jax_grad(self, rng_key):
+        structure, params, clamps, state, x, y, eps = self._setup(rng_key)
+
+        W_h = params.nodes["h"].weights["x->h:in"]
+        b_h = params.nodes["h"].biases["b"]
+        W_y = params.nodes["y"].weights["h->y:in"]
+        b_y = params.nodes["y"].biases["b"]
+
+        def energy(eps_h):
+            z_h = (x @ W_h + b_h) + eps_h
+            e_h = 0.5 * jnp.sum(eps_h**2)
+            e_y = 0.5 * jnp.sum((y - (z_h @ W_y + b_y)) ** 2)
+            return e_h + e_y
+
+        expected = jax.grad(energy)(eps)
+        new_state = EPCInference.forward_value_and_grad(
+            params, state, clamps, structure
+        )
+        assert jnp.allclose(new_state.nodes["h"].latent_grad, expected, atol=1e-5)
+
+    def test_grads_accumulate_into_latent_grad(self, rng_key):
+        """∇_ε E is added to latent_grad, never replaces it."""
+        structure, params, clamps, state, *_ = self._setup(rng_key)
+        sentinel = jnp.full((4, 4), 1.75)
+        state = update_node_in_state(state, "h", latent_grad=sentinel)
+
+        with_sentinel = EPCInference.forward_value_and_grad(
+            params, state, clamps, structure
+        )
+        without = EPCInference.forward_value_and_grad(
+            params,
+            update_node_in_state(state, "h", latent_grad=jnp.zeros((4, 4))),
+            clamps,
+            structure,
+        )
+        assert jnp.allclose(
+            with_sentinel.nodes["h"].latent_grad,
+            without.nodes["h"].latent_grad + sentinel,
+            atol=1e-6,
+        )
+
+
+class TestEnergyDescent:
+    def test_energy_decreases_over_steps(self, rng_key):
+        structure = _chain(inference=EPCInference(eta_infer=0.05, infer_steps=1))
+        params = initialize_params(structure, rng_key)
+        batch_size = 4
+        clamps = {
+            "x": jax.random.normal(rng_key, (batch_size, 5)),
+            "y": jax.random.normal(jax.random.PRNGKey(1), (batch_size, 3)),
+        }
+        state = initialize_graph_state(
+            structure, batch_size, rng_key, clamps, params=params
+        )
+
+        energies = []
+        inference = structure.config["inference"]
+        for _ in range(6):
+            state = inference.run_inference(params, state, clamps, structure)
+            energies.append(float(_total_energy(state, structure)))
+
+        assert all(
+            b < a for a, b in zip(energies, energies[1:])
+        ), f"energy did not decrease monotonically: {energies}"
+
+
+class TestSPCEquivalence:
+    def _convex_graph(self, inference):
+        """Strictly convex DAG with an unclamped top-down prior: shapes chosen
+        so the stacked residual Jacobian has full column rank (W_y injective
+        on z_h, W_p injective on z_prior), giving one global minimizer. The
+        larger weight std keeps the prior direction (curvature ~
+        sigma_min(W_y W_p)^2) well conditioned so both solvers converge
+        within the step budget."""
+        w_init = NormalInitializer(std=0.8)
+        x = IdentityNode(shape=(5,), name="x")
+        prior = Linear(shape=(3,), name="prior", weight_init=w_init)
+        h = Linear(
+            shape=(4,), name="h", activation=IdentityActivation(), weight_init=w_init
+        )
+        y = Linear(
+            shape=(6,), name="y", activation=IdentityActivation(), weight_init=w_init
+        )
+        return graph(
+            nodes=[x, prior, h, y],
+            edges=[
+                Edge(source=x, target=h.slot("in")),
+                Edge(source=prior, target=h.slot("in")),
+                Edge(source=h, target=y.slot("in")),
+            ],
+            task_map=TaskMap(x=x, y=y),
+            inference=inference,
+        )
+
+    def test_shared_equilibrium_and_weight_grads(self, rng_key):
+        batch_size = 3
+        x = jax.random.normal(rng_key, (batch_size, 5))
+        y = jax.random.normal(jax.random.PRNGKey(1), (batch_size, 6))
+        clamps = {"x": x, "y": y}
+
+        finals = {}
+        # ePC's rate sits below sPC's local rate: the ε-space curvature is
+        # amplified by the triangular reparameterization (eta 0.1 diverges
+        # here), the constructor's tuning guidance in action.
+        for key, inference in (
+            ("spc", InferenceSGD(eta_infer=0.1, infer_steps=20000)),
+            ("epc", EPCInference(eta_infer=0.05, infer_steps=20000)),
+        ):
+            structure = self._convex_graph(inference)
+            params = initialize_params(structure, rng_key)
+            state = initialize_graph_state(
+                structure, batch_size, rng_key, clamps, params=params
+            )
+            final = inference.run_inference(params, state, clamps, structure)
+            finals[key] = (structure, params, final)
+
+        spc_structure, spc_params, spc = finals["spc"]
+        _, epc_params, epc = finals["epc"]
+
+        for name in spc_structure.nodes:
+            assert jnp.allclose(
+                spc.nodes[name].z_latent, epc.nodes[name].z_latent, atol=1e-4
+            ), f"{name}: z_latent equilibria differ"
+            # z_mu and energy agree for in_degree > 0 nodes (the energy's
+            # domain). A source's z_mu is bookkeeping outside E: sPC re-syncs
+            # it to the relaxed latent, ePC holds it at the init constant.
+            if spc_structure.nodes[name].node_info.in_degree > 0:
+                assert jnp.allclose(
+                    spc.nodes[name].z_mu, epc.nodes[name].z_mu, atol=1e-4
+                ), f"{name}: z_mu equilibria differ"
+                assert jnp.allclose(
+                    spc.nodes[name].energy, epc.nodes[name].energy, atol=1e-4
+                ), f"{name}: energies differ"
+
+        grads_spc = compute_local_weight_gradients(spc_params, spc, spc_structure)
+        grads_epc = compute_local_weight_gradients(epc_params, epc, spc_structure)
+        for name in grads_spc.nodes:
+            for edge_key, g in grads_spc.nodes[name].weights.items():
+                assert jnp.allclose(
+                    g, grads_epc.nodes[name].weights[edge_key], atol=1e-4
+                ), f"weight grad differs at {name}/{edge_key}"
+
+
+class TestForwardFromErrorBranches:
+    def test_cross_entropy_clamped_output(self, rng_key):
+        """Clamped internal node: z_latent stays the clamp, error and energy
+        are derived, and the output loss's gradient reaches upstream ε."""
+        x = IdentityNode(shape=(5,), name="x")
+        h = Linear(
+            shape=(4,), name="h", activation=TanhActivation(), weight_init=W_INIT
+        )
+        y = Linear(
+            shape=(3,),
+            name="y",
+            activation=SoftmaxActivation(),
+            energy=CrossEntropyEnergy(),
+            weight_init=W_INIT,
+        )
+        structure = graph(
+            nodes=[x, h, y],
+            edges=[
+                Edge(source=x, target=h.slot("in")),
+                Edge(source=h, target=y.slot("in")),
+            ],
+            task_map=TaskMap(x=x, y=y),
+            inference=EPCInference(eta_infer=0.01, infer_steps=3),
+        )
+        params = initialize_params(structure, rng_key)
+        batch_size = 4
+        y_onehot = jax.nn.one_hot(jnp.array([0, 1, 2, 1]), 3)
+        clamps = {"x": jax.random.normal(rng_key, (batch_size, 5)), "y": y_onehot}
+        state = initialize_graph_state(
+            structure, batch_size, rng_key, clamps, params=params
+        )
+
+        new_state = EPCInference.forward_value_and_grad(
+            params, state, clamps, structure
+        )
+        y_state = new_state.nodes["y"]
+        assert jnp.array_equal(y_state.z_latent, y_onehot)
+        assert jnp.allclose(y_state.error, y_onehot - y_state.z_mu, atol=1e-6)
+        energy_obj = structure.nodes["y"].node_info.energy
+        expected = type(energy_obj).energy(y_onehot, y_state.z_mu, energy_obj.config)
+        assert jnp.allclose(y_state.energy, expected, atol=1e-6)
+        # The output loss's gradient reached the upstream relaxed error.
+        assert not jnp.allclose(new_state.nodes["h"].latent_grad, 0.0)
+
+    def test_gaussian_readout_stays_at_zero_error(self, rng_key):
+        """An unclamped pure-Gaussian readout at ε = 0 has ∇_ε E =
+        precision * ε = 0, so it stays put while upstream ε moves."""
+        structure = _chain(inference=EPCInference(eta_infer=0.05, infer_steps=4))
+        params = initialize_params(structure, rng_key)
+        batch_size = 4
+        clamps = {"x": jax.random.normal(rng_key, (batch_size, 5))}
+        state = initialize_graph_state(
+            structure, batch_size, rng_key, clamps, params=params
+        )
+        final = run_inference(params, state, clamps, structure)
+        assert jnp.allclose(final.nodes["y"].error, 0.0, atol=1e-7)
+        assert jnp.allclose(final.nodes["y"].z_latent, final.nodes["y"].z_mu, atol=1e-6)
+
+    def test_storkey_hopfield_readout_gets_attractor_gradient(self, rng_key):
+        """A Hopfield readout retains its nonzero attractor energy and
+        receives the attractor gradient even at ε = 0."""
+        probe = IdentityNode(shape=(6,), name="probe")
+        hop = StorkeyHopfield(
+            shape=(6,), name="hop", hopfield_strength=2.0, use_bias=False
+        )
+        structure = graph(
+            nodes=[probe, hop],
+            edges=[Edge(source=probe, target=hop.slot("in"))],
+            task_map=TaskMap(x=probe, y=hop),
+            inference=EPCInference(eta_infer=0.01, infer_steps=3),
+        )
+        params = initialize_params(structure, rng_key)
+        batch_size = 4
+        clamps = {"probe": jax.random.normal(rng_key, (batch_size, 6))}
+        state = initialize_graph_state(
+            structure, batch_size, rng_key, clamps, params=params
+        )
+
+        new_state = EPCInference.forward_value_and_grad(
+            params, state, clamps, structure
+        )
+        hop_state = new_state.nodes["hop"]
+        assert not jnp.allclose(hop_state.energy, 0.0)
+        assert not jnp.allclose(hop_state.latent_grad, 0.0)
+
+        final = run_inference(params, state, clamps, structure)
+        assert not jnp.any(jnp.isnan(final.nodes["hop"].z_latent))
+
+    def test_unclamped_prior_source_relaxes(self, rng_key):
+        """A top-down prior's z_mu stays the init constant while its ε
+        receives gradient through downstream z_mu."""
+        prior = Linear(shape=(3,), name="prior", weight_init=W_INIT)
+        h = Linear(
+            shape=(4,), name="h", activation=IdentityActivation(), weight_init=W_INIT
+        )
+        structure = graph(
+            nodes=[prior, h],
+            edges=[Edge(source=prior, target=h.slot("in"))],
+            task_map=TaskMap(y=h),
+            inference=EPCInference(eta_infer=0.05, infer_steps=3),
+        )
+        params = initialize_params(structure, rng_key)
+        batch_size = 4
+        clamps = {"h": jax.random.normal(rng_key, (batch_size, 4))}
+        state = initialize_graph_state(
+            structure, batch_size, rng_key, clamps, params=params
+        )
+        init_z_mu = state.nodes["prior"].z_mu
+
+        new_state = EPCInference.forward_value_and_grad(
+            params, state, clamps, structure
+        )
+        assert not jnp.allclose(new_state.nodes["prior"].latent_grad, 0.0)
+
+        final = run_inference(params, state, clamps, structure)
+        prior_final = final.nodes["prior"]
+        assert jnp.array_equal(prior_final.z_mu, init_z_mu)
+        assert jnp.allclose(
+            prior_final.z_latent, prior_final.z_mu + prior_final.error, atol=1e-6
+        )
+        # ε moved, so the latent moved off the init.
+        assert not jnp.allclose(prior_final.z_latent, state.nodes["prior"].z_latent)
+
+    def test_int_token_embedding_graph(self, rng_key):
+        """Int-dtype token clamps never enter the AD pytree; the clamped
+        source's state passes through forward_from_error untouched."""
+        from fabricpc.nodes.transformer_v2 import EmbeddingNode
+
+        tokens = IdentityNode(shape=(4,), name="tokens")
+        emb = EmbeddingNode(shape=(4, 8), name="emb", vocab_size=11, embed_dim=8)
+        out = Linear(
+            shape=(4, 8),
+            name="out",
+            activation=IdentityActivation(),
+            weight_init=W_INIT,
+        )
+        structure = graph(
+            nodes=[tokens, emb, out],
+            edges=[
+                Edge(source=tokens, target=emb.slot("in")),
+                Edge(source=emb, target=out.slot("in")),
+            ],
+            task_map=TaskMap(x=tokens, y=out),
+            inference=EPCInference(eta_infer=0.01, infer_steps=2),
+        )
+        params = initialize_params(structure, rng_key)
+        batch_size = 3
+        token_ids = jnp.array(
+            [[1, 2, 3, 4], [5, 6, 7, 8], [9, 10, 0, 1]], dtype=jnp.int32
+        )
+        clamps = {"tokens": token_ids}
+        state = initialize_graph_state(
+            structure, batch_size, rng_key, clamps, params=params
+        )
+
+        assert "tokens" not in EPCInference._relaxed_errors(structure, clamps)
+        final = run_inference(params, state, clamps, structure)
+        assert final.nodes["tokens"].z_latent.dtype == jnp.int32
+        assert jnp.array_equal(final.nodes["tokens"].z_latent, token_ids)
+        expected_mu = params.nodes["emb"].weights["embeddings"][token_ids]
+        assert jnp.allclose(final.nodes["emb"].z_mu, expected_mu, atol=1e-6)
+
+
+class TestCyclicSchedule:
+    def _cycle(self, unroll, infer_steps):
+        x = IdentityNode(shape=(5,), name="x")
+        a = Linear(
+            shape=(4,), name="a", activation=TanhActivation(), weight_init=W_INIT
+        )
+        b = Linear(
+            shape=(4,), name="b", activation=TanhActivation(), weight_init=W_INIT
+        )
+        y = Linear(
+            shape=(3,), name="y", activation=IdentityActivation(), weight_init=W_INIT
+        )
+        return graph(
+            nodes=[x, a, b, y],
+            edges=[
+                Edge(source=x, target=a.slot("in")),
+                Edge(source=a, target=b.slot("in")),
+                Edge(source=b, target=a.slot("in")),
+                Edge(source=b, target=y.slot("in")),
+            ],
+            task_map=TaskMap(x=x, y=y),
+            inference=EPCInference(eta_infer=0.02, infer_steps=infer_steps),
+            unroll=unroll,
+        )
+
+    def test_cyclic_smoke_jit_and_energy(self, rng_key):
+        structure = self._cycle(unroll=2, infer_steps=1)
+        params = initialize_params(structure, rng_key)
+        batch_size = 3
+        clamps = {
+            "x": jax.random.normal(rng_key, (batch_size, 5)),
+            "y": jax.random.normal(jax.random.PRNGKey(1), (batch_size, 3)),
+        }
+        state = initialize_graph_state(
+            structure, batch_size, rng_key, clamps, params=params
+        )
+        inference = structure.config["inference"]
+
+        @jax.jit
+        def step(p, s):
+            return inference.run_inference(p, s, clamps, structure)
+
+        energies = []
+        for _ in range(5):
+            state = step(params, state)
+            energies.append(float(_total_energy(state, structure)))
+        assert all(jnp.isfinite(jnp.array(energies)))
+        assert energies[-1] < energies[0]
+
+    def test_warm_start_two_steps_u1_differs_from_one_step_u2(self, rng_key):
+        """Each step starts from the carried state (truncated warm start), so
+        two steps at U=1 is a different computation from one step at U=2."""
+        batch_size = 3
+        x = jax.random.normal(rng_key, (batch_size, 5))
+        y = jax.random.normal(jax.random.PRNGKey(1), (batch_size, 3))
+        clamps = {"x": x, "y": y}
+
+        results = {}
+        for unroll, infer_steps in ((1, 2), (2, 1)):
+            structure = self._cycle(unroll=unroll, infer_steps=infer_steps)
+            params = initialize_params(structure, rng_key)
+            state = initialize_graph_state(
+                structure, batch_size, rng_key, clamps, params=params
+            )
+            final = structure.config["inference"].run_inference(
+                params, state, clamps, structure
+            )
+            results[(unroll, infer_steps)] = final
+
+        assert not jnp.allclose(
+            results[(1, 2)].nodes["a"].z_latent,
+            results[(2, 1)].nodes["a"].z_latent,
+            atol=1e-6,
+        )
+
+
+class TestMuPCScaling:
+    def test_derived_z_mu_matches_manual_scaling(self, rng_key):
+        from fabricpc.core.initializers import MuPCInitializer
+
+        x = IdentityNode(shape=(5,), name="x")
+        h = Linear(
+            shape=(4,),
+            name="h",
+            activation=IdentityActivation(),
+            weight_init=MuPCInitializer(),
+        )
+        y = Linear(
+            shape=(3,),
+            name="y",
+            activation=IdentityActivation(),
+            weight_init=MuPCInitializer(),
+        )
+        structure = graph(
+            nodes=[x, h, y],
+            edges=[
+                Edge(source=x, target=h.slot("in")),
+                Edge(source=h, target=y.slot("in")),
+            ],
+            task_map=TaskMap(x=x, y=y),
+            inference=EPCInference(eta_infer=0.01, infer_steps=2),
+            scaling=MuPCConfig(),
+        )
+        params = initialize_params(structure, rng_key)
+        batch_size = 4
+        x_data = jax.random.normal(rng_key, (batch_size, 5))
+        clamps = {"x": x_data}
+        state = initialize_graph_state(
+            structure, batch_size, rng_key, clamps, params=params
+        )
+
+        derived = EPCInference.derive_states(params, state, clamps, structure)
+        scale = structure.nodes["h"].node_info.scaling_config.forward_scale["x->h:in"]
+        expected_mu = (scale * x_data) @ params.nodes["h"].weights["x->h:in"] + (
+            params.nodes["h"].biases["b"]
+        )
+        assert jnp.allclose(derived.nodes["h"].z_mu, expected_mu, atol=1e-6)
+
+
+class TestOrderIndependence:
+    def test_one_step_grads_insertion_order_independent(self, rng_key):
+        """The global ε gradient is a property of the graph, not of node
+        insertion order: the derived forward walks the topological schedule."""
+
+        def build(order):
+            x = IdentityNode(shape=(5,), name="x")
+            a = Linear(
+                shape=(4,), name="a", activation=TanhActivation(), weight_init=W_INIT
+            )
+            b = Linear(
+                shape=(4,), name="b", activation=TanhActivation(), weight_init=W_INIT
+            )
+            y = Linear(
+                shape=(3,),
+                name="y",
+                activation=IdentityActivation(),
+                weight_init=W_INIT,
+            )
+            by_name = {"x": x, "a": a, "b": b, "y": y}
+            return graph(
+                nodes=[by_name[n] for n in order],
+                edges=[
+                    Edge(source=x, target=a.slot("in")),
+                    Edge(source=x, target=b.slot("in")),
+                    Edge(source=a, target=y.slot("in")),
+                    Edge(source=b, target=y.slot("in")),
+                ],
+                task_map=TaskMap(x=x, y=y),
+                inference=EPCInference(eta_infer=0.05, infer_steps=1),
+            )
+
+        structure_a = build(("x", "a", "b", "y"))
+        structure_b = build(("y", "b", "a", "x"))
+        params = initialize_params(structure_a, rng_key)
+        batch_size = 3
+        clamps = {
+            "x": jax.random.normal(rng_key, (batch_size, 5)),
+            "y": jax.random.normal(jax.random.PRNGKey(1), (batch_size, 3)),
+        }
+        state_a = initialize_graph_state(
+            structure_a, batch_size, rng_key, clamps, params=params
+        )
+        # Same per-node states wrapped for the permuted structure.
+        state_b = GraphState(
+            nodes={name: state_a.nodes[name] for name in structure_b.nodes},
+            batch_size=batch_size,
+        )
+
+        grads_a = EPCInference.forward_value_and_grad(
+            params, state_a, clamps, structure_a
+        )
+        grads_b = EPCInference.forward_value_and_grad(
+            params, state_b, clamps, structure_b
+        )
+        for name in structure_a.nodes:
+            assert jnp.allclose(
+                grads_a.nodes[name].latent_grad,
+                grads_b.nodes[name].latent_grad,
+                atol=1e-6,
+            ), f"{name}: one-step ε grads depend on insertion order"
+
+
+class TestFinalStateInvariant:
+    def test_z_latent_equals_z_mu_plus_error_after_run(self, rng_key):
+        structure = _chain(inference=EPCInference(eta_infer=0.05, infer_steps=5))
+        params = initialize_params(structure, rng_key)
+        batch_size = 4
+        clamps = {
+            "x": jax.random.normal(rng_key, (batch_size, 5)),
+            "y": jax.random.normal(jax.random.PRNGKey(1), (batch_size, 3)),
+        }
+        state = initialize_graph_state(
+            structure, batch_size, rng_key, clamps, params=params
+        )
+        final = run_inference(params, state, clamps, structure)
+
+        for name in structure.nodes:
+            node_state = final.nodes[name]
+            if name in clamps:
+                assert jnp.allclose(node_state.z_latent, clamps[name], atol=1e-6)
+            assert jnp.allclose(
+                node_state.z_latent.astype(node_state.z_mu.dtype),
+                node_state.z_mu + node_state.error,
+                atol=1e-6,
+            ), f"{name}: z_latent != z_mu + error after run_inference"
