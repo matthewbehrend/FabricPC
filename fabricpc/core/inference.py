@@ -398,6 +398,81 @@ class InferenceSGDNormClip(InferenceBase):
         )
 
 
+class InferenceSchedule(InferenceBase):
+    """
+    Composable inference schedule: solvers run as segments per weight update.
+
+    Usage:
+        inference = InferenceSchedule(
+            EPCInference(eta_infer=1e-3, infer_steps=5),
+            InferenceSGD(eta_infer=0.05, infer_steps=20),
+        )
+
+    The example composes a few cheap global ePC steps to near-equilibrium
+    with sPC refinement on the true arbitrary-graph energy (back edges
+    included), warm-started from ePC's solution.
+
+    Chained execution contract:
+    1. Node states are initialized once, by the graph's configured
+       initializer, before the first segment; no segment re-initializes.
+    2. Each solver receives z_latent, z_mu, and error exactly as the
+       previous segment (or the initializer) left them — no resync, no
+       re-derivation at the boundary. Each solver applies its own
+       ``begin_segment``/``finalize_state``.
+    3. The next solver continues from the resulting state (after e.g. ePC's
+       ``finalize_state`` rebuild).
+
+    A schedule has no single per-step rule, so ``inference_step`` and
+    ``compute_new_latent`` raise; per-step consumers (tracking) iterate
+    ``segments()`` instead, which flattens nested schedules.
+    """
+
+    def __init__(self, *solvers):
+        if not solvers:
+            raise ValueError("InferenceSchedule requires at least one solver")
+        for solver in solvers:
+            if not isinstance(solver, InferenceBase):
+                raise TypeError(
+                    f"InferenceSchedule accepts InferenceBase instances; "
+                    f"got {type(solver).__name__}"
+                )
+        super().__init__(solvers=tuple(solvers))
+
+    def run_inference(
+        self,
+        params: GraphParams,
+        initial_state: GraphState,
+        clamps: Dict[str, jnp.ndarray],
+        structure: GraphStructure,
+    ) -> GraphState:
+        """Fold the state through each solver's run_inference in order."""
+        state = initial_state
+        for solver in self.config["solvers"]:
+            state = solver.run_inference(params, state, clamps, structure)
+        return state
+
+    def segments(self):
+        """Flatten component segments — nested schedules compose."""
+        flattened = []
+        for solver in self.config["solvers"]:
+            flattened.extend(solver.segments())
+        return tuple(flattened)
+
+    @classmethod
+    def inference_step(cls, params, state, clamps, structure, config):
+        raise NotImplementedError(
+            "InferenceSchedule has no single per-step rule; iterate "
+            "segments() and step each segment's own solver."
+        )
+
+    @staticmethod
+    def compute_new_latent(node_name, node_state, config):
+        raise NotImplementedError(
+            "InferenceSchedule has no single per-step rule; iterate "
+            "segments() and step each segment's own solver."
+        )
+
+
 # =============================================================================
 # Convenience Function
 # =============================================================================

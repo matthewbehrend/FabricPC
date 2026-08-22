@@ -62,6 +62,55 @@ clipped_grad = latent_grad * clip_factor
 z_new = z * (1 - eta * latent_decay) - eta * clipped_grad
 ```
 
+## EPCInference
+
+Error-parameterized predictive coding (ePC, Goemaere et al., arXiv 2505.20137). The prediction error ε is the first-class relaxed variable; each latent is derived by a forward pass along `structure.schedule` as `z_latent = z_mu + ε`. Because every node's `z_mu` depends on all upstream latents, one `jax.value_and_grad` over the ε pytree per step delivers the output-loss signal to every layer unattenuated — a few steps replace sPC's hundreds on deep DAGs. The ε ↔ z_latent map is a volume-preserving bijection: identical energies, identical equilibria, and the final derived state feeds the local weight-gradient path unchanged.
+
+```python
+from fabricpc.core.inference_epc import EPCInference
+
+inference = EPCInference(eta_infer=1e-3, infer_steps=5, latent_decay=0.0)
+structure = graph(..., inference=inference)
+```
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `eta_infer` | `float` | `1e-3` | Inference rate on ε — tune like a weight learning rate (see below) |
+| `infer_steps` | `int` | `5` | Number of inference iterations |
+| `latent_decay` | `float` | `0.0` | Weight decay on the relaxed errors |
+
+**Update rule (per step):**
+```
+derive z_latent = z_mu + error along structure.schedule (clamped nodes keep the clamp, derive error)
+latent_grad = d(total energy of in_degree > 0 nodes)/d(error)   # one global reverse pass
+error_new = error * (1 - eta * latent_decay) - eta * latent_grad
+```
+
+The ε gradient is taken through the full network's transfer function — a change in one node's ε moves every downstream derived latent — so `eta_infer` must be tuned like a weight learning rate, not like sPC's local rate: sPC's typical 0.05–0.1 overshoots the minimum along the global gradient. Start from the weight optimizer's rate.
+
+On cyclic graphs, ePC minimizes the unrolled approximation of the graph energy fixed by `graph(..., unroll=U)`; state-based solvers minimize the exact graph energy as-is. Memory: each ePC step's single reverse pass stores activations for the whole derived forward (depth × unroll), backprop-scale rather than sPC's per-node closures.
+
+## InferenceSchedule
+
+Composes solvers as segments per weight update — e.g. a few cheap global ePC steps to near-equilibrium, then sPC refinement on the true arbitrary-graph energy, warm-started from ePC's solution:
+
+```python
+from fabricpc.core.inference import InferenceSGD, InferenceSchedule
+from fabricpc.core.inference_epc import EPCInference
+
+inference = InferenceSchedule(
+    EPCInference(eta_infer=1e-3, infer_steps=5),
+    InferenceSGD(eta_infer=0.05, infer_steps=20),
+)
+```
+
+Chained execution contract:
+1. Node states are initialized once, by the graph's configured initializer, before the first segment; no segment re-initializes.
+2. Each solver receives `z_latent`, `z_mu`, and `error` exactly as the previous segment (or the initializer) left them — no resync at the boundary.
+3. The next solver continues from the resulting state (after e.g. ePC's final derive rebuild).
+
+Schedules nest, and `segments()` flattens them for per-step consumers (tracking iterates segments instead of assuming one global step count). A schedule has no single per-step rule, so `inference_step()` and `compute_new_latent()` raise. Under a composed schedule, a tracked `latent_grad_norm` series carries each segment's own gradient semantics — sPC's one-hop dE/dz_latent, ePC's full-forward ε gradient.
+
 ## Tuning Guidance
 
 | Parameter | Typical Range | Notes |

@@ -58,6 +58,8 @@ inference = InferenceSGD(eta_infer=0.05, infer_steps=20)
 
 During training, the input node is clamped to `x` (the batch data) and the output node is clamped to `y` (the target labels). These clamped nodes provide boundary conditions, and the inference loop adjusts all unclamped latent states to minimize the total network energy given these constraints.
 
+The state-based update above moves the error signal one hop per step, so on deep graphs it needs many steps for the output clamp to reach early layers. `EPCInference` minimizes the same energy in error coordinates: the prediction errors are the relaxed variables, the latents are derived by one forward pass (`z_latent = z_mu + error`), and one global reverse pass per step delivers the loss signal to every layer at once — a few steps replace hundreds on deep DAGs, at backprop-scale memory per step. The two parameterizations share the same equilibria, and `InferenceSchedule` composes them per weight update (e.g. a few ePC steps, then sPC refinement on the exact graph energy — the general solver for arbitrary graphs, including cycles that are not unrolled). See the [Inference Algorithms API](12_api_inference.md).
+
 ### Outer Loop: Learning
 
 The **learning loop** updates weights using gradients computed from the converged states. After inference reaches equilibrium, each node computes local weight gradients based on its prediction error and the activity of its inputs. This is a Hebbian-like learning rule:

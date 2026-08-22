@@ -44,9 +44,11 @@ from fabricpc.core.inference import (
     InferenceBase,
     InferenceSGD,
     InferenceSGDNormClip,
+    InferenceSchedule,
     gather_inputs,
     run_inference,
 )
+from fabricpc.core.inference_epc import EPCInference
 
 # Initializers
 from fabricpc.core.initializers import (
@@ -96,6 +98,8 @@ __all__ = [
     "InferenceBase",
     "InferenceSGD",
     "InferenceSGDNormClip",
+    "EPCInference",
+    "InferenceSchedule",
     "gather_inputs",
     "run_inference",
     # Initializers
