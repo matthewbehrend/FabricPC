@@ -70,7 +70,9 @@ This plan replaces all four with one API. Core semantic positions:
   `0.5·precision·Σ(z-μ)²`, summed over all non-batch dimensions.
 - `mesh` — an optional `jax.sharding.Mesh` with axis `"data"`; batches are sharded on the leading
   axis with `NamedSharding(mesh, P("data"))`, params replicated with `P()`.
-- `step` — the count of optimizer updates applied in this `train` call (0-based, monotonic).
+- `step` — the count of optimizer updates applied in this `train` call. Not offset by
+  `start_epoch`: a resumed run counts from 0 again, so a caller logging a global step adds its
+  own checkpoint offset.
 
 ### The unified step (one axis: `algorithm`)
 
@@ -98,6 +100,11 @@ Verified mechanics (read in source, this branch):
   `FeedforwardStateInit` is already proven by the in-progress branch's 1e-12 backprop parity tests.
 - Under a sharded batch, XLA inserts the cross-device reduction where sharded per-sample
   quantities contract to replicated weight gradients; no explicit `pmean`/`axis_name` plumbing.
+  **Gradient-scale behavior change:** that contraction yields the global batch **sum**, matching
+  the single-device path; the legacy pmap path applied `pmean` over per-device shard sums, i.e.
+  Σ_global/N on N devices — its gradients disagreed with main's own single-device path by 1/N.
+  The new semantics are the correct ones, but multi-GPU learning rates tuned on 0.4 shift by ×N
+  for scale-sensitive optimizers — CHANGELOG behavior note required.
 
 ### Metrics dict (step output, callbacks, results)
 
@@ -178,7 +185,14 @@ def default_metrics(structure, algorithm) -> Dict[str, EvalMetric]
 
 # fabricpc/training/generation.py
 def generate(params, structure, prompt, max_new_tokens, rng_key,
-             temperature=1.0, top_k=None, top_p=None) -> jnp.ndarray
+             temperature=1.0, top_k=None, top_p=None,
+             algorithm="pc") -> jnp.ndarray
+    # Same algorithm split and validation as evaluate: "pc" settles via
+    # run_inference each step, "backprop" samples from the feedforward pass.
+    # Without it, a backprop-only graph (inference=None, which
+    # _validate_algorithm permits) crashes inside run_inference, and a
+    # backprop-trained model silently gets PC settling at generation time
+    # while its evaluate takes the feedforward pass.
 
 # fabricpc/core/energy.py
 def graph_energy(state, structure, *, node_names=None) -> jnp.ndarray
@@ -199,8 +213,12 @@ satisfies the unchanged `ExperimentArm` positional prefix; the arm's result unpa
 There is no `device_utils.py` and no `use_tqdm`: `verbose=True` shows tqdm bars and epoch
 summaries, `verbose=False` is silent.
 
-`config` reads only `num_epochs` (fractional supported; a partial epoch's `epoch_results` entry is
-the mean over the batches actually run). The trainer treats `config` otherwise as an opaque
+`config` reads only `num_epochs`, which is **required** — a missing key raises `ValueError`, no
+silent default (the same fail-fast stance as the retired keys; `ab_experiment`'s per-epoch time
+normalization depends on the value being explicit). Fractional values are supported; a partial
+epoch's `epoch_results` entry is the mean over the batches actually run, and a fractional tail
+that rounds to zero batches is dropped rather than appending an empty epoch entry and invoking
+the callback on empty metrics. The trainer treats `config` otherwise as an opaque
 pass-through to callbacks and `ExperimentArm` — in particular, settling parameters (`infer_steps`,
 `eta_infer`) live in the inference object inside `structure.config`, not here (docstring states
 this). `train`/`evaluate` raise `ValueError` if `config` contains a retired key (`"loss_type"`,
@@ -244,8 +262,14 @@ this). `train`/`evaluate` raise `ValueError` if `config` contains a retired key 
    (`utils/data/dataloader.py:268` yield; arrays materialized at `:336`/`:466`) hit `TypeError` in
    `_validate_clamp_dtypes`.
 3. Causal mask, graph-derived: if `"causal_mask" in structure.task_map`, inject
-   `broadcast_to(tril[None,None], (batch, 1, seq, seq))` at `task_map["causal_mask"]`; otherwise
-   no-op. No caller flag: no non-AR graph in the repo declares the key, v1 transformer graphs
+   `broadcast_to(tril[None,None], (batch, 1, seq, seq))` at `task_map["causal_mask"]`, with `seq`
+   read from the mask node's declared shape (`node_info.shape[-1]`) — genuinely graph-derived,
+   not from a hard-coded `batch["x"]` whose absence would be a bare `KeyError`; otherwise no-op.
+   Target clamps are shape-validated here (`(batch, *node.shape)` after one-hot) so a wrong-shape
+   target raises an actionable `ValueError` instead of an opaque XLA broadcast error (the legacy
+   AR path had such a check; the shape rule also makes rank-1 target clamps unrepresentable,
+   which keeps the trainer's `n_predictions = prod(shape[:-1])` consistent with
+   `metrics._predictions_per_sample`). No caller flag: no non-AR graph in the repo declares the key, v1 transformer graphs
    declare the mask node in their `TaskMap`, and v2 graphs mask internally
    (`MhaResidualNode(is_causal=True)`), so the in-progress `_require_causal_mask_node` raise on v2
    graphs is deleted.
@@ -254,7 +278,11 @@ this). `train`/`evaluate` raise `ValueError` if `config` contains a retired key 
 
 ```python
 def _batch_grads(params, batch, structure, rng_key, *, algorithm):
-    batch_size = next(iter(batch.values())).shape[0]
+    # Batch size reads the leading axis of the first task-mapped batch key,
+    # never an arbitrary batch value: an extra key whose leading axis is not
+    # the batch would yield a wrong size (and, under mesh, a hard sharding
+    # failure). A batch with no task-mapped key raises.
+    batch_size = <leading axis of the first batch key in structure.task_map>
     clamps = build_clamps(batch, structure, clamp_target=True)           # (2) identical for both
     target_nodes = tuple(n for n in clamps
                          if structure.nodes[n].node_info.in_degree > 0)  # static
@@ -375,7 +403,11 @@ dropped.
   the renamed `loss` key and would otherwise silently log 0.0.
 - `utils/dashboarding/callbacks.py`: the four factories take the new contracts
   (`create_epoch_callback`'s eval-and-return behavior is exactly the return-replaces-history rule);
-  `create_detailed_iter_callback` remains custom-loop-only on `make_train_step`'s `final_state`.
+  `create_detailed_iter_callback` remains custom-loop-only on `make_train_step`'s `final_state`
+  and **migrates to the step's contract** — `(epoch_idx, batch_idx, metrics: dict, final_state)`,
+  reading `metrics["energy"]` — with a custom-loop example in guide 09; leaving it on the pre-0.5
+  `(..., energy: float, ...)` shape would strand it with zero valid call sites. The vestigial
+  `batch_size` normalization parameters are deleted from all factories (energy is per-sample).
 - `utils/dashboarding/extractors.py`: energy extraction points at `graph_energy`.
 - `utils/dashboarding/inference_tracking.py:train_step_with_history`: same signature, body rebuilt
   on `build_clamps` → `initialize_graph_state` → `run_inference_with_history` → `graph_energy` →
@@ -477,7 +509,8 @@ create_causal_mask, TrainResult, EpochContext, EvalMetric`, plus the `metrics` s
 `train_pcn, evaluate_pcn`; docstring example), `pyproject.toml` (0.5.0; **drop `flax`** — nothing
 imports it and the checkpointing follow-up uses Orbax), `fabricpc/experiments/ab_experiment.py`
 (result unpack), `fabricpc/tuning/bayesian_tuner.py` (callback, keys, `_log`),
-`fabricpc/utils/dashboarding/{inference_tracking,callbacks,extractors}.py`, plus the
+`fabricpc/utils/dashboarding/{inference_tracking,callbacks,extractors}.py`,
+`.github/workflows/test.yml` (the 2-host-device sharding step — see test plan), plus the
 callers/tests/docs below.
 
 ## Implementation steps (one PR, ordered)
@@ -531,6 +564,12 @@ callers/tests/docs below.
 - `examples/mnist_aim_tracking.py`: `evaluate_pcn→evaluate`; `train_step_with_history` energy-scale
   label update.
 - `examples/transformer_tuning.py`: check base_config for retired keys.
+- Recorded demo baselines: the transformer demos' docstring Results blocks were produced by the
+  deleted trainers (their print format, the pre-fix eval numerics, the per-token AR-backprop
+  objective). The README requires demos to match recorded baselines, so each block is either
+  re-measured under 0.5 or explicitly marked pre-0.5 with the reasons the numbers shifted —
+  "reproduction disregarded" is a decision about the code, not a license to leave stale numbers
+  presented as current.
 
 ## Test plan
 
@@ -538,6 +577,14 @@ New `tests/test_trainer.py`:
 - PC parity vs an in-test hand-rolled reference step (clamps → init → inference → energy → local
   grads → optax) at 1e-12 under the fold_in stream — permanent parity evidence independent of the
   deleted legacy files.
+- **RNG-sensitive legs are mandatory for every test that claims to pin the key stream.** Under
+  the default `FeedforwardStateInit`, the second pass overwrites the random `z_latent` of every
+  unclamped `in_degree>0` node with the feedforward `z_mu`, the only `in_degree==0` node is
+  clamped, and inference is deterministic — so `rng_key` has no effect on such graphs and a
+  parity/resume test on them passes under *any* key derivation. The parity and resume tests run
+  a second leg on a `GlobalStateInit` graph, plus a negative test that `start_epoch=k` produces
+  different params than `start_epoch=0` there (the leg that fails if the stream derives from the
+  epoch offset instead of the epoch index).
 - Backprop gradient correctness: reference CE loss composed from raw jnp ops on a 2-layer
   softmax graph; `jax.grad` of it vs the step's applied update with `optax.sgd(1.0)`; plus a
   `GaussianEnergy`-output variant asserting the objective equals `0.5·precision·SSE/batch`.
@@ -569,6 +616,9 @@ New `tests/test_trainer.py`:
 New `tests/test_sharding.py` (replaces `test_multi_gpu.py`):
 `XLA_FLAGS=--xla_force_host_platform_device_count=2` — mesh-vs-single-device parity for one train
 step and for `evaluate` (including a ragged final batch exercising the pad-and-weight path).
+Because the multi-device legs skip without that env var, replacing the unconditional
+`test_multi_gpu.py` with them silently removes CI coverage unless the workflow changes too:
+`.github/workflows/test.yml` gains a step running `pytest tests/test_sharding.py` under the flag.
 
 Updates in place: `test_fabricpc.py`, `test_ndim_shapes.py`, `test_optimizers.py`,
 `test_storkey_hopfield.py`, `test_conv_pool_integration.py`, `test_mupc.py`,
@@ -586,9 +636,15 @@ adjusted key-set assertion); `test_bayesian_tuner.py` (fakes drive the `EpochCon
   the RNG contract, mesh-based multi-device (`jax.make_mesh`), `EpochContext` callbacks,
   `ExperimentArm` partial pattern.
 - Mechanical renames: `02_quickstart.md`, `03_how_predictive_coding_works.md`, `07_optimizers.md`,
-  `09_experiment_tracking.md`, `14_api_data.md`, `15_api_experiments.md`, `README.md`.
+  `14_api_data.md`, `15_api_experiments.md`, `README.md`.
   All snippets must bind against the new signatures in the same change
   (`tests/test_doc_snippets.py` enforces this).
+- `09_experiment_tracking.md` is **not** a mechanical rename: its custom-loop snippet embeds three
+  semantic contracts that changed — `train_step_with_history` now returns per-sample energy (so
+  the snippet's `energy / batch_size` double-normalizes), it takes a batch dict (the snippet must
+  call `convert_batch` on tuple-yielding loaders), and the per-batch key must advance
+  (`fold_in(fold_in(rng_key, epoch), batch_idx)`), not be reused verbatim. The signature-binding
+  check in `test_doc_snippets.py` catches none of these; they must be rewritten by hand.
 - `CHANGELOG.md` `[0.5.0]`: migration table (every removed name → replacement) + behavior notes:
   AR-backprop per-sample objective (÷ legacy lr by seq_len to reproduce), CE eps `clip(1e-7,1)` vs
   `+1e-10`, retired config keys raise, Gaussian-output backprop objective is `0.5·precision·SSE`
@@ -598,6 +654,15 @@ adjusted key-set assertion); `test_bayesian_tuner.py` (fakes drive the `EpochCon
   reproducible under 0.5), pmap → mesh migration (`pmap_single_device` removed), `flax` dependency
   removed, backprop gains tqdm/multi-device, multi-input eval batches now clamp all non-target
   task keys.
+  The migration table also carries every **signature** break a migrating reader hits, not only
+  removed names: the `iter_callback` third argument (`energy: float` → metrics dict), the
+  `epoch_callback` contract (five positionals → one `EpochContext`), `evaluate`'s now-required
+  `rng_key` (legacy `evaluate_backprop` defaulted `None` → `PRNGKey(0)`), and the dashboarding
+  `create_detailed_iter_callback` shape. Behavior notes additionally cover: multi-device PC
+  gradients are the global batch sum (pmap applied a device mean — ×N scale for the same global
+  batch), `num_epochs` is required (silent default of 10 removed), `evaluate` on an empty loader
+  returns `NaN` per metric (was `0.0`), and the default metrics raise on a no-target graph
+  (`evaluate_pcn` returned `{"energy": …, "accuracy": 0.0}`).
 
 ## Verification
 
@@ -612,6 +677,42 @@ JAX_PLATFORMS=cpu .venv/bin/python examples/PC_backprop_compare.py       # same-
 XLA_FLAGS=--xla_force_host_platform_device_count=2 JAX_PLATFORMS=cpu \
     .venv/bin/python -m pytest tests/test_sharding.py -q                 # real 2-device mesh leg
 .venv/bin/python -c "from fabricpc import train, evaluate; from fabricpc.training import make_train_step, generate, TrainResult, EpochContext, EvalMetric, metrics"
+```
+
+### Results (2026-08-22)
+
+| Leg | Result |
+|---|---|
+| `pytest tests/ -x -q` | **373 passed, 6 skipped** in 2:24 (2 optuna `ExperimentalWarning`s only) |
+| Retired-symbol grep | 12 hits, **no live call sites**: the `trainer.py` fail-fast messages for the retired `loss_type`/`use_causal_mask` config keys, the user-guide text documenting their retirement, the test parametrization asserting the raise, a `test_sharding.py` docstring naming the pmap tests it replaces, and a `transformer_v2_demo.py` comment pointing at `mnist_multi_gpu.py` |
+| `mnist_demo.py` (CPU) | Test accuracy **98.13%**; epoch energy monotone at the tail (0.0026 → 0.0023 → 0.0020); ~3.5 s/epoch |
+| `transformer_v2_demo.py --num_epochs 0.02` (GPU, per deviation 6) | Accuracy 26.55%, CE 2.7015, **perplexity 14.90**; generation produces text |
+| `transformer_v2_demo.py --num_epochs 0.02 --mode backprop` (GPU) | Accuracy 27.69%, CE 2.6297, **perplexity 13.87** |
+| `PC_backprop_compare.py --n_trials 1` (per deviation 6) | Same-graph gelu arms: PC 97.75%, backprop 97.36% (+0.39%); per-epoch time ratio 1.02× |
+| `test_sharding.py` (2-device CPU mesh) | **6 passed** in 5.5 s |
+| Public-API import check | OK |
+
+Full run of transformer_v2_demo
+```bash
+python examples/transformer_v2_demo.py```
+```
+PC mode: batch_size=16
+Model parameters: 108,353
+Vocab Size: 65
+Epoch 1/5 — energy: 275.5329, target_energy: 2.1492                                                                                                                                                                                                                                                                 
+Epoch 2/5 — energy: 261.7871, target_energy: 2.0417                                                                                                                                                                                                                                                                 
+Epoch 3/5 — energy: 252.7063, target_energy: 1.9710                                                                                                                                                                                                                                                                 
+Epoch 4/5 — energy: 249.3224, target_energy: 1.9445                                                                                                                                                                                                                                                                 
+Epoch 5/5 — energy: 245.0873, target_energy: 1.9116                                                                                                                                                                                                                                                                 
+Epoch 5/5: 100%|██████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 313660/313660 [3:16:14<00:00, 26.64it/s, energy=240.8698, epoch=5/5]
+Training completed in 11775.3s
+Evaluation completed in 82.5s
+Test Accuracy:   35.06%
+Test CE Loss:    2.2542
+Test Perplexity: 9.53
+--- Generating ---
+ROMEO: my, mes one to ind saconing not dundye
+Theroug bears en the to ate.
 ```
 
 ## Risks
@@ -652,6 +753,54 @@ XLA_FLAGS=--xla_force_host_platform_device_count=2 JAX_PLATFORMS=cpu \
    takes hours), and the transformer smoke legs ran on GPU — the CPU legs are dominated by the
    stride-1 test loader (~3,400 eval batches), a cost identical before and after this change.
 
+
+## Plan gaps found in PR review (2026-08-23)
+
+Defects the review traced to the plan itself, not to implementation slips. Each is now folded
+into the relevant section above; this log records what the plan originally missed.
+
+1. **RNG-test vacuity.** The test plan specified parity/resume tests but never required a graph
+   on which the key matters. Every planned fixture used the default `FeedforwardStateInit`, whose
+   second pass overwrites unclamped latents — so the resume "bitwise property", the permanent
+   parity references, and the step-3 bitwise RNG gate were all insensitive to the key stream (the
+   gate would have passed the split-chain → fold_in switch even if the switch were wrong). Fixed:
+   the test plan now mandates `GlobalStateInit` legs and a negative `start_epoch` test.
+2. **CI coverage regression.** The plan deleted `test_multi_gpu.py` (ran unconditionally in CI)
+   and replaced it with env-gated sharding tests, but the file-changes list never touched
+   `.github/workflows/test.yml` — CI silently stopped executing any multi-device test. Fixed:
+   the workflow gains a 2-host-device step; the file-changes and test-plan sections name it.
+3. **Multi-device gradient scale unflagged.** The device-parallelism design said "XLA inserts the
+   cross-device reduction" without stating the semantic consequence: global batch **sum** where
+   pmap applied a device **mean**, a ×N learning-rate-visible change absent from the plan's
+   CHANGELOG list. Fixed in the design section and the CHANGELOG list.
+4. **`generate` had no algorithm axis.** The plan gave `evaluate` the settle-vs-feedforward split
+   and `_validate_algorithm` explicitly permits `inference=None` for backprop, but the planned
+   `generate` signature always settled via `run_inference` — crashing on backprop-only graphs and
+   silently PC-settling backprop-trained models. Fixed: `generate(..., algorithm=)` with the same
+   validation.
+5. **`num_epochs` missing-key behavior unspecified.** "`config` reads only `num_epochs`" defined
+   the read but not the miss; the implementation inherited a silent default of 10 while
+   `ab_experiment` assumed 1 — contradicting the plan's own fail-fast stance on retired keys.
+   Fixed: required, raises.
+6. **The plan's own pseudocode embedded two fragile derivations** it elsewhere claimed were
+   graph-derived: `batch_size = next(iter(batch.values())).shape[0]` (wrong under an extra
+   non-batch-leading key; hard sharding failure under mesh) and the causal-mask `seq` from
+   `batch["x"]` (a bare `KeyError` when the input task key is not named `x`). Fixed: batch size
+   from the first task-mapped key, `seq` from the mask node's declared shape.
+7. **CHANGELOG list omitted the signature breaks** a migrating reader actually hits — the
+   `iter_callback`/`epoch_callback` contracts, `evaluate`'s required `rng_key`, empty-loader
+   `NaN`, and the no-target default-metrics raise. Fixed in the CHANGELOG section.
+8. **Doc/example migration misclassified.** Guide 09's custom-loop snippet was listed under
+   "mechanical renames" although it embeds three changed semantic contracts (per-sample energy
+   scale, batch-dict conversion, per-batch key threading) that the doc-snippet signature check
+   cannot catch; and "reproduction of pre-unification transformer results is disregarded" left
+   the demos' recorded Results blocks presented as current although the README requires demos to
+   match baselines. Fixed: guide 09 called out for a hand rewrite; baseline blocks re-measured or
+   marked pre-0.5.
+9. **`create_detailed_iter_callback` migration underspecified.** "Remains custom-loop-only on
+   `make_train_step`'s `final_state`" named the consumer but not the contract, so the factory
+   kept the pre-0.5 `(epoch, batch, energy: float, state)` shape with zero valid call sites.
+   Fixed: the step's metrics-dict contract, documented with a custom-loop example.
 
 ## Followups TODO
 - Support non-deterministic nodes. RNG seed splitting into the inference path for future dropout and other stochastic processing in nodes.

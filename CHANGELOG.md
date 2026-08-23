@@ -37,6 +37,10 @@ removed, not deprecated.
 | `config["loss_type"]` | removed — raises `ValueError`; set the output node's energy functional |
 | `config["use_causal_mask"]` | removed — raises `ValueError`; the mask follows the graph |
 | `autoregressive=` (never released) | removed — mask graph-derived, one-hot dtype-derived |
+| `iter_callback(epoch_idx, batch_idx, energy: float)` | `iter_callback(epoch_idx, batch_idx, metrics: dict)` — read `metrics["energy"]`; formatting the third argument directly (`f"{energy:.4f}"`) now raises `TypeError` |
+| `epoch_callback(epoch_idx, params, structure, config, rng_key)` — five positionals | `epoch_callback(ctx: EpochContext)` — one context argument, fields by name |
+| `evaluate_backprop(..., rng_key=None)` (defaulted to `PRNGKey(0)`) | `evaluate` — `rng_key` is a required positional |
+| `create_detailed_iter_callback` (dashboarding) `(epoch_idx, batch_idx, energy: float, final_state)` | `(epoch_idx, batch_idx, metrics: dict, final_state)`, for custom loops over `make_train_step` |
 
 ### New
 
@@ -63,9 +67,38 @@ removed, not deprecated.
   from their dtype (class count from the target node's `shape[-1]`); stock
   int32 token loaders now work with backprop training too.
 - Backprop training gains tqdm progress and multi-device data parallelism.
+- `generate(..., algorithm=)` with the same validation as `train`/`evaluate`:
+  `"pc"` (default) settles via `run_inference`, `"backprop"` samples from the
+  feedforward pass — required for graphs built with `inference=None`, which
+  previously crashed inside `run_inference` with an opaque `AttributeError`.
+- `BayesianTuner(algorithm=)` threads the learning algorithm through every
+  trial's `train`/`evaluate` (previously fixed to PC), and raises instead of
+  silently scoring `inf` when the trial graph has no `CrossEntropyEnergy`
+  target (no `perplexity` key to minimize).
+- Fail-fast diagnostics: a wrong-shape target raises an actionable
+  `ValueError` from `build_clamps` (was an opaque XLA broadcast error), a
+  loader without `len()` and a mesh without a `"data"` axis raise messages
+  naming the requirement, and the causal-mask sequence length is read from
+  the mask node's declared shape instead of a hard-coded `batch["x"]`.
 
 ### Behavior changes
 
+- Multi-device PC weight gradients are now the global batch sum, matching the
+  single-device semantics (pinned by the mesh-vs-single-device parity tests).
+  The 0.4 pmap path applied a device mean (`pmean`) over per-device shard
+  sums, so its gradients were smaller by the device count N for the same
+  global batch. To reproduce 0.4 multi-GPU runs with a scale-sensitive
+  optimizer (SGD), divide the learning rate by N; Adam-family updates are
+  invariant to the gradient scale up to `eps`, so Adam runs shift only
+  marginally.
+- `config["num_epochs"]` is required by `train`; the legacy silent default of
+  10 epochs is removed (a missing key now raises `ValueError`). A fractional
+  tail that rounds to zero batches is dropped instead of producing an empty
+  epoch entry.
+- `evaluate` on an empty loader returns `NaN` for each metric (was `0.0`).
+- The default eval metrics raise `ValueError` on a graph with no target task
+  key (`evaluate_pcn` silently returned `{"energy": ..., "accuracy": 0.0}`);
+  pass an explicit `metrics=` dict to evaluate such a graph.
 - Eval result keys: `loss` is renamed `cross_entropy`; `target_energy` is new;
   `cross_entropy`/`perplexity` are reported only for `CrossEntropyEnergy`
   targets (previously a finite-but-meaningless cross-entropy could be reported

@@ -326,7 +326,10 @@ class TestIntegration:
         y = jax.nn.one_hot(
             jax.random.randint(x_key, (batch_size,), 0, n_classes), n_classes
         )
-        batch = {"input": x, "class": y}
+        # Batch keys are TASK keys (x/y), not node names: a batch keyed by
+        # node names matches nothing in the task_map, produces zero clamps,
+        # and now raises instead of silently training unclamped.
+        batch = {"x": x, "y": y}
 
         optimizer = optax.adam(1e-3)
         opt_state = optimizer.init(params)

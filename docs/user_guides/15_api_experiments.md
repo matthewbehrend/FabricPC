@@ -142,6 +142,8 @@ Optuna ships in the `[experiments]` extra, not the core install: `pip install "f
 
 Two-phase Optuna search for language-model hyperparameters, both phases minimizing validation perplexity. Phase 1 searches architecture and training parameters together, with Hyperband pruning that allocates training epochs as the trial resource: unpromising trials are stopped after few epochs while strong ones train longer. Phase 2 fixes the Phase 1 winning architecture and refines the continuous training parameters (`lr`, `eta_infer`, `infer_steps`) with a multivariate TPE sampler that models correlations between them. Training energy serves only as a divergence guard: a trial is pruned when its energy becomes non-finite or rises above its best epoch by more than `divergence_rel_tol`.
 
+The perplexity objective requires the trial graph's target node to use `CrossEntropyEnergy` — `evaluate` reports `perplexity` only then, and the tuner raises on a graph without it rather than scoring the trial silently. `algorithm=` selects the learning algorithm for every trial's `train`/`evaluate` call (`"pc"` default, `"backprop"` supported).
+
 ```python
 from fabricpc.tuning import BayesianTuner
 
@@ -193,6 +195,7 @@ Full runnable version: `examples/transformer_tuning.py`.
 | `log_file` | `str` | `"tuning_results.txt"` | Per-trial results log |
 | `divergence_rel_tol` | `float` | `0.5` | Relative energy rise over the trial's best epoch that triggers pruning |
 | `verbose` | `bool` | `False` | Print per-epoch trial progress |
+| `algorithm` | `str` | `"pc"` | Learning algorithm passed to every trial's `train`/`evaluate` |
 
 **Methods:**
 

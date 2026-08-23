@@ -2,9 +2,11 @@
 
 Sampling runs a jitted ``lax.scan`` over a fixed-size sliding context
 window: each step clamps the window into the input node (plus the graph's
-causal mask, when its ``TaskMap`` declares one), settles the graph via
-``run_inference``, and samples the next token from the output node's
-post-activation probabilities (``z_mu``) at the last position.
+causal mask, when its ``TaskMap`` declares one), produces the graph state —
+settled via ``run_inference`` for ``algorithm="pc"``, the single feedforward
+pass for ``algorithm="backprop"``, mirroring ``evaluate`` — and samples the
+next token from the output node's post-activation probabilities (``z_mu``)
+at the last position.
 """
 
 from typing import Optional, Tuple
@@ -15,7 +17,7 @@ import jax.numpy as jnp
 from fabricpc.core.inference import run_inference
 from fabricpc.core.types import GraphParams, GraphStructure
 from fabricpc.graph_initialization.state_initializer import initialize_graph_state
-from fabricpc.training.trainer import build_clamps
+from fabricpc.training.trainer import Algorithm, _validate_algorithm, build_clamps
 
 
 def _generation_step(
@@ -30,6 +32,7 @@ def _generation_step(
     temperature: float,
     top_k: Optional[int],
     top_p: Optional[float],
+    algorithm: str,
 ) -> Tuple[Tuple[jnp.ndarray, jnp.ndarray, jax.Array], jnp.ndarray]:
     """Single ``lax.scan`` generation step over a fixed-size sliding window.
 
@@ -50,10 +53,11 @@ def _generation_step(
     # Input only — the output runs free. build_clamps injects the causal
     # mask when the graph's TaskMap declares one (v1); v2 masks internally.
     clamps = build_clamps({"x": input_data}, structure, clamp_target=False)
-    state = initialize_graph_state(
+    final_state = initialize_graph_state(
         structure, batch_size, init_key, clamps=clamps, params=params
     )
-    final_state = run_inference(params, state, clamps, structure)
+    if algorithm == "pc":
+        final_state = run_inference(params, final_state, clamps, structure)
 
     # z_mu is post-activation (softmax) probabilities; take the last position.
     output_probs = final_state.nodes[output_node].z_mu
@@ -98,6 +102,7 @@ def generate(
     temperature: float = 1.0,
     top_k: Optional[int] = None,
     top_p: Optional[float] = None,
+    algorithm: Algorithm = "pc",
 ) -> jnp.ndarray:
     """Autoregressively sample ``max_new_tokens`` from a trained model.
 
@@ -116,7 +121,13 @@ def generate(
         temperature: Sampling temperature (>1 flattens, <1 sharpens).
         top_k: If set, sample only from the k highest-probability tokens.
         top_p: If set, nucleus sampling with this cumulative-probability cap.
+        algorithm: ``"pc"`` (default) settles the graph via ``run_inference``
+            before reading the output probabilities; ``"backprop"`` reads
+            them off the single feedforward pass — the same split as
+            ``evaluate``, and the only option for a graph built with
+            ``inference=None``. Validation mirrors ``train``/``evaluate``.
     """
+    _validate_algorithm(algorithm, structure)
     if prompt.ndim == 1:
         prompt = prompt[None, :]
         unbatch = True
@@ -155,6 +166,7 @@ def generate(
                 temperature=temperature,
                 top_k=top_k,
                 top_p=top_p,
+                algorithm=algorithm,
             )
 
         output_buffer = jnp.zeros((batch_size, max_new_tokens), dtype=jnp.int32)

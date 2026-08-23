@@ -146,6 +146,8 @@ config = TrackingConfig(
 For detailed tracking including inference dynamics, use a custom training loop with `train_step_with_history`:
 
 ```python
+import jax
+from fabricpc.training import convert_batch
 from fabricpc.utils.dashboarding import (
     AimExperimentTracker,
     TrackingConfig,
@@ -173,9 +175,14 @@ jit_train_step = jax.jit(
 )
 
 for epoch in range(num_epochs):
-    for batch_idx, batch in enumerate(train_loader):
+    epoch_key = jax.random.fold_in(rng_key, epoch)
+    for batch_idx, batch_data in enumerate(train_loader):
+        # convert_batch turns a (x, y) tuple batch into the {"x", "y"} dict
+        # the step's clamp assembly iterates.
+        batch = convert_batch(batch_data)
+        batch_key = jax.random.fold_in(epoch_key, batch_idx)
         params, opt_state, energy, final_state, stacked_history = jit_train_step(
-            params, opt_state, batch, rng_key
+            params, opt_state, batch, batch_key
         )
 
         # Unstack inference history outside of JIT
@@ -183,8 +190,9 @@ for epoch in range(num_epochs):
             stacked_history, collect_every=collect_every
         )
 
-        # Track batch metrics
-        tracker.track_batch_energy(energy / batch_size, epoch, batch_idx)
+        # energy is already the per-sample objective (graph_energy over
+        # internal nodes / batch size) — no further normalization.
+        tracker.track_batch_energy(float(energy), epoch, batch_idx)
         tracker.track_batch_energy_per_node(final_state, structure, epoch, batch_idx)
 
         # Track state stats/distributions at configured frequency
@@ -197,6 +205,44 @@ for epoch in range(num_epochs):
         convergence = summarize_inference_convergence(inference_history)
         print(f"h1 final energy: {convergence['h1']['final_energy']:.4f}")
 
+tracker.close()
+```
+
+### Per-batch state tracking with `make_train_step`
+
+`create_detailed_iter_callback` tracks per-node energy and state
+distributions alongside the batch energy. It consumes the final
+`GraphState`, which only `make_train_step`'s step returns, so it plugs into
+a custom loop — not into `train(iter_callback=...)`:
+
+```python
+import jax
+from fabricpc.training import convert_batch, make_train_step
+from fabricpc.utils.dashboarding import (
+    AimExperimentTracker,
+    TrackingConfig,
+    create_detailed_iter_callback,
+)
+
+tracker = AimExperimentTracker(config=TrackingConfig(experiment_name="detailed"))
+detailed_cb = create_detailed_iter_callback(tracker, structure)
+
+step = make_train_step(structure, optimizer)
+opt_state = optimizer.init(params)
+for epoch in range(num_epochs):
+    epoch_key = jax.random.fold_in(rng_key, epoch)
+    for batch_idx, batch_data in enumerate(train_loader):
+        batch = convert_batch(batch_data)
+        batch_key = jax.random.fold_in(epoch_key, batch_idx)
+        params, opt_state, metrics, final_state = step(
+            params, opt_state, batch, batch_key
+        )
+        detailed_cb(
+            epoch,
+            batch_idx,
+            {k: float(v) for k, v in metrics.items()},
+            final_state,
+        )
 tracker.close()
 ```
 

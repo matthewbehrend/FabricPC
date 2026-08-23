@@ -12,13 +12,14 @@ trainers:
 """
 
 import math
-from typing import Iterator, List
+from typing import List
 
 import jax
 import jax.numpy as jnp
 import optax
 import pytest
 
+from conftest import ListLoader, make_classification_structure, max_param_diff
 from fabricpc.core.activations import (
     IdentityActivation,
     SigmoidActivation,
@@ -56,19 +57,6 @@ PARITY_TOL = 1e-12
 # ---------------------------------------------------------------------------
 
 
-class ListLoader:
-    """Deterministic loader: same batches every time it is iterated."""
-
-    def __init__(self, batches):
-        self._batches = batches
-
-    def __len__(self) -> int:
-        return len(self._batches)
-
-    def __iter__(self) -> Iterator:
-        return iter(self._batches)
-
-
 def make_batches(
     rng_key, *, batch_size=4, n_batches=3, in_dim=6, n_classes=3, one_hot=True
 ):
@@ -83,26 +71,16 @@ def make_batches(
     return ListLoader(batches)
 
 
-def classification_structure(output_energy=None, output_activation=None):
-    """3-node Linear chain; the default FeedforwardStateInit satisfies both
-    algorithms, and InferenceSGD drives PC settling."""
-    x = Linear(shape=(6,), name="x")
-    h = Linear(shape=(8,), activation=SigmoidActivation(), name="h")
-    y = Linear(
-        shape=(3,),
-        activation=output_activation or SoftmaxActivation(),
-        energy=output_energy or CrossEntropyEnergy(),
-        name="y",
-    )
-    return graph(
-        nodes=[x, h, y],
-        edges=[
-            Edge(source=x, target=h.slot("in")),
-            Edge(source=h, target=y.slot("in")),
-        ],
-        task_map=TaskMap(x=x, y=y),
-        inference=InferenceSGD(eta_infer=0.05, infer_steps=10),
-    )
+classification_structure = make_classification_structure
+
+
+def rng_sensitive_structure():
+    """The classification chain with GlobalStateInit: unclamped latents keep
+    their random initialization into inference, so the training key changes
+    the result. Under the default FeedforwardStateInit the feedforward pass
+    overwrites every unclamped in_degree>0 latent and the key has no effect —
+    tests that pin the RNG stream must use this graph."""
+    return make_classification_structure(state_initializer=GlobalStateInit())
 
 
 def sequence_structure(seq_len=6, vocab_size=11):
@@ -147,20 +125,26 @@ def v1_masked_structure(seq_len=5, vocab_size=7):
     )
 
 
-def max_param_diff(a, b) -> float:
-    diffs = jax.tree_util.tree_map(lambda p, q: jnp.max(jnp.abs(p - q)), a, b)
-    return float(jax.tree_util.tree_reduce(jnp.maximum, diffs, jnp.array(0.0)))
-
-
 # ---------------------------------------------------------------------------
 # PC parity vs a hand-rolled reference step
 # ---------------------------------------------------------------------------
 
 
-def test_pc_parity_hand_rolled_reference(rng_key):
+@pytest.mark.parametrize("graph_kind", ["feedforward_init", "global_init"])
+def test_pc_parity_hand_rolled_reference(rng_key, graph_kind):
     """train(algorithm='pc') matches the composed primitives under the
-    fold_in stream: clamps -> init -> inference -> local grads -> optax."""
-    structure = classification_structure()
+    fold_in stream: clamps -> init -> inference -> local grads -> optax.
+
+    The global_init leg is the RNG-sensitive one: with GlobalStateInit the
+    latent initialization consumes the key, so this leg fails under any
+    other key derivation (the feedforward_init leg is key-insensitive and
+    pins only the non-RNG mechanics).
+    """
+    structure = (
+        classification_structure()
+        if graph_kind == "feedforward_init"
+        else rng_sensitive_structure()
+    )
     params_key, train_key = jax.random.split(rng_key)
     params = initialize_params(structure, params_key)
     loader = make_batches(rng_key)
@@ -272,8 +256,17 @@ def test_backprop_gaussian_objective_is_precision_sse(rng_key):
 # ---------------------------------------------------------------------------
 
 
-def test_resume_is_bitwise_identical(rng_key):
-    structure = classification_structure()
+@pytest.mark.parametrize("graph_kind", ["feedforward_init", "global_init"])
+def test_resume_is_bitwise_identical(rng_key, graph_kind):
+    """The global_init leg pins the resume RNG contract: with GlobalStateInit
+    the per-epoch keys matter, so this leg fails if start_epoch were ignored
+    or the stream derived from the epoch offset instead of the epoch index.
+    The feedforward_init leg pins only the opt_state threading."""
+    structure = (
+        classification_structure()
+        if graph_kind == "feedforward_init"
+        else rng_sensitive_structure()
+    )
     params_key, train_key = jax.random.split(rng_key)
     params = initialize_params(structure, params_key)
     loader = make_batches(rng_key)
@@ -312,14 +305,75 @@ def test_resume_is_bitwise_identical(rng_key):
     assert full.step == part1.step + part2.step
 
 
+def test_rng_key_changes_result_on_global_init(rng_key):
+    """Sanity for the RNG-sensitive fixture: two training keys give
+    different params, so the parity/resume legs above are not vacuous."""
+    structure = rng_sensitive_structure()
+    params = initialize_params(structure, rng_key)
+    loader = make_batches(rng_key, n_batches=2)
+    kwargs = dict(verbose=False)
+    r1 = train(
+        params,
+        structure,
+        loader,
+        optax.adam(1e-2),
+        {"num_epochs": 1},
+        jax.random.PRNGKey(0),
+        **kwargs,
+    )
+    r2 = train(
+        params,
+        structure,
+        loader,
+        optax.adam(1e-2),
+        {"num_epochs": 1},
+        jax.random.PRNGKey(1),
+        **kwargs,
+    )
+    assert max_param_diff(r1.params, r2.params) > 0.0
+
+
+def test_start_epoch_offsets_rng_stream(rng_key):
+    """start_epoch=k must shift the per-epoch key to fold_in(rng_key, k):
+    on an RNG-sensitive graph the params differ from a start_epoch=0 run.
+    Fails if the stream were derived from the epoch offset (always 0 here)
+    instead of the absolute epoch index."""
+    structure = rng_sensitive_structure()
+    params_key, train_key = jax.random.split(rng_key)
+    params = initialize_params(structure, params_key)
+    loader = make_batches(rng_key, n_batches=2)
+    r0 = train(
+        params,
+        structure,
+        loader,
+        optax.adam(1e-2),
+        {"num_epochs": 1},
+        train_key,
+        verbose=False,
+    )
+    rk = train(
+        params,
+        structure,
+        loader,
+        optax.adam(1e-2),
+        {"num_epochs": 1},
+        train_key,
+        start_epoch=3,
+        verbose=False,
+    )
+    assert max_param_diff(r0.params, rk.params) > 0.0
+
+
 def test_caller_params_survive_train(rng_key):
-    """The internal step donates buffers; the caller's params must stay valid."""
+    """The internal step donates buffers; the caller's params must stay valid
+    and unmodified."""
     structure = classification_structure()
     params_key, train_key = jax.random.split(rng_key)
     params = initialize_params(structure, params_key)
     loader = make_batches(rng_key, n_batches=1)
     optimizer = optax.adam(1e-2)
-    train(
+    before = jax.tree_util.tree_map(jnp.copy, params)
+    r1 = train(
         params,
         structure,
         loader,
@@ -328,8 +382,11 @@ def test_caller_params_survive_train(rng_key):
         train_key,
         verbose=False,
     )
-    # A second call on the same arrays must not hit deleted buffers.
-    train(
+    # Donation must not have modified the caller's arrays in place.
+    assert max_param_diff(params, before) == 0.0
+    # A second call on the same arrays must not hit deleted buffers, and
+    # identical inputs must reproduce the identical result.
+    r2 = train(
         params,
         structure,
         loader,
@@ -338,6 +395,7 @@ def test_caller_params_survive_train(rng_key):
         train_key,
         verbose=False,
     )
+    assert max_param_diff(r1.params, r2.params) == 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -374,6 +432,9 @@ def test_train_and_evaluate_smoke(rng_key, algorithm, task):
         assert set(batch_metrics) == {"energy", "target_energy"}
         for v in batch_metrics.values():
             assert math.isfinite(v)
+        # Both keys are energies (CE targets here): non-negative.
+        assert batch_metrics["energy"] >= 0.0
+        assert batch_metrics["target_energy"] >= 0.0
     assert max_param_diff(params, result.params) > 0.0
 
     eval_metrics = evaluate(
@@ -385,6 +446,11 @@ def test_train_and_evaluate_smoke(rng_key, algorithm, task):
     assert set(eval_metrics) == expected_keys
     for v in eval_metrics.values():
         assert math.isfinite(v)
+    assert 0.0 <= eval_metrics["accuracy"] <= 1.0
+    assert eval_metrics["target_energy"] >= 0.0
+    assert eval_metrics["perplexity"] >= 1.0
+    if algorithm == "pc":
+        assert eval_metrics["energy"] >= 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -603,6 +669,84 @@ def test_custom_metric_weighted_aggregation_uneven_batches(rng_key):
     assert abs(out["ppl"] - math.exp(expected)) < 1e-4
 
 
+def test_eval_energy_matches_graph_energy(rng_key):
+    """evaluate's default 'energy' metric must agree with graph_energy /
+    batch_size — metrics._internal_energy_fn re-implements graph_energy's
+    node ordering, so a divergence would otherwise be silent. GlobalStateInit
+    keeps the eval energy nonzero (a free feedforward output sits at its
+    zero-error fixed point)."""
+    structure = rng_sensitive_structure()
+    params = initialize_params(structure, rng_key)
+    batch = next(iter(make_batches(rng_key, n_batches=1)))
+    loader = ListLoader([batch])
+    out = evaluate(params, structure, loader, {}, rng_key)
+
+    clamps = build_clamps(batch, structure, clamp_target=False)
+    key = jax.random.fold_in(rng_key, 0)  # evaluate's key for batch 0
+    state = initialize_graph_state(
+        structure, batch["x"].shape[0], key, clamps=clamps, params=params
+    )
+    state = run_inference(params, state, clamps, structure)
+    expected = float(graph_energy(state, structure)) / batch["x"].shape[0]
+    assert expected > 0.0
+    assert abs(out["energy"] - expected) < 1e-5
+
+
+def test_multi_target_metric_accumulation(rng_key):
+    """Two target nodes: each default metric sums values AND weights across
+    targets, so the mean is per prediction over both heads — pins the
+    accumulation loops in metrics.py, which single-target tests never
+    iterate twice."""
+    x_node = Linear(shape=(4,), name="x")
+    y1 = Linear(
+        shape=(3,),
+        activation=SoftmaxActivation(),
+        energy=CrossEntropyEnergy(),
+        name="y1",
+    )
+    y2 = Linear(
+        shape=(5,),
+        activation=SoftmaxActivation(),
+        energy=CrossEntropyEnergy(),
+        name="y2",
+    )
+    structure = graph(
+        nodes=[x_node, y1, y2],
+        edges=[
+            Edge(source=x_node, target=y1.slot("in")),
+            Edge(source=x_node, target=y2.slot("in")),
+        ],
+        task_map=TaskMap(x=x_node, y=y1, y2=y2),
+        inference=InferenceSGD(eta_infer=0.05, infer_steps=5),
+    )
+    params = initialize_params(structure, rng_key)
+    kx, k1, k2 = jax.random.split(rng_key, 3)
+    batch = {
+        "x": jax.random.normal(kx, (4, 4)),
+        "y": jax.random.randint(k1, (4,), 0, 3),
+        "y2": jax.random.randint(k2, (4,), 0, 5),
+    }
+    out = evaluate(params, structure, ListLoader([batch]), {}, rng_key)
+
+    # Hand-compute from the settled eval state.
+    clamps = build_clamps(batch, structure, clamp_target=False)
+    key = jax.random.fold_in(rng_key, 0)
+    state = initialize_graph_state(structure, 4, key, clamps=clamps, params=params)
+    state = run_inference(params, state, clamps, structure)
+    correct = 0.0
+    ce_total = 0.0
+    for task_key, node in (("y", "y1"), ("y2", "y2")):
+        mu = state.nodes[node].z_mu
+        labels = batch[task_key]
+        correct += float(jnp.sum(jnp.argmax(mu, axis=-1) == labels))
+        onehot = jax.nn.one_hot(labels, mu.shape[-1])
+        ce_total += float(-jnp.sum(onehot * jnp.log(jnp.clip(mu, 1e-7, 1.0))))
+    # 4 samples x 2 targets = 8 predictions.
+    assert abs(out["accuracy"] - correct / 8.0) < 1e-5
+    assert abs(out["cross_entropy"] - ce_total / 8.0) < 1e-4
+    assert abs(out["perplexity"] - math.exp(ce_total / 8.0)) < 1e-3
+
+
 # ---------------------------------------------------------------------------
 # Contract guards
 # ---------------------------------------------------------------------------
@@ -639,6 +783,50 @@ def test_backprop_requires_feedforward_init(rng_key):
         make_train_step(structure, optax.adam(1e-3), algorithm="backprop")
 
 
+def test_pc_requires_inference(rng_key):
+    """algorithm='pc' on a graph built with inference=None fails fast at
+    build time, naming the missing prerequisite."""
+    x_node = Linear(shape=(6,), name="x")
+    y_node = Linear(
+        shape=(3,),
+        activation=SoftmaxActivation(),
+        energy=CrossEntropyEnergy(),
+        name="y",
+    )
+    structure = graph(
+        nodes=[x_node, y_node],
+        edges=[Edge(source=x_node, target=y_node.slot("in"))],
+        task_map=TaskMap(x=x_node, y=y_node),
+        inference=None,
+    )
+    with pytest.raises(ValueError, match="inference"):
+        make_train_step(structure, optax.adam(1e-3), algorithm="pc")
+    params = initialize_params(structure, rng_key)
+    loader = make_batches(rng_key, n_batches=1)
+    with pytest.raises(ValueError, match="inference"):
+        train(
+            params,
+            structure,
+            loader,
+            optax.adam(1e-3),
+            {"num_epochs": 1},
+            rng_key,
+            verbose=False,
+        )
+    # The same graph trains with backprop (feedforward pass only).
+    result = train(
+        params,
+        structure,
+        loader,
+        optax.adam(1e-3),
+        {"num_epochs": 1},
+        rng_key,
+        algorithm="backprop",
+        verbose=False,
+    )
+    assert max_param_diff(params, result.params) > 0.0
+
+
 def test_backprop_without_clamped_target_raises(rng_key):
     x_node = Linear(shape=(4,), name="x")
     h = Linear(shape=(5,), activation=SigmoidActivation(), name="h")
@@ -657,6 +845,88 @@ def test_backprop_without_clamped_target_raises(rng_key):
             {"x": jax.random.normal(rng_key, (4, 4))},
             rng_key,
         )
+    # The same guard fires through the train loop, not only the raw step.
+    loader = ListLoader([{"x": jax.random.normal(rng_key, (4, 4))}])
+    with pytest.raises(ValueError, match="target"):
+        train(
+            params,
+            structure,
+            loader,
+            optax.adam(1e-3),
+            {"num_epochs": 1},
+            rng_key,
+            algorithm="backprop",
+            verbose=False,
+        )
+
+
+def test_wrong_shape_target_raises_actionable_error(rng_key):
+    """A float target whose trailing shape mismatches the node raises from
+    build_clamps, not as an opaque XLA broadcast error inside the step."""
+    structure = classification_structure()  # y expects (batch, 3)
+    x = jax.random.normal(rng_key, (4, 6))
+    y_bad = jax.nn.one_hot(jnp.zeros(4, dtype=jnp.int32), 4)  # (4, 4)
+    with pytest.raises(ValueError, match="target 'y'"):
+        build_clamps({"x": x, "y": y_bad}, structure, clamp_target=True)
+
+
+def test_loader_without_len_raises_actionable_error(rng_key):
+    structure = classification_structure()
+    params = initialize_params(structure, rng_key)
+    batches = (b for b in make_batches(rng_key, n_batches=1))  # no __len__
+    with pytest.raises(TypeError, match="len"):
+        train(
+            params,
+            structure,
+            batches,
+            optax.adam(1e-3),
+            {"num_epochs": 1},
+            rng_key,
+            verbose=False,
+        )
+
+
+def test_mesh_without_data_axis_raises(rng_key):
+    structure = classification_structure()
+    params = initialize_params(structure, rng_key)
+    loader = make_batches(rng_key, n_batches=1)
+    mesh = jax.make_mesh((1,), ("batch",))
+    with pytest.raises(ValueError, match="'data' axis"):
+        make_train_step(structure, optax.adam(1e-3), mesh=mesh)
+    with pytest.raises(ValueError, match="'data' axis"):
+        train(
+            params,
+            structure,
+            loader,
+            optax.adam(1e-3),
+            {"num_epochs": 1},
+            rng_key,
+            mesh=mesh,
+            verbose=False,
+        )
+    with pytest.raises(ValueError, match="'data' axis"):
+        evaluate(params, structure, loader, {}, rng_key, mesh=mesh)
+
+
+def test_verbose_epoch_summary(rng_key, capsys):
+    """verbose=True prints the per-epoch summary (tqdm postfix formatting and
+    the epoch line are otherwise never executed by the suite)."""
+    structure = classification_structure()
+    params = initialize_params(structure, rng_key)
+    loader = make_batches(rng_key, n_batches=2)
+    train(
+        params,
+        structure,
+        loader,
+        optax.adam(1e-3),
+        {"num_epochs": 1},
+        rng_key,
+        verbose=True,
+    )
+    captured = capsys.readouterr()
+    text = captured.out + captured.err
+    assert "Epoch 1/1" in text
+    assert "energy" in text
 
 
 @pytest.mark.parametrize("bad_key", ["loss_type", "use_causal_mask"])
@@ -696,7 +966,17 @@ def test_pc_energy_decreases_over_epochs(rng_key):
     assert energies[-1] < energies[0]
 
 
-def test_fractional_epochs(rng_key):
+def test_train_requires_num_epochs(rng_key):
+    """A missing num_epochs raises instead of silently training a default."""
+    structure = classification_structure()
+    params = initialize_params(structure, rng_key)
+    loader = make_batches(rng_key, n_batches=1)
+    with pytest.raises(ValueError, match="num_epochs"):
+        train(params, structure, loader, optax.adam(1e-3), {}, rng_key, verbose=False)
+
+
+@pytest.mark.parametrize("algorithm", ["pc", "backprop"])
+def test_fractional_epochs(rng_key, algorithm):
     structure = classification_structure()
     params_key, train_key = jax.random.split(rng_key)
     params = initialize_params(structure, params_key)
@@ -708,6 +988,7 @@ def test_fractional_epochs(rng_key):
         optax.adam(1e-3),
         {"num_epochs": 1.5},
         train_key,
+        algorithm=algorithm,
         verbose=False,
     )
     assert len(result.iter_results) == 2
@@ -720,7 +1001,32 @@ def test_fractional_epochs(rng_key):
     assert abs(result.epoch_results[1]["energy"] - expected) < 1e-6
 
 
-def test_epoch_context_fields_and_callback_replacement(rng_key):
+def test_fractional_tail_rounding_to_zero_batches_is_dropped(rng_key):
+    """num_epochs=1.1 on 4 batches rounds the tail to 0 batches: the tail is
+    dropped — no empty epoch entry, no callback invoked on empty metrics."""
+    structure = classification_structure()
+    params_key, train_key = jax.random.split(rng_key)
+    params = initialize_params(structure, params_key)
+    loader = make_batches(rng_key, n_batches=4)
+    calls = []
+    result = train(
+        params,
+        structure,
+        loader,
+        optax.adam(1e-3),
+        {"num_epochs": 1.1},
+        train_key,
+        epoch_callback=lambda ctx: calls.append(ctx.epoch_idx),
+        verbose=False,
+    )
+    assert result.step == 4
+    assert len(result.iter_results) == 1
+    assert len(result.epoch_results) == 1
+    assert calls == [0]
+
+
+@pytest.mark.parametrize("algorithm", ["pc", "backprop"])
+def test_epoch_context_fields_and_callback_replacement(rng_key, algorithm):
     structure = classification_structure()
     params_key, train_key = jax.random.split(rng_key)
     params = initialize_params(structure, params_key)
@@ -742,6 +1048,7 @@ def test_epoch_context_fields_and_callback_replacement(rng_key):
         optax.adam(1e-3),
         {"num_epochs": 2},
         train_key,
+        algorithm=algorithm,
         start_epoch=5,
         epoch_callback=epoch_callback,
         verbose=False,
@@ -876,3 +1183,133 @@ def test_generate_shape_dtype_prefix(rng_key):
     )
     assert out2.shape == (2, 5)
     assert jnp.array_equal(out2[:, :3], batched)
+
+
+def test_generate_prompt_truncation(rng_key):
+    """A prompt longer than the model's seq_len keeps only the trailing
+    window as context, and the full prompt survives in the output."""
+    structure = sequence_structure()  # seq_len 6
+    params = initialize_params(structure, rng_key)
+    prompt = (jnp.arange(10) % 11).astype(jnp.int32)
+    out = generate(params, structure, prompt, max_new_tokens=2, rng_key=rng_key)
+    assert out.shape == (12,)
+    assert jnp.array_equal(out[:10], prompt)
+
+
+def test_generate_top_k_restricts_support(rng_key):
+    """top_k=1 leaves a single admissible token per step, so sampling is
+    deterministic: two different keys must produce identical tokens."""
+    structure = sequence_structure()
+    params = initialize_params(structure, rng_key)
+    prompt = jnp.array([1, 2, 3], dtype=jnp.int32)
+    out_a = generate(
+        params,
+        structure,
+        prompt,
+        max_new_tokens=4,
+        rng_key=jax.random.PRNGKey(0),
+        top_k=1,
+    )
+    out_b = generate(
+        params,
+        structure,
+        prompt,
+        max_new_tokens=4,
+        rng_key=jax.random.PRNGKey(1),
+        top_k=1,
+    )
+    assert jnp.array_equal(out_a, out_b)
+
+
+def test_generate_top_p_and_temperature(rng_key):
+    """Exercises the nucleus-filter and temperature paths; a vanishing top_p
+    keeps only the most probable token, so sampling turns deterministic."""
+    structure = sequence_structure()
+    params = initialize_params(structure, rng_key)
+    prompt = jnp.array([1, 2, 3], dtype=jnp.int32)
+    out = generate(
+        params,
+        structure,
+        prompt,
+        max_new_tokens=3,
+        rng_key=rng_key,
+        temperature=0.7,
+        top_p=0.9,
+    )
+    assert out.shape == (6,)
+    assert bool(jnp.all(out >= 0)) and bool(jnp.all(out < 11))
+
+    out_a = generate(
+        params,
+        structure,
+        prompt,
+        max_new_tokens=3,
+        rng_key=jax.random.PRNGKey(0),
+        top_p=1e-6,
+    )
+    out_b = generate(
+        params,
+        structure,
+        prompt,
+        max_new_tokens=3,
+        rng_key=jax.random.PRNGKey(1),
+        top_p=1e-6,
+    )
+    assert jnp.array_equal(out_a, out_b)
+
+
+def test_generate_backprop_algorithm_and_one_hot_input(rng_key):
+    """A graph built with inference=None generates via the feedforward pass
+    (algorithm='backprop'); its 2D input node exercises the one-hot input
+    branch. The default algorithm='pc' fails fast, naming the missing
+    inference — previously an opaque AttributeError inside run_inference."""
+    seq_len, vocab = 5, 7
+    x_node = Linear(shape=(seq_len, vocab), name="inp")
+    y_node = Linear(
+        shape=(seq_len, vocab),
+        activation=SoftmaxActivation(),
+        energy=CrossEntropyEnergy(),
+        name="out",
+    )
+    structure = graph(
+        nodes=[x_node, y_node],
+        edges=[Edge(source=x_node, target=y_node.slot("in"))],
+        task_map=TaskMap(x=x_node, y=y_node),
+        inference=None,
+    )
+    params = initialize_params(structure, rng_key)
+    prompt = jnp.array([1, 2], dtype=jnp.int32)
+    out = generate(
+        params,
+        structure,
+        prompt,
+        max_new_tokens=3,
+        rng_key=rng_key,
+        algorithm="backprop",
+    )
+    assert out.shape == (5,)
+    assert jnp.array_equal(out[:2], prompt)
+    assert bool(jnp.all(out >= 0)) and bool(jnp.all(out < vocab))
+
+    with pytest.raises(ValueError, match="inference"):
+        generate(params, structure, prompt, max_new_tokens=1, rng_key=rng_key)
+
+
+def test_generate_requires_x_and_y_task_keys(rng_key):
+    x_node = Linear(shape=(4,), name="x")
+    h = Linear(shape=(5,), activation=SigmoidActivation(), name="h")
+    structure = graph(
+        nodes=[x_node, h],
+        edges=[Edge(source=x_node, target=h.slot("in"))],
+        task_map=TaskMap(x=x_node),
+        inference=InferenceSGD(),
+    )
+    params = initialize_params(structure, rng_key)
+    with pytest.raises(ValueError, match="task_map"):
+        generate(
+            params,
+            structure,
+            jnp.array([1, 2], dtype=jnp.int32),
+            max_new_tokens=1,
+            rng_key=rng_key,
+        )

@@ -14,6 +14,7 @@ Key Features:
 Example:
     >>> from fabricpc.nodes import Linear
     >>> from fabricpc.core.topology import Edge
+    >>> from fabricpc.core.inference import InferenceSGD
     >>> from fabricpc.graph_assembly import TaskMap, graph
     >>> from fabricpc.graph_initialization import initialize_params
     >>> from fabricpc import train, evaluate

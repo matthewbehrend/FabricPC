@@ -9,20 +9,14 @@ Without the flag those tests skip; the single-device mesh leg always runs.
 """
 
 import warnings
-from typing import Iterator
 
 import jax
 import jax.numpy as jnp
 import optax
 import pytest
 
-from fabricpc.core.activations import SigmoidActivation, SoftmaxActivation
-from fabricpc.core.energy import CrossEntropyEnergy
-from fabricpc.core.inference import InferenceSGD
-from fabricpc.core.topology import Edge
-from fabricpc.graph_assembly import TaskMap, graph
+from conftest import ListLoader, make_classification_structure, max_param_diff
 from fabricpc.graph_initialization import initialize_params
-from fabricpc.nodes import Linear
 from fabricpc.training import evaluate, make_train_step, train
 
 requires_two_devices = pytest.mark.skipif(
@@ -30,36 +24,7 @@ requires_two_devices = pytest.mark.skipif(
     reason="needs >=2 devices (XLA_FLAGS=--xla_force_host_platform_device_count=2)",
 )
 
-
-class ListLoader:
-    def __init__(self, batches):
-        self._batches = batches
-
-    def __len__(self) -> int:
-        return len(self._batches)
-
-    def __iter__(self) -> Iterator:
-        return iter(self._batches)
-
-
-def make_structure():
-    x = Linear(shape=(6,), name="x")
-    h = Linear(shape=(8,), activation=SigmoidActivation(), name="h")
-    y = Linear(
-        shape=(3,),
-        activation=SoftmaxActivation(),
-        energy=CrossEntropyEnergy(),
-        name="y",
-    )
-    return graph(
-        nodes=[x, h, y],
-        edges=[
-            Edge(source=x, target=h.slot("in")),
-            Edge(source=h, target=y.slot("in")),
-        ],
-        task_map=TaskMap(x=x, y=y),
-        inference=InferenceSGD(eta_infer=0.05, infer_steps=10),
-    )
+make_structure = make_classification_structure
 
 
 def make_batch(rng_key, batch_size):
@@ -67,11 +32,6 @@ def make_batch(rng_key, batch_size):
     x = jax.random.normal(kx, (batch_size, 6))
     y = jax.nn.one_hot(jax.random.randint(ky, (batch_size,), 0, 3), 3)
     return {"x": x, "y": y}
-
-
-def max_param_diff(a, b) -> float:
-    diffs = jax.tree_util.tree_map(lambda p, q: jnp.max(jnp.abs(p - q)), a, b)
-    return float(jax.tree_util.tree_reduce(jnp.maximum, diffs, jnp.array(0.0)))
 
 
 def test_single_device_mesh_matches_no_mesh(rng_key):

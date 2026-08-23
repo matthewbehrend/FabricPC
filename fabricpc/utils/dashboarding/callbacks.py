@@ -1,7 +1,10 @@
 """Callback factories for integration with fabricpc.training.train.
 
-These functions create callbacks compatible with train's iter_callback and
-epoch_callback parameters.
+``create_iter_callback``/``create_epoch_callback``/``create_tracking_callbacks``
+produce callbacks for train's ``iter_callback``/``epoch_callback`` parameters.
+``create_detailed_iter_callback`` is the exception: it consumes the final
+``GraphState``, which only ``make_train_step``'s step returns, so it plugs
+into a custom loop, not into ``train``.
 """
 
 from typing import Any, Callable, Dict, Optional, Tuple
@@ -13,13 +16,11 @@ from fabricpc.utils.dashboarding.trackers import AimExperimentTracker, TrackingC
 
 def create_iter_callback(
     tracker: AimExperimentTracker,
-    batch_size: Optional[int] = None,
 ) -> Callable[[int, int, Dict[str, float]], Dict[str, float]]:
     """Create an iter_callback for train that tracks batch energy.
 
     Args:
         tracker: AimExperimentTracker instance.
-        batch_size: Optional batch size for normalization.
 
     Returns:
         Callback function: (epoch_idx, batch_idx, metrics) -> metrics
@@ -90,7 +91,6 @@ def create_tracking_callbacks(
     eval_loader: Any = None,
     eval_config: Optional[dict] = None,
     hparams: Optional[dict] = None,
-    batch_size: Optional[int] = None,
     repo: Optional[str] = None,
 ) -> Tuple[AimExperimentTracker, Callable, Optional[Callable]]:
     """Create both iter_callback and epoch_callback with a shared tracker.
@@ -104,7 +104,6 @@ def create_tracking_callbacks(
         eval_loader: Optional evaluation data loader.
         eval_config: Optional evaluation config.
         hparams: Optional hyperparameters to log.
-        batch_size: Optional batch size for energy normalization.
         repo: Optional path to Aim repository.
 
     Returns:
@@ -121,7 +120,7 @@ def create_tracking_callbacks(
     if structure:
         tracker.log_graph_structure(structure)
 
-    iter_callback = create_iter_callback(tracker, batch_size=batch_size)
+    iter_callback = create_iter_callback(tracker)
     epoch_callback = (
         create_epoch_callback(tracker, structure, eval_fn, eval_loader, eval_config)
         if structure
@@ -134,33 +133,36 @@ def create_tracking_callbacks(
 def create_detailed_iter_callback(
     tracker: AimExperimentTracker,
     structure: GraphStructure,
-    batch_size: Optional[int] = None,
-) -> Callable[[int, int, float, "GraphState"], float]:
-    """Create an iter_callback that also tracks state distributions.
+) -> Callable[[int, int, Dict[str, float], "GraphState"], Dict[str, float]]:
+    """Create a per-batch callback that also tracks state distributions.
 
-    This callback requires access to the final GraphState, so it must be used
-    with a custom loop over make_train_step (whose step returns the final
-    state), not with train.
+    This callback consumes the final GraphState, which only
+    ``make_train_step``'s step returns, so it plugs into a custom loop —
+    not into ``train(iter_callback=...)``, whose callbacks receive
+    ``(epoch_idx, batch_idx, metrics)`` without the state. Custom-loop
+    example: docs/user_guides/09_experiment_tracking.md.
 
     Args:
         tracker: AimExperimentTracker instance.
         structure: GraphStructure.
-        batch_size: Optional batch size for normalization.
 
     Returns:
-        Callback function: (epoch_idx, batch_idx, energy, final_state) -> energy
+        Callback function:
+        (epoch_idx, batch_idx, metrics, final_state) -> metrics,
+        where ``metrics`` is the step's metric dict
+        (``{"energy", "target_energy"}``).
     """
 
     def detailed_iter_callback(
         epoch_idx: int,
         batch_idx: int,
-        energy: float,
+        metrics: Dict[str, float],
         final_state: GraphState,
-    ) -> float:
-        # energy is the per-sample training objective (metrics["energy"]).
-
-        # Track batch energy
-        tracker.track_batch_energy(energy, epoch=epoch_idx, batch=batch_idx)
+    ) -> Dict[str, float]:
+        # metrics["energy"] is the per-sample training objective.
+        tracker.track_batch_energy(
+            float(metrics["energy"]), epoch=epoch_idx, batch=batch_idx
+        )
 
         # Track per-node energy
         tracker.track_batch_energy_per_node(
@@ -173,6 +175,6 @@ def create_detailed_iter_callback(
                 final_state, epoch=epoch_idx, batch=batch_idx, infer_step=0
             )
 
-        return energy
+        return metrics
 
     return detailed_iter_callback

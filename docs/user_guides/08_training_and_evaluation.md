@@ -56,8 +56,9 @@ result = train(
 )
 ```
 
-`config` reads only `num_epochs`; everything else passes through untouched to
-callbacks and experiment harnesses. Settling parameters (`infer_steps`,
+`config` reads only `num_epochs`, which is required (a missing key raises
+`ValueError` — there is no default epoch count); everything else passes
+through untouched to callbacks and experiment harnesses. Settling parameters (`infer_steps`,
 `eta_infer`) live in the inference object inside the graph
 (`graph(..., inference=InferenceSGD(eta_infer=0.05, infer_steps=20))`), not
 in `config`. The retired keys `loss_type` and `use_causal_mask` raise
@@ -172,7 +173,7 @@ energy framing:
 | key | when | definition |
 |---|---|---|
 | `target_energy` | always | `E(y, z_mu)` under the target node's functional, per prediction |
-| `accuracy` | always | `argmax(z_mu, -1) == argmax(y, -1)` per prediction (argmax-based: meaningful for class-like targets, not continuous ones) |
+| `accuracy` | always | `argmax(z_mu, -1)` compared to `argmax(y, -1)` for one-hot targets (same rank as `z_mu`), or directly to integer class labels of lower rank; per prediction (argmax-based: meaningful for class-like targets, not continuous ones) |
 | `cross_entropy` | target functional is `CrossEntropyEnergy` | identical to `target_energy` in that case; the conventional name |
 | `perplexity` | target functional is `CrossEntropyEnergy` | `exp(cross_entropy)` |
 | `energy` | `algorithm="pc"` | per-sample energy over internal nodes — the PC training objective's definition |
@@ -301,6 +302,11 @@ row.
   probability on the most likely tokens, above 1.0 flattens the distribution.
 - `top_k` keeps only the k most probable tokens.
 - `top_p` keeps the smallest token set whose cumulative probability reaches p.
+- `algorithm` selects the state the tokens are sampled from, with the same
+  validation as `train`/`evaluate`: `"pc"` (default) settles the graph via
+  `run_inference` each step, `"backprop"` samples from the single feedforward
+  pass — use it for backprop-trained models and for graphs built with
+  `inference=None`.
 
 Generation slides a context window of the model's `seq_len`: once the
 sequence exceeds it, the oldest tokens drop out of the context.

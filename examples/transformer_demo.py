@@ -21,12 +21,11 @@ Usage:
     python examples/transformer_demo.py --mode pc --num_blocks 2
 
 Results: PC training (cuda13, rtx3090, jax 0.10.2, can vary a few points in perplexity in different jax versions / hardware due to sensitivity to floating point rounding)
-Final train energy: 332.7728
-Test loss: 2.6713, Perplexity: 14.46
+Final train energy: 352.9587
+Test loss: 2.6988, Perplexity: 14.86
 Prompt: 'ROMEO: '
 ----------------------------------------
-ROMEO: hiteeeeeo he
-Wateeo
+ROMEO: hooofo!eoooraoathe o
 ----------------------------------------
 
 Backprop Training
@@ -233,6 +232,7 @@ def generate_text(
     temperature: float = 0.8,
     top_k: int = None,
     top_p: float = None,
+    algorithm: str = "pc",
 ) -> List[str]:
     """Generate text autoregressively from batched prompts."""
     if rng_key is None:
@@ -263,6 +263,7 @@ def generate_text(
         temperature=temperature,
         top_k=top_k,
         top_p=top_p,
+        algorithm=algorithm,
     )
 
     generated_texts = []
@@ -430,7 +431,7 @@ def main(args=None):
         alpha=0.01,
     )
     optimizer = optax.chain(
-        optax.clip_by_global_norm(1.0),
+        optax.clip_by_global_norm(0.8),
         optax.adamw(lr_schedule, weight_decay=0.1),
     )
     train_config = {"num_epochs": args.num_epochs}
@@ -607,6 +608,7 @@ def main(args=None):
         max_new_tokens=20,
         rng_key=gen_key,
         temperature=0.8,
+        algorithm="pc" if use_pc else "backprop",
     )
 
     for prompt, generated in zip(prompts, generated_texts):

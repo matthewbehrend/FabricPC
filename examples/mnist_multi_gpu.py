@@ -67,6 +67,12 @@ structure = graph(
 
 # --- Hyperparameters ---
 
+# Weight gradients are the global batch sum, and the batch below scales with
+# the device count, so the gradient magnitude grows with N devices. adamw
+# normalizes the update by the gradient's second moment, which cancels that
+# scale (up to eps and the decoupled weight decay); a scale-sensitive
+# optimizer (SGD) would need lr / N here. The 0.4 pmap trainer applied a
+# device mean instead — see the 0.5.0 CHANGELOG behavior notes.
 optimizer = optax.adamw(0.001, weight_decay=0.001)
 train_config = {"num_epochs": 20}
 

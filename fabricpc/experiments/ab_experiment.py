@@ -171,7 +171,7 @@ class PlannedMultiContrastResults:
     per_arm_trials: Dict[str, List[TrialResult]]
     seeds: List[int]
     total_time: float
-    num_epochs: int
+    num_epochs: float
 
     def per_arm_metrics(self, arm_name: str) -> np.ndarray:
         """Per-trial metric values for one arm (length n_trials)."""
@@ -384,6 +384,10 @@ class PlannedMultiContrastExperiment:
         per_arm_trials: Dict[str, List[TrialResult]] = {a.name: [] for a in self.arms}
         seeds: List[int] = []
 
+        # fabricpc.training.train requires num_epochs, so any arm using it
+        # declares the key; the fallback of 1 is reachable only with a custom
+        # train_fn that reads no config, where dividing wall time by 1 leaves
+        # the reported "per-epoch" time as the raw trial time.
         num_epochs = next(
             (
                 arm.train_config["num_epochs"]
@@ -449,7 +453,7 @@ class ABResults:
     arm_b_trials: List[TrialResult]
     seeds: List[int]
     total_time: float
-    num_epochs: int
+    num_epochs: float
 
     @property
     def arm_a_metrics(self) -> np.ndarray:

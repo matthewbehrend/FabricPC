@@ -29,6 +29,13 @@ class BayesianTuner:
         objective.
     Phase 2 — Continuous fine-tuning: fix the Phase 1 architecture and refine
         lr / eta_infer / infer_steps, also minimizing validation perplexity.
+
+    Both phases score trials by validation perplexity, which ``evaluate``
+    reports only when the target node's energy functional is
+    ``CrossEntropyEnergy`` — a trial on a graph without one raises instead
+    of silently scoring ``inf``. ``algorithm`` selects the learning
+    algorithm for every trial's ``train``/``evaluate`` call
+    (``"pc"`` default, ``"backprop"`` supported).
     """
 
     def __init__(
@@ -44,6 +51,7 @@ class BayesianTuner:
         log_file: Optional[str] = "tuning_results.txt",
         divergence_rel_tol: float = 0.5,
         verbose: bool = False,
+        algorithm: str = "pc",
     ):
         self.train_loader = train_loader
         self.val_loader = val_loader
@@ -54,6 +62,7 @@ class BayesianTuner:
         self.log_file = log_file
         self.divergence_rel_tol = divergence_rel_tol
         self.verbose = verbose
+        self.algorithm = algorithm
 
         if log_file:
             os.makedirs(
@@ -185,6 +194,7 @@ class BayesianTuner:
                 optimizer,
                 train_config,
                 train_key,
+                algorithm=self.algorithm,
                 verbose=False,
                 iter_callback=iter_callback,
                 epoch_callback=epoch_callback,
@@ -203,7 +213,12 @@ class BayesianTuner:
 
         try:
             metrics = evaluate(
-                trained_params, structure, val_loader, train_config, eval_key
+                trained_params,
+                structure,
+                val_loader,
+                train_config,
+                eval_key,
+                algorithm=self.algorithm,
             )
         except Exception as e:
             print(f"  Trial {trial.number} failed during eval: {e}")
@@ -215,8 +230,15 @@ class BayesianTuner:
 
         # Both phases optimize the same predictive metric: validation perplexity.
         # The energy above is only a stability diagnostic/guard, never the score.
-        perplexity = metrics.get("perplexity", float("inf"))
-        return perplexity, metrics
+        if "perplexity" not in metrics:
+            raise ValueError(
+                "BayesianTuner scores trials by validation perplexity, which "
+                "evaluate() reports only when the target node's energy "
+                "functional is CrossEntropyEnergy; this trial's graph has no "
+                "such target. Use a CrossEntropyEnergy output node, or score "
+                "trials yourself with a custom Optuna objective."
+            )
+        return metrics["perplexity"], metrics
 
     def _log(
         self,

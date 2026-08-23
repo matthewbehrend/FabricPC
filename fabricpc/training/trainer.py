@@ -79,7 +79,9 @@ class TrainResult(NamedTuple):
         opt_state: Final optimizer state — pass it back via
             ``train(..., opt_state=...)`` to resume without resetting
             optimizer moments or an optax schedule's count.
-        step: Optimizer updates applied in this call (0-based, monotonic).
+        step: Count of optimizer updates applied in this call. Not offset
+            by ``start_epoch``: a resumed run counts from 0 again, so a
+            caller logging a global step adds its own checkpoint offset.
         iter_results: 2D list ``[epoch][batch]`` of per-batch metric dicts
             (floats), or the ``iter_callback`` replacement values.
         epoch_results: List of per-epoch mean metric dicts (floats), or the
@@ -138,6 +140,22 @@ def create_causal_mask(seq_len: int) -> jnp.ndarray:
     return jnp.tril(jnp.ones((seq_len, seq_len)))
 
 
+def _batch_size(batch: Dict[str, jnp.ndarray], structure: GraphStructure) -> int:
+    """Leading-axis size of the first batch key the ``task_map`` names.
+
+    Reading an arbitrary batch value would trust extra keys whose leading
+    axis is not the batch; only task-mapped keys are guaranteed to be
+    ``(batch, ...)`` arrays.
+    """
+    for key, value in batch.items():
+        if key in structure.task_map:
+            return jnp.asarray(value).shape[0]
+    raise ValueError(
+        f"No batch key maps to a task: batch keys {sorted(batch)}, "
+        f"task keys {sorted(structure.task_map)}."
+    )
+
+
 def build_clamps(
     batch: Dict[str, jnp.ndarray],
     structure: GraphStructure,
@@ -153,11 +171,14 @@ def build_clamps(
     2. A clamped target with non-floating dtype (int or bool class indices)
        is one-hot encoded with ``num_classes`` from the target node's
        ``shape[-1]`` — token loaders yield int32 targets to keep the
-       host->device transfer small.
+       host->device transfer small. Target clamps must then match the node
+       shape (``(batch, *node.shape)``); a mismatch raises ``ValueError``
+       here instead of an opaque XLA broadcast error inside the step.
     3. If the task map declares a ``"causal_mask"`` node (v1 transformer
        graphs), a lower-triangular mask of shape ``(batch, 1, seq, seq)`` is
-       injected, with ``seq`` from ``batch["x"].shape[1]``. Graphs without
-       the entry (v2 masks internally via ``is_causal``) are untouched.
+       injected, with ``seq`` from the mask node's declared shape. Graphs
+       without the entry (v2 masks internally via ``is_causal``) are
+       untouched.
     """
     clamps: Dict[str, jnp.ndarray] = {}
     for task_name, task_value in batch.items():
@@ -169,15 +190,27 @@ def build_clamps(
         if is_target and not clamp_target:
             continue
         value = jnp.asarray(task_value)
-        if is_target and not jnp.issubdtype(value.dtype, jnp.floating):
-            value = jax.nn.one_hot(value.astype(jnp.int32), node_info.shape[-1])
+        if is_target:
+            if not jnp.issubdtype(value.dtype, jnp.floating):
+                value = jax.nn.one_hot(value.astype(jnp.int32), node_info.shape[-1])
+            if value.shape[1:] != tuple(node_info.shape):
+                raise ValueError(
+                    f"target '{task_name}' has shape {value.shape} (after "
+                    f"one-hot), but node '{node_name}' expects "
+                    f"(batch, {', '.join(str(d) for d in node_info.shape)}). "
+                    f"Integer/bool targets are one-hot encoded to the node's "
+                    f"trailing class axis; float targets must already match "
+                    f"the node shape."
+                )
         clamps[node_name] = value
     if "causal_mask" in structure.task_map:
-        batch_size, seq_len = batch["x"].shape[0], batch["x"].shape[1]
+        mask_node = structure.task_map["causal_mask"]
+        # The mask node declares (..., seq, seq); read seq from the graph, not
+        # from a hard-coded batch key.
+        seq_len = structure.nodes[mask_node].node_info.shape[-1]
+        batch_size = _batch_size(batch, structure)
         mask = create_causal_mask(seq_len)[None, None, :, :]
-        clamps[structure.task_map["causal_mask"]] = jnp.broadcast_to(
-            mask, (batch_size, 1, seq_len, seq_len)
-        )
+        clamps[mask_node] = jnp.broadcast_to(mask, (batch_size, 1, seq_len, seq_len))
     return clamps
 
 
@@ -197,6 +230,19 @@ def _validate_config(config: dict) -> None:
             "(v1 transformer graphs) or use MhaResidualNode(is_causal=True) "
             "(v2 graphs)."
         )
+
+
+def _data_axis_size(mesh: Mesh) -> int:
+    """Size of the mesh's ``"data"`` axis, with an actionable error when the
+    mesh names no such axis (``mesh.shape["data"]`` alone raises a bare
+    ``KeyError``)."""
+    if "data" not in mesh.shape:
+        raise ValueError(
+            f"mesh must name a 'data' axis for data parallelism, got axes "
+            f"{tuple(mesh.shape)}; build it with "
+            f"jax.make_mesh((jax.device_count(),), ('data',))."
+        )
+    return mesh.shape["data"]
 
 
 def _validate_algorithm(algorithm: str, structure: GraphStructure) -> None:
@@ -237,7 +283,7 @@ def _target_node_names(structure, clamps):
 
 def _batch_grads(params, batch, structure, rng_key, *, algorithm):
     """Gradients and metrics for one batch — the only algorithm branch."""
-    batch_size = next(iter(batch.values())).shape[0]
+    batch_size = _batch_size(batch, structure)
     clamps = build_clamps(batch, structure, clamp_target=True)
     target_nodes = _target_node_names(structure, clamps)
 
@@ -268,6 +314,9 @@ def _batch_grads(params, batch, structure, rng_key, *, algorithm):
 
     # Total prediction positions across target clamps: batch*seq for
     # sequences, batch for classification. Shapes are static at trace time.
+    # The trailing axis is the class axis: build_clamps validates every
+    # target clamp against (batch, *node.shape), so rank >= 2 holds and this
+    # agrees with metrics._predictions_per_sample's per-sample weight.
     n_predictions = sum(math.prod(clamps[name].shape[:-1]) for name in target_nodes)
     if target_nodes:
         target_e = (
@@ -332,6 +381,7 @@ def make_train_step(
     if mesh is None:
         return jitted
 
+    _data_axis_size(mesh)
     batch_sharding = NamedSharding(mesh, P("data"))
     replicated = NamedSharding(mesh, P())
 
@@ -374,10 +424,12 @@ def train(
             ``structure.config``, not in ``config``.
         train_loader: Iterable of batches supporting ``len()``.
         optimizer: Optax optimizer.
-        config: Reads only ``num_epochs`` (fractional supported: a partial
+        config: Must contain ``num_epochs`` (fractional supported: a partial
             epoch's ``epoch_results`` entry is the mean over the batches
-            actually run). Otherwise an opaque pass-through to callbacks and
-            experiment harnesses. Retired keys (``loss_type``,
+            actually run; a fractional tail that rounds to zero batches is
+            dropped). A missing ``num_epochs`` raises ``ValueError`` — there
+            is no silent default. Otherwise an opaque pass-through to
+            callbacks and experiment harnesses. Retired keys (``loss_type``,
             ``use_causal_mask``) raise ``ValueError``.
         rng_key: Base training key. It affects only latent initialization;
             inference is deterministic. Per-epoch keys are
@@ -420,29 +472,40 @@ def train(
     data_axis_size = None
     batch_sharding = None
     if mesh is not None:
+        data_axis_size = _data_axis_size(mesh)
         batch_sharding = NamedSharding(mesh, P("data"))
         replicated = NamedSharding(mesh, P())
         params = jax.device_put(params, replicated)
         opt_state = jax.device_put(opt_state, replicated)
-        data_axis_size = mesh.shape["data"]
 
     step_fn = _make_step(
         structure, optimizer, algorithm=algorithm, with_state=False, donate=True
     )
 
-    num_epochs = config.get("num_epochs", 10)
-    total_epochs = math.ceil(num_epochs)
-    frac = num_epochs - math.floor(num_epochs)
-
-    num_batches = len(train_loader)
-    total_batches = sum(
-        (
-            round(frac * num_batches)
-            if (e == total_epochs - 1 and frac > 0)
-            else num_batches
+    if "num_epochs" not in config:
+        raise ValueError(
+            "config['num_epochs'] is required (fractional values are "
+            "supported); there is no default epoch count."
         )
-        for e in range(total_epochs)
-    )
+    num_epochs = config["num_epochs"]
+
+    try:
+        num_batches = len(train_loader)
+    except TypeError as exc:
+        raise TypeError(
+            f"train_loader must support len() — the epoch schedule and "
+            f"progress total need the batch count; got "
+            f"{type(train_loader).__name__}. Wrap a generator in a list or a "
+            f"loader class with __len__."
+        ) from exc
+
+    full_epochs = math.floor(num_epochs)
+    frac = num_epochs - full_epochs
+    # A fractional tail that rounds to zero batches is dropped entirely: no
+    # empty epoch entry, no callback invoked on empty metrics.
+    partial_batches = round(frac * num_batches) if frac > 0 else 0
+    total_epochs = full_epochs + (1 if partial_batches > 0 else 0)
+    total_batches = full_epochs * num_batches + partial_batches
     progress = _tqdm_cls(total=total_batches, disable=not verbose, leave=True)
     sync_per_batch = verbose or iter_callback is not None
     shard_warned = False
@@ -452,10 +515,7 @@ def train(
     epoch_results: List[Any] = []
     for epoch_offset in range(total_epochs):
         epoch_idx = start_epoch + epoch_offset
-        is_last_epoch = epoch_offset == total_epochs - 1
-        max_batches = (
-            round(frac * num_batches) if (is_last_epoch and frac > 0) else num_batches
-        )
+        max_batches = num_batches if epoch_offset < full_epochs else partial_batches
         progress.set_description(f"Epoch {epoch_offset + 1}/{total_epochs}")
 
         # Keys are a pure function of (rng_key, epoch_idx, batch_idx),
@@ -471,7 +531,7 @@ def train(
                 break
             batch = convert_batch(batch_data)
             if mesh is not None:
-                bsz = next(iter(batch.values())).shape[0]
+                bsz = _batch_size(batch, structure)
                 if bsz % data_axis_size != 0:
                     if not shard_warned:
                         warnings.warn(
@@ -596,7 +656,7 @@ def evaluate(
     metric_names = tuple(metric_map)
 
     def eval_step(p, batch, key, sample_mask):
-        batch_size = next(iter(batch.values())).shape[0]
+        batch_size = _batch_size(batch, structure)
         clamps = build_clamps(batch, structure, clamp_target=False)
         state = initialize_graph_state(
             structure, batch_size, key, clamps=clamps, params=p
@@ -618,15 +678,15 @@ def evaluate(
     batch_sharding = None
     mask_sharding = None
     if mesh is not None:
+        data_axis_size = _data_axis_size(mesh)
         batch_sharding = NamedSharding(mesh, P("data"))
         mask_sharding = NamedSharding(mesh, P("data"))
         params = jax.device_put(params, NamedSharding(mesh, P()))
-        data_axis_size = mesh.shape["data"]
 
     totals = {name: (jnp.zeros(()), jnp.zeros(())) for name in metric_names}
     for batch_idx, batch_data in enumerate(test_loader):
         batch = convert_batch(batch_data)
-        bsz = next(iter(batch.values())).shape[0]
+        bsz = _batch_size(batch, structure)
         sample_mask = jnp.ones((bsz,))
         if mesh is not None:
             if bsz % data_axis_size != 0:
