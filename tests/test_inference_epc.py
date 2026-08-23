@@ -9,23 +9,26 @@ correspondence, gradient correctness against the closed form and a
 hand-rolled ``jax.grad``, energy descent, the sPC equilibrium equivalence
 (including an unclamped top-down prior — the case that distinguishes
 ε-relaxed sources from frozen ones), the ``forward_from_error`` branch
-coverage (clamped/unclamped x source/internal), cyclic warm-start
-semantics, muPC input scaling, insertion-order independence, and the
-z_latent = z_mu + ε invariant of the finalized state.
+coverage (clamped/unclamped x source/internal), the ``begin_segment``
+resync (ε := z_latent - z_mu at the carried latents, so ePC continues
+exactly from any incoming state), cyclic warm-start semantics, muPC input
+scaling (and the recorded divergence of sPC+muPC's preconditioned fixed
+point from the true energy minimum ePC reaches), insertion-order
+independence, and the z_latent = z_mu + ε invariant of the finalized state.
 """
 
 import jax
 import jax.numpy as jnp
 import pytest
 
+from conftest import total_energy
+from fabricpc.core import EPCInference, InferenceSGD, run_inference
 from fabricpc.core.activations import (
     IdentityActivation,
     SoftmaxActivation,
     TanhActivation,
 )
 from fabricpc.core.energy import CrossEntropyEnergy
-from fabricpc.core.inference import InferenceSGD, run_inference
-from fabricpc.core.inference_epc import EPCInference
 from fabricpc.core.initializers import NormalInitializer
 from fabricpc.core.learning import compute_local_weight_gradients
 from fabricpc.core.mupc import MuPCConfig
@@ -62,11 +65,18 @@ def _chain(inference=None, scaling=None):
     )
 
 
-def _total_energy(state, structure):
+def _epsilon_grad_sq_norm(params, state, clamps, structure):
+    """Squared norm of the true energy gradient in ε coordinates at the
+    state's latents. begin_segment resyncs ε := z_latent - z_mu, so the
+    measurement is taken exactly at the incoming latents; the ε ↔ z_latent
+    Jacobian is unit-triangular, so this is zero iff the state is a
+    stationary point of the energy in z coordinates too."""
+    synced = EPCInference.begin_segment(params, state, clamps, structure)
+    synced = EPCInference.zero_grads(params, synced, clamps, structure)
+    with_grads = EPCInference.forward_value_and_grad(params, synced, clamps, structure)
     return sum(
-        jnp.sum(state.nodes[name].energy)
-        for name in structure.nodes
-        if structure.nodes[name].node_info.in_degree > 0
+        float(jnp.sum(with_grads.nodes[name].latent_grad ** 2))
+        for name in EPCInference._relaxed_errors(structure, clamps)
     )
 
 
@@ -193,7 +203,7 @@ class TestEnergyDescent:
         inference = structure.config["inference"]
         for _ in range(6):
             state = inference.run_inference(params, state, clamps, structure)
-            energies.append(float(_total_energy(state, structure)))
+            energies.append(float(total_energy(state, structure)))
 
         assert all(
             b < a for a, b in zip(energies, energies[1:])
@@ -228,6 +238,7 @@ class TestSPCEquivalence:
             inference=inference,
         )
 
+    @pytest.mark.slow
     def test_shared_equilibrium_and_weight_grads(self, rng_key):
         batch_size = 3
         x = jax.random.normal(rng_key, (batch_size, 5))
@@ -253,6 +264,11 @@ class TestSPCEquivalence:
         spc_structure, spc_params, spc = finals["spc"]
         _, epc_params, epc = finals["epc"]
 
+        # Both finals are stationary points of the shared energy, not merely
+        # near each other: the true ε-coordinate gradient vanishes at both.
+        assert _epsilon_grad_sq_norm(spc_params, spc, clamps, spc_structure) < 1e-6
+        assert _epsilon_grad_sq_norm(epc_params, epc, clamps, spc_structure) < 1e-6
+
         for name in spc_structure.nodes:
             assert jnp.allclose(
                 spc.nodes[name].z_latent, epc.nodes[name].z_latent, atol=1e-4
@@ -274,6 +290,141 @@ class TestSPCEquivalence:
             for edge_key, g in grads_spc.nodes[name].weights.items():
                 assert jnp.allclose(
                     g, grads_epc.nodes[name].weights[edge_key], atol=1e-4
+                ), f"weight grad differs at {name}/{edge_key}"
+            for bias_key, g in grads_spc.nodes[name].biases.items():
+                assert jnp.allclose(
+                    g, grads_epc.nodes[name].biases[bias_key], atol=1e-4
+                ), f"bias grad differs at {name}/{bias_key}"
+
+
+class TestBeginSegmentResync:
+    def test_resync_preserves_incoming_latents_on_dag(self, rng_key):
+        """begin_segment then derive_states reproduces arbitrary incoming
+        latents exactly on a DAG: the resync computes ε := z_latent - z_mu at
+        the carried latents, and the derive inverts it node by node in
+        schedule order. This is what makes a distribution initializer's
+        random internal latents (or a previous solver segment's state)
+        survive the handoff instead of being overwritten."""
+        structure = _chain()
+        params = initialize_params(structure, rng_key)
+        batch_size = 4
+        clamps = {"x": jax.random.normal(rng_key, (batch_size, 5))}
+        state = initialize_graph_state(
+            structure, batch_size, rng_key, clamps, params=params
+        )
+        # Perturb every unclamped latent off the feedforward point — the
+        # state a distribution initializer would hand over.
+        for name, shape in (("h", (batch_size, 4)), ("y", (batch_size, 3))):
+            perturbed = state.nodes[name].z_latent + jax.random.normal(
+                jax.random.PRNGKey(hash(name) % 2**31), shape
+            )
+            state = update_node_in_state(state, name, z_latent=perturbed)
+
+        synced = EPCInference.begin_segment(params, state, clamps, structure)
+        derived = EPCInference.derive_states(params, synced, clamps, structure)
+        for name in structure.nodes:
+            assert jnp.allclose(
+                derived.nodes[name].z_latent,
+                state.nodes[name].z_latent,
+                atol=1e-6,
+            ), f"{name}: resync + derive moved the incoming latent"
+
+    def test_spc_to_epc_handoff_preserves_latents(self, rng_key):
+        """A zero-step ePC segment after sPC (begin_segment + finalize only)
+        returns sPC's latents unchanged: nothing of the sPC refinement —
+        including its final latent update — is lost at the boundary."""
+        spc = InferenceSGD(eta_infer=0.05, infer_steps=7)
+        epc = EPCInference(eta_infer=0.01, infer_steps=0)
+        structure = _chain(inference=spc)
+        params = initialize_params(structure, rng_key)
+        batch_size = 4
+        clamps = {
+            "x": jax.random.normal(rng_key, (batch_size, 5)),
+            "y": jax.random.normal(jax.random.PRNGKey(1), (batch_size, 3)),
+        }
+        state = initialize_graph_state(
+            structure, batch_size, rng_key, clamps, params=params
+        )
+        after_spc = spc.run_inference(params, state, clamps, structure)
+        after_epc = epc.run_inference(params, after_spc, clamps, structure)
+        for name in structure.nodes:
+            assert jnp.allclose(
+                after_epc.nodes[name].z_latent,
+                after_spc.nodes[name].z_latent,
+                atol=1e-6,
+            ), f"{name}: the ePC boundary moved sPC's latents"
+
+
+class TestNonlinearEquivalence:
+    @pytest.mark.slow
+    def test_tanh_cross_entropy_equilibrium(self, rng_key):
+        """sPC/ePC equivalence off the linear-Gaussian case: tanh hidden
+        layers and a CrossEntropy output energy. Both solvers start from the
+        same feedforward init; the shared stationarity check (true ε-gradient
+        ~ 0 at both finals) plus matching latents pins one shared minimum,
+        and the local weight gradients agree there."""
+
+        def build(inference):
+            x = IdentityNode(shape=(4,), name="x")
+            h1 = Linear(
+                shape=(3,), name="h1", activation=TanhActivation(), weight_init=W_INIT
+            )
+            h2 = Linear(
+                shape=(3,), name="h2", activation=TanhActivation(), weight_init=W_INIT
+            )
+            y = Linear(
+                shape=(2,),
+                name="y",
+                activation=SoftmaxActivation(),
+                energy=CrossEntropyEnergy(),
+                weight_init=W_INIT,
+            )
+            return graph(
+                nodes=[x, h1, h2, y],
+                edges=[
+                    Edge(source=x, target=h1.slot("in")),
+                    Edge(source=h1, target=h2.slot("in")),
+                    Edge(source=h2, target=y.slot("in")),
+                ],
+                task_map=TaskMap(x=x, y=y),
+                inference=inference,
+            )
+
+        batch_size = 3
+        clamps = {
+            "x": jax.random.normal(rng_key, (batch_size, 4)),
+            "y": jax.nn.one_hot(jnp.array([0, 1, 0]), 2),
+        }
+
+        finals = {}
+        for key, inference in (
+            ("spc", InferenceSGD(eta_infer=0.1, infer_steps=8000)),
+            ("epc", EPCInference(eta_infer=0.05, infer_steps=8000)),
+        ):
+            structure = build(inference)
+            params = initialize_params(structure, rng_key)
+            state = initialize_graph_state(
+                structure, batch_size, rng_key, clamps, params=params
+            )
+            final = inference.run_inference(params, state, clamps, structure)
+            finals[key] = (structure, params, final)
+
+        structure, params, spc = finals["spc"]
+        _, _, epc = finals["epc"]
+
+        assert _epsilon_grad_sq_norm(params, spc, clamps, structure) < 1e-6
+        assert _epsilon_grad_sq_norm(params, epc, clamps, structure) < 1e-6
+        for name in structure.nodes:
+            assert jnp.allclose(
+                spc.nodes[name].z_latent, epc.nodes[name].z_latent, atol=1e-3
+            ), f"{name}: z_latent equilibria differ"
+
+        grads_spc = compute_local_weight_gradients(params, spc, structure)
+        grads_epc = compute_local_weight_gradients(params, epc, structure)
+        for name in grads_spc.nodes:
+            for edge_key, g in grads_spc.nodes[name].weights.items():
+                assert jnp.allclose(
+                    g, grads_epc.nodes[name].weights[edge_key], atol=1e-3
                 ), f"weight grad differs at {name}/{edge_key}"
 
 
@@ -485,9 +636,31 @@ class TestCyclicSchedule:
         energies = []
         for _ in range(5):
             state = step(params, state)
-            energies.append(float(_total_energy(state, structure)))
+            energies.append(float(total_energy(state, structure)))
         assert all(jnp.isfinite(jnp.array(energies)))
         assert energies[-1] < energies[0]
+
+    def test_clamped_cycle_member_keeps_clamp(self, rng_key):
+        """A clamp on a cycle member holds through repeated schedule visits:
+        derive_states never relaxes it, and the run stays finite."""
+        structure = self._cycle(unroll=2, infer_steps=2)
+        params = initialize_params(structure, rng_key)
+        batch_size = 3
+        a_clamp = jax.random.normal(jax.random.PRNGKey(3), (batch_size, 4))
+        clamps = {
+            "x": jax.random.normal(rng_key, (batch_size, 5)),
+            "a": a_clamp,
+        }
+        state = initialize_graph_state(
+            structure, batch_size, rng_key, clamps, params=params
+        )
+        final = structure.config["inference"].run_inference(
+            params, state, clamps, structure
+        )
+        assert jnp.array_equal(final.nodes["a"].z_latent, a_clamp)
+        assert jnp.isfinite(float(total_energy(final, structure)))
+        # b relaxed against the clamped a.
+        assert not jnp.allclose(final.nodes["b"].error, 0.0)
 
     def test_warm_start_two_steps_u1_differs_from_one_step_u2(self, rng_key):
         """Each step starts from the carried state (truncated warm start), so
@@ -557,6 +730,103 @@ class TestMuPCScaling:
             params.nodes["h"].biases["b"]
         )
         assert jnp.allclose(derived.nodes["h"].z_mu, expected_mu, atol=1e-6)
+
+
+class TestMuPCDivergence:
+    @pytest.mark.slow
+    def test_spc_mupc_fixed_point_differs_from_true_minimum(self, rng_key):
+        """Under muPC scaling, sPC and ePC have different fixed points, and
+        the divergence is directional: ePC descends the true gradient of the
+        input-scaled energy and stops at its stationary point, while sPC's
+        per-hop updates carry ``topdown_grad_scale = a * jacobian_gain``
+        (tanh's jacobian_gain ~ 1.26), so its fixed point zeroes the
+        preconditioned sum, not the true gradient. The gain is taken from
+        the edge's TARGET activation, so the shifted fixed point needs an
+        unclamped node (h1) feeding a tanh node (h2). Measured with one
+        shared criterion — the true ε-gradient norm at each solver's final
+        state — ePC's vanishes and sPC's does not."""
+        w_init = NormalInitializer(std=0.3)
+
+        def build(inference):
+            x = IdentityNode(shape=(5,), name="x")
+            h1 = Linear(
+                shape=(4,), name="h1", activation=TanhActivation(), weight_init=w_init
+            )
+            h2 = Linear(
+                shape=(4,), name="h2", activation=TanhActivation(), weight_init=w_init
+            )
+            y = Linear(
+                shape=(3,),
+                name="y",
+                activation=IdentityActivation(),
+                weight_init=w_init,
+            )
+            return graph(
+                nodes=[x, h1, h2, y],
+                edges=[
+                    Edge(source=x, target=h1.slot("in")),
+                    Edge(source=h1, target=h2.slot("in")),
+                    Edge(source=h2, target=y.slot("in")),
+                ],
+                task_map=TaskMap(x=x, y=y),
+                inference=inference,
+                scaling=MuPCConfig(),
+            )
+
+        batch_size = 3
+        clamps = {
+            "x": jax.random.normal(rng_key, (batch_size, 5)),
+            "y": jax.random.normal(jax.random.PRNGKey(1), (batch_size, 3)),
+        }
+
+        finals = {}
+        for key, inference in (
+            ("spc", InferenceSGD(eta_infer=0.1, infer_steps=5000)),
+            ("epc", EPCInference(eta_infer=0.05, infer_steps=5000)),
+        ):
+            structure = build(inference)
+            params = initialize_params(structure, rng_key)
+            state = initialize_graph_state(
+                structure, batch_size, rng_key, clamps, params=params
+            )
+            finals[key] = (
+                structure,
+                params,
+                inference.run_inference(params, state, clamps, structure),
+            )
+
+        structure, params, epc = finals["epc"]
+        _, _, spc = finals["spc"]
+        epc_grad = _epsilon_grad_sq_norm(params, epc, clamps, structure)
+        spc_grad = _epsilon_grad_sq_norm(params, spc, clamps, structure)
+        assert epc_grad < 1e-8, "ePC did not reach the true energy's minimum"
+        assert spc_grad > 100 * max(epc_grad, 1e-10), (
+            "sPC+muPC's preconditioned fixed point unexpectedly coincides "
+            "with the true energy minimum"
+        )
+        assert not jnp.allclose(
+            spc.nodes["h1"].z_latent, epc.nodes["h1"].z_latent, atol=1e-4
+        )
+
+
+class TestComputeNewError:
+    def test_decay_and_gradient_step(self):
+        """ε update formula: ε * (1 - eta * decay) - eta * grad."""
+        from fabricpc.core.types import NodeState
+
+        error = jnp.array([[2.0, -4.0]])
+        grad = jnp.array([[0.5, 1.0]])
+        node_state = NodeState(
+            z_latent=jnp.zeros((1, 2)),
+            z_mu=jnp.zeros((1, 2)),
+            error=error,
+            energy=jnp.zeros((1,)),
+            latent_grad=grad,
+        )
+        config = {"eta_infer": 0.1, "latent_decay": 0.5}
+        new_error = EPCInference.compute_new_error("n", node_state, config)
+        expected = error * (1.0 - 0.1 * 0.5) - 0.1 * grad
+        assert jnp.allclose(new_error, expected)
 
 
 class TestOrderIndependence:

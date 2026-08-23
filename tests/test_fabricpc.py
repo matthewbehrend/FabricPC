@@ -621,6 +621,40 @@ class TestUnclampedReadoutRelaxation:
         )
         assert not jnp.any(jnp.isnan(readout_final.z_mu))
 
+    def test_gaussian_readout_latent_converges_to_z_mu(self, rng_key):
+        """An unclamped pure-Gaussian readout relaxes toward z_mu: its only
+        energy term is 0.5||z - z_mu||^2, so the relaxation gradient is
+        z - z_mu and, from a non-feedforward start, z_latent decays
+        geometrically onto z_mu. This is the property that makes reading
+        eval predictions from z_latent equivalent to z_mu at convergence —
+        every eval path now reads z_mu, but the settling behavior itself is
+        the contract."""
+        structure = self._readout_graph()
+        structure = with_inference(structure, eta_infer=0.2, infer_steps=500)
+        params = initialize_params(structure, rng_key)
+        batch_size = 4
+        clamps = {"inp": jax.random.normal(rng_key, (batch_size, 6))}
+
+        state = initialize_graph_state(
+            structure, batch_size, rng_key, clamps, params=params
+        )
+        # Non-feedforward start: push the readout latent off z_mu.
+        off = state.nodes["readout"].z_latent + jax.random.normal(
+            jax.random.PRNGKey(5), (batch_size, 4)
+        )
+        state = state._replace(
+            nodes={
+                **state.nodes,
+                "readout": state.nodes["readout"]._replace(z_latent=off),
+            }
+        )
+
+        final = run_inference(params, state, clamps, structure)
+        readout = final.nodes["readout"]
+        # The O(1) perturbation decays through the coupled hidden-readout
+        # relaxation; 500 steps at eta 0.2 leave a sub-1e-3 residual.
+        assert jnp.allclose(readout.z_latent, readout.z_mu, atol=1e-3)
+
     def test_storkey_hopfield_readout_settles_on_attractor(self, rng_key):
         from fabricpc.nodes import StorkeyHopfield
 

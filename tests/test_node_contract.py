@@ -56,7 +56,20 @@ def _all_node_classes():
 class TestTemplatesAreNotOverridden:
     def test_all_node_classes_resolve_templates_to_base(self):
         classes = _all_node_classes()
-        assert len(classes) >= 15, "subclass walk found too few node classes"
+        # The audit must cover every node class the package exports —
+        # anchored to the export list, not a count, so dropping a module
+        # from fabricpc.nodes.__init__ cannot silently shrink the audit.
+        import fabricpc.nodes as nodes_pkg
+
+        exported = {
+            getattr(nodes_pkg, name)
+            for name in nodes_pkg.__all__
+            if isinstance(getattr(nodes_pkg, name), type)
+            and issubclass(getattr(nodes_pkg, name), NodeBase)
+            and getattr(nodes_pkg, name) is not NodeBase
+        }
+        missing = exported - set(classes)
+        assert not missing, f"subclass walk missed exported node classes: {missing}"
         for cls in classes:
             for method in TEMPLATE_METHODS:
                 # staticmethod access off the class yields the underlying
@@ -126,6 +139,33 @@ class TestSourceGuard:
             )
             assert jnp.allclose(out.energy, expected)
 
+    def test_energy_override_tolerates_source_aux_none(self, rng_key):
+        """The source branch calls energy(aux=None) — predict() never ran and
+        the param initializer gives sources empty params — so an
+        energy-overriding node used as a source must fall back to its base
+        energy instead of unpacking a missing aux (StorkeyHopfield's memory
+        matrix lives under its input edge key, which a source cannot have)."""
+        w_init = NormalInitializer(std=0.1)
+        hop = StorkeyHopfield(shape=(6,), name="hop", hopfield_strength=1.0)
+        out = Linear(shape=(4,), name="out", weight_init=w_init)
+        structure = graph(
+            nodes=[hop, out],
+            edges=[Edge(source=hop, target=out.slot("in"))],
+            task_map=TaskMap(x=hop, y=out),
+            inference=InferenceSGD(),
+        )
+        params = initialize_params(structure, rng_key)
+        info = structure.nodes["hop"].node_info
+        assert info.in_degree == 0
+        state = _node_state(rng_key, 3, info.shape)
+
+        result = StorkeyHopfield.forward(params.nodes["hop"], {}, state, info)
+        energy_obj = info.energy
+        expected = type(energy_obj).energy(
+            state.z_latent, state.z_latent, energy_obj.config
+        )
+        assert jnp.allclose(result.energy, expected)
+
     def test_source_never_calls_predict(self, rng_key):
         """IdentityNode.predict would crash on empty inputs; the template
         guard means a source IdentityNode still forwards fine."""
@@ -192,6 +232,34 @@ class TestAuxSurface:
 
 
 class TestPredictContract:
+    def test_predict_ignores_z_latent_values(self, rng_key):
+        """The contract forbids predict() from reading state.z_latent values
+        (shape/dtype reads allowed): sPC differentiates through such a read
+        while ePC evaluates z_mu at the carried latent, so a z_latent-
+        dependent prediction makes the two solvers minimize different
+        energies. Perturbing z_latent (same shape) must not move z_mu or aux
+        for any shipped node exercised here."""
+        structure = _chain_structure()
+        params = initialize_params(structure, rng_key)
+
+        for name in ("h", "hop"):
+            info = structure.nodes[name].node_info
+            node_class = info.node_class
+            state_a = _node_state(rng_key, 4, info.shape)
+            state_b = state_a._replace(z_latent=state_a.z_latent + 3.7)
+            inputs = {
+                info.in_edges[0]: jax.random.normal(jax.random.PRNGKey(9), (4, 6))
+            }
+            mu_a, aux_a = node_class.predict(params.nodes[name], inputs, state_a, info)
+            mu_b, aux_b = node_class.predict(params.nodes[name], inputs, state_b, info)
+            assert jnp.array_equal(mu_a, mu_b), f"{name}: z_mu depends on z_latent"
+            for leaf_a, leaf_b in zip(
+                jax.tree_util.tree_leaves(aux_a), jax.tree_util.tree_leaves(aux_b)
+            ):
+                assert jnp.array_equal(
+                    leaf_a, leaf_b
+                ), f"{name}: aux depends on z_latent"
+
     def test_bare_array_predict_fails(self, rng_key):
         """A predict that returns a bare array instead of (z_mu, aux) fails
         when the template unpacks it."""

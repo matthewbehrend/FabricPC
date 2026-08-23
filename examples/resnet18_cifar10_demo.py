@@ -93,6 +93,20 @@ def get_activation(name):
     return factories[name]()
 
 
+def make_optimizer(lr, weight_decay, num_epochs, steps_per_epoch):
+    """adamw on a warmup-cosine schedule: 5% linear warmup to lr, cosine decay to lr/100."""
+    total_steps = num_epochs * steps_per_epoch
+    warmup_steps = int(0.05 * total_steps)
+    schedule = optax.warmup_cosine_decay_schedule(
+        init_value=0.0,
+        peak_value=lr,
+        warmup_steps=warmup_steps,
+        decay_steps=total_steps,
+        end_value=lr * 0.01,
+    )
+    return optax.adamw(schedule, weight_decay=weight_decay)
+
+
 # =============================================================================
 # Data Augmentation
 # =============================================================================
@@ -386,17 +400,9 @@ def run_single_mupc(args):
 
     # Cosine LR schedule with warmup
     steps_per_epoch = len(train_loader)
-    total_steps = args.num_epochs * steps_per_epoch
-    warmup_steps = int(0.05 * total_steps)
-
-    schedule = optax.warmup_cosine_decay_schedule(
-        init_value=0.0,
-        peak_value=args.lr,
-        warmup_steps=warmup_steps,
-        decay_steps=total_steps,
-        end_value=args.lr * 0.01,
+    optimizer = make_optimizer(
+        args.lr, args.weight_decay, args.num_epochs, steps_per_epoch
     )
-    optimizer = optax.adamw(schedule, weight_decay=args.weight_decay)
     train_config = {"num_epochs": args.num_epochs}
 
     # Periodic evaluation callback

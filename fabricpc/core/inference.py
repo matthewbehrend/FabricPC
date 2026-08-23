@@ -415,10 +415,12 @@ class InferenceSchedule(InferenceBase):
     Chained execution contract:
     1. Node states are initialized once, by the graph's configured
        initializer, before the first segment; no segment re-initializes.
-    2. Each solver receives z_latent, z_mu, and error exactly as the
-       previous segment (or the initializer) left them — no resync, no
-       re-derivation at the boundary. Each solver applies its own
-       ``begin_segment``/``finalize_state``.
+    2. Each solver receives z_latent exactly as the previous segment (or
+       the initializer) left it, and its ``begin_segment`` adapts the
+       derived fields to its own parameterization without moving the
+       latents — ePC recomputes ε := z_latent - z_mu at the carried
+       latents, so relaxation continues from the incoming latents rather
+       than from stale ε.
     3. The next solver continues from the resulting state (after e.g. ePC's
        ``finalize_state`` rebuild).
 

@@ -352,10 +352,14 @@ class NodeBase(ABC):
         weight matrix. The pair (error = z_latent - z_mu) and the energy call
         are applied by the base templates; do not compute them here.
 
-        ``predict`` may read the node's own ``state``, but under
-        ``EPCInference.derive_states`` the state carries the previous step's
-        values: z_mu is always evaluated at the carried state, never at the
-        latent being derived.
+        ``predict`` must not read ``state.z_latent`` values (shape/dtype
+        reads like ``state.z_latent.shape[0]`` are fine). The state-based
+        solvers differentiate through such a read —
+        ``forward_and_latent_grads`` re-binds z_latent and differentiates
+        the whole forward — while ``EPCInference.derive_states`` evaluates
+        z_mu at the carried latent, so a z_latent-dependent prediction makes
+        the two solver families minimize different energies. An energy term
+        that needs the node's own latent belongs in ``energy()``.
 
         muPC scaling is NOT applied here; the inference/learning callsite
         applies it. Do not scale inputs or gradients inside this method.
@@ -405,6 +409,12 @@ class NodeBase(ABC):
         snapshotted at ``predict`` time, which under ePC is before z_latent
         is derived, so such an entry would evaluate the energy at two
         different latents (see ``predict``).
+
+        aux is None on the ``in_degree == 0`` path (``predict`` never runs
+        and the param initializer assigns sources empty params), so an
+        override must tolerate ``aux=None`` — typically by returning the
+        base energy when its extra term needs parameters a source cannot
+        have (see StorkeyHopfield).
 
         Args:
             params: Node parameters (weights, biases)
@@ -511,7 +521,8 @@ class NodeBase(ABC):
         The clamp decides which side of the pair is free:
         - Unclamped: ε is relaxed; z_latent := z_mu + ε. This holds for every
           degree — top-down priors (in_degree == 0, whose z_mu is the constant
-          assigned at initialization) and readouts (out_degree == 0) included.
+          fixed by the segment's ``begin_segment`` resync) and readouts
+          (out_degree == 0) included.
         - Clamped: z_latent stays the clamp and ε is derived — with in-edges
           the sPC-direction template recomputes error = pair_error(clamp, z_mu)
           and energy(clamp, z_mu), the output loss; a clamped source keeps its

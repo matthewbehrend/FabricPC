@@ -298,7 +298,9 @@ def graph(
     Raises:
         GraphCycleError: The graph contains cycles and ``unroll`` was not given.
     """
-    if unroll is not None and (not isinstance(unroll, int) or unroll < 1):
+    if unroll is not None and (
+        isinstance(unroll, bool) or not isinstance(unroll, int) or unroll < 1
+    ):
         raise ValueError(f"unroll must be an int >= 1, got {unroll!r}")
     # 1. Build EdgeInfo objects from Edge objects
     edge_infos = {}

@@ -37,7 +37,7 @@ These methods are static because FabricPC uses a functional JAX-based design. No
 `predict()` is where the node does its real work, and its body is intentionally unconstrained: how you turn inputs into a prediction is up to you — a matmul in `Linear`, an attention pipeline in `TransformerBlock`, an embedding lookup in `EmbeddingNode`. Everything around the prediction is **base-owned and not a node override point**:
 
 - The error pair — `error = z_latent - z_mu` (`pair_error`) and its inverse `z_latent = z_mu + error` (`pair_latent`) — lives on `NodeBase`. State-based inference relaxes `z_latent` and derives `error`; the error-parameterized solver (`EPCInference`) relaxes `error` and derives `z_latent`. Both directions share one bijection, which is why nodes cannot override it.
-- The assembly templates `forward()` (predict → pair → energy), `forward_with_aux()` (the same, surfacing `aux`), and `forward_from_error()` (the ePC derive direction) live on `NodeBase`. Source semantics (an `in_degree == 0` node's `z_mu` mirrors its `z_latent` with zero error) also live there — `predict()` is never called on a source node.
+- The assembly templates `forward()` (predict → pair → energy), `forward_with_aux()` (the same, surfacing `aux`), and `forward_from_error()` (the ePC derive direction) live on `NodeBase`. Source semantics (`in_degree == 0`) also live there — `predict()` is never called on a source node: in the sPC direction (`forward`/`forward_with_aux`) a source's `z_mu` mirrors its `z_latent` with zero error, while in the ePC direction (`forward_from_error`) an unclamped source derives `z_latent = z_mu + error` with `z_mu` held fixed.
 
 ## Step-by-Step: Conv2D Node
 
@@ -249,7 +249,7 @@ The contract:
 2. **Return `aux`**: an arbitrary pytree of intermediates for `energy()`, or `None` if unused. See [the aux pattern](#the-aux-pattern) — aux must depend only on `params` and `inputs`.
 3. **Do not compute the error or the energy.** The base templates apply `error = z_latent - z_mu` and call `energy()`; a node body that repeats them breaks the error-parameterized solver, which derives `z_latent` from the error instead.
 
-`predict()` may read the node's own `state`, but under `EPCInference` the state carries the *previous* step's values: `z_mu` is always evaluated at the carried state, never at the latent being derived in the same visit.
+`predict()` must not read `state.z_latent` values (shape/dtype reads like `state.z_latent.shape[0]` are fine). The state-based solvers differentiate through such a read — `forward_and_latent_grads` re-binds `z_latent` and differentiates the whole forward — while `EPCInference` evaluates `z_mu` at the carried latent, so a `z_latent`-dependent prediction makes the two solver families minimize different energies. An energy term that needs the node's own latent belongs in `energy()`.
 
 > **muPC scaling is not applied inside `predict()`.** The inference and learning callsites scale inputs and gradients; doing so again here double-scales them. See the [Initialization and Scaling guide](05_initialization_and_scaling.md).
 
@@ -306,6 +306,9 @@ The default `energy()` scores the node's energy functional at `(state.z_latent, 
 @staticmethod
 def energy(params, inputs, state, aux, node_info):
     """Combined energy: the functional default plus the attractor term."""
+    if aux is None:                        # source node: predict() never ran and
+        return NodeBase.energy(params, inputs, state, aux, node_info)  # no W exists
+
     W, strength = aux                      # params-derived, snapshotted at predict time
     energy = NodeBase.energy(params, inputs, state, aux, node_info)
 
@@ -317,6 +320,8 @@ def energy(params, inputs, state, aux, node_info):
 ```
 
 The returned energy stays per-sample (shape `(batch,)`); summation over the batch dimension is owned by the gradient templates, which need the resulting scalar for autodiff.
+
+An override must tolerate `aux=None`: on the `in_degree == 0` path `predict()` never runs (and the param initializer gives sources empty params), so an extra term whose inputs a source cannot have falls back to the base energy, as above.
 
 ### The aux pattern
 

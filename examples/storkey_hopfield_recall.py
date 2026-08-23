@@ -134,11 +134,13 @@ class HopfieldRecallLoader:
 def build_recall_graph(D, hopfield_strength=1.0, infer_steps=20, eta_infer=0.05):
     """Build 3-node recall graph: probe -> hopfield -> output.
 
-    An unclamped readout now takes the ordinary relaxation path (error =
-    z_latent - z_mu, energy as the node assigns), so a StorkeyHopfield
-    readout would also settle onto its attractor. This graph keeps the
-    Hopfield node internal with a separate output node so recall quality is
-    read from a plain projection of the settled attractor state.
+    Recall quality is read from the Hopfield node's own settled z_latent —
+    the attractor lives in that node's z-space. The unclamped output readout
+    relaxes like any other node (error = z_latent - z_mu, its energy in the
+    total): as the attractor pulls the Hopfield latent, the readout's z_mu
+    moves ahead of its z_latent, and the resulting error feeds a transient
+    top-down gradient back into the Hopfield latent until the readout
+    catches up.
     """
     probe = IdentityNode(shape=(D,), name="probe")
     hopfield = StorkeyHopfield(

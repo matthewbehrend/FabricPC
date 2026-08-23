@@ -17,9 +17,9 @@ Energy formulation:
 
     where D = dimension of z (last axis) for scale-invariance.
 
-The standard PC energy path (via energy_functional()) is called normally.
-The Hopfield energy is added afterward via accumulate_hopfield_energy(),
-which augments state.energy. The gradient dE_hop/dz is computed
+The node implements the split contract: ``predict()`` returns z_mu plus the
+aux pair (W, strength), and the ``energy()`` override adds the Hopfield
+attractor term to the base PC energy. The gradient dE_hop/dz is computed
 automatically via autodiff in forward_and_latent_grads().
 
 Attractor dynamics arise naturally from the Hopfield energy gradient
@@ -398,7 +398,14 @@ class StorkeyHopfield(NodeBase):
         here — the z_latent-dependent-term rule — so both solver directions
         evaluate it at the same latent as the PC term. The gradient
         dE_hop/dz = (s/D)(W^2 - W)z arrives via autodiff.
+
+        aux is None on the in_degree == 0 path: predict() never runs there
+        and the param initializer assigns no W to source nodes (the memory
+        matrix is stored under the input edge key), so without a memory
+        matrix the energy is the base PC term alone.
         """
+        if aux is None:
+            return NodeBase.energy(params, inputs, state, aux, node_info)
         W, strength = aux
         energy = NodeBase.energy(params, inputs, state, aux, node_info)
 

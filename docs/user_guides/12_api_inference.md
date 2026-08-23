@@ -9,7 +9,9 @@ Inference is the inner optimization loop of predictive coding. Given fixed weigh
 Each inference step has three phases:
 1. **Zero gradients** — Reset accumulated latent gradients
 2. **Forward pass** — Compute predictions, errors, and accumulate gradient contributions
-3. **Latent update** — Apply the algorithm-specific update rule to z_latent
+3. **Update** — Apply the algorithm-specific update rule to the relaxed variables (`z_latent` for the state-based solvers, ε for `EPCInference`)
+
+`run_inference` brackets the step loop with two segment hooks, `begin_segment` and `finalize_state` (identity by default) — a solver's entry adaptation and exit rebuild when its per-step state is not the consumable final state.
 
 ## InferenceSGD
 
@@ -64,7 +66,7 @@ z_new = z * (1 - eta * latent_decay) - eta * clipped_grad
 
 ## EPCInference
 
-Error-parameterized predictive coding (ePC, Goemaere et al., arXiv 2505.20137). The prediction error ε is the first-class relaxed variable; each latent is derived by a forward pass along `structure.schedule` as `z_latent = z_mu + ε`. Because every node's `z_mu` depends on all upstream latents, one `jax.value_and_grad` over the ε pytree per step delivers the output-loss signal to every layer unattenuated — a few steps replace sPC's hundreds on deep DAGs. The ε ↔ z_latent map is a volume-preserving bijection: identical energies, identical equilibria, and the final derived state feeds the local weight-gradient path unchanged.
+Error-parameterized predictive coding (ePC, Goemaere et al., arXiv 2505.20137). The prediction error ε is the first-class relaxed variable; each latent is derived by a forward pass along `structure.schedule` as `z_latent = z_mu + ε`. Because every node's `z_mu` depends on all upstream latents, one `jax.value_and_grad` over the ε pytree per step delivers the output-loss signal to every layer unattenuated — a few steps replace sPC's hundreds on deep DAGs. The ε ↔ z_latent map is a volume-preserving bijection: identical energies, identical equilibria, and the final derived state feeds the local weight-gradient path unchanged. (The equivalence relies on the node contract's rule that `predict` never reads `state.z_latent` values — see the custom-nodes guide.)
 
 ```python
 from fabricpc.core.inference_epc import EPCInference
@@ -86,7 +88,9 @@ latent_grad = d(total energy of in_degree > 0 nodes)/d(error)   # one global rev
 error_new = error * (1 - eta * latent_decay) - eta * latent_grad
 ```
 
-The ε gradient is taken through the full network's transfer function — a change in one node's ε moves every downstream derived latent — so `eta_infer` must be tuned like a weight learning rate, not like sPC's local rate: sPC's typical 0.05–0.1 can overshoot the minimum along the global gradient. The default 1e-2 comes from the measured resnet18/CIFAR-10 convergence (`examples/epc_spc_resnet18_compare.py --mode convergence`): reaching sPC-120's final total energy took 105 steps at 1e-3, 12 at 1e-2, and 5 at 3e-2.
+A segment starts with `begin_segment` — one forward pass at the carried latents setting ε := z_latent − z_mu, so relaxation continues exactly from the incoming state (the initializer's output or a previous segment's latents) — and ends with `finalize_state`, one detached derive so the returned state satisfies z_latent = z_mu + ε with energies at the final point.
+
+The ε gradient is taken through the full network's transfer function — a change in one node's ε moves every downstream derived latent — so `eta_infer` must be tuned like a weight learning rate, not like sPC's local per-node rate. Measured on the resnet18/CIFAR-10 convergence (`examples/epc_spc_resnet18_compare.py --mode convergence`), reaching sPC's final recorded total energy (120-step run) took 104 ε updates at 1e-3, 11 at 1e-2, 4 at 3e-2, and 1 at 0.1. The default is 1e-2 rather than the fastest measured rate: one batch on one architecture is thin evidence for 0.1's stability across models, and 1e-2 already converges in about a dozen updates.
 
 On cyclic graphs, ePC minimizes the unrolled approximation of the graph energy fixed by `graph(..., unroll=U)`; state-based solvers minimize the exact graph energy as-is. Memory: each ePC step's single reverse pass stores activations for the whole derived forward (depth × unroll), backprop-scale rather than sPC's per-node closures.
 
@@ -106,7 +110,7 @@ inference = InferenceSchedule(
 
 Chained execution contract:
 1. Node states are initialized once, by the graph's configured initializer, before the first segment; no segment re-initializes.
-2. Each solver receives `z_latent`, `z_mu`, and `error` exactly as the previous segment (or the initializer) left them — no resync at the boundary.
+2. Each solver receives `z_latent` exactly as the previous segment (or the initializer) left it, and its `begin_segment` adapts the derived fields to its own parameterization without moving the latents — ePC recomputes ε := z_latent − z_mu at the carried latents, so relaxation continues from the incoming latents rather than from stale ε.
 3. The next solver continues from the resulting state (after e.g. ePC's final derive rebuild).
 
 Schedules nest, and `segments()` flattens them for per-step consumers (tracking iterates segments instead of assuming one global step count). A schedule has no single per-step rule, so `inference_step()` and `compute_new_latent()` raise. Under a composed schedule, a tracked `latent_grad_norm` series carries each segment's own gradient semantics — sPC's one-hop dE/dz_latent, ePC's full-forward ε gradient.
@@ -115,8 +119,10 @@ Schedules nest, and `segments()` flattens them for per-step consumers (tracking 
 
 | Parameter | Typical Range | Notes |
 |-----------|:------------:|-------|
-| `eta_infer` | 0.01–0.2 | Lower for stability, higher for faster convergence |
-| `infer_steps` | 10–50 | More steps = better convergence, slower training |
+| `eta_infer` (state-based) | 0.01–0.2 | A per-node rate; lower for stability, higher for faster convergence |
+| `eta_infer` (EPCInference) | ~1e-2 | A global rate through the whole transfer function; tune like a weight learning rate |
+| `infer_steps` (state-based) | 10–50 | More steps = better convergence, slower training |
+| `infer_steps` (EPCInference) | 3–10 | One reverse pass per step reaches every layer |
 | `latent_decay` | 0.0 | Rarely needed; try 0.001 if latents drift |
 | `max_norm` | 0.5–2.0 | For InferenceSGDNormClip; prevents gradient explosions |
 
@@ -145,7 +151,7 @@ class InferenceMomentum(InferenceBase):
         return node_state.z_latent - eta * node_state.latent_grad
 ```
 
-For more radical changes, override `inference_step()`, `forward_value_and_grad()`, or `run_inference()`.
+For more radical changes, override `inference_step()`, `forward_value_and_grad()`, or `run_inference()`. Segment-aware solvers additionally override the boundary hooks `begin_segment()` (entry adaptation, run before the first step) and `finalize_state()` (exit rebuild, run after the last step) — see `EPCInference` for a worked example of both.
 
 ## Convenience Function
 

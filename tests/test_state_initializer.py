@@ -22,11 +22,15 @@ from fabricpc.core.activations import (
     SoftmaxActivation,
     GeluActivation,
 )
-from fabricpc.core.initializers import NormalInitializer
+from fabricpc.core.initializers import NormalInitializer, ZerosInitializer
+from fabricpc.core.mupc import MuPCConfig
+from fabricpc.core.state_ops import set_latents_to_clamps
+from fabricpc.core.types import GraphState, NodeState
 from fabricpc.graph_initialization.state_initializer import (
     GlobalStateInit,
     NodeDistributionStateInit,
     FeedforwardStateInit,
+    StateInitBase,
     initialize_graph_state,
 )
 
@@ -395,6 +399,58 @@ class TestSourceZmuInvariant:
             ), f"{name}: z_mu != z_latent at init"
             assert jnp.all(node_state.error == 0), f"{name}: error != 0 at init"
 
+    def test_post_pass_overwrites_custom_initializer_garbage(self, rng_key):
+        """The shared post-pass assigns BOTH z_mu and error on sources, so
+        the invariant is self-contained: a custom initializer that writes an
+        inconsistent z_mu/error still leaves error = z_latent - z_mu = 0.
+        (The built-in initializers already zero the error field, which would
+        make an error assertion against them vacuous — this initializer
+        deliberately does not.)"""
+
+        class GarbageInit(StateInitBase):
+            def __init__(self):
+                super().__init__()
+
+            @staticmethod
+            def initialize_state(
+                structure, batch_size, rng_key, clamps, config, params=None
+            ):
+                nodes = {}
+                for name, node in structure.nodes.items():
+                    shape = (batch_size, *node.node_info.shape)
+                    nodes[name] = NodeState(
+                        z_latent=jnp.full(shape, 1.5),
+                        z_mu=jnp.full(shape, -3.0),
+                        error=jnp.full(shape, 7.0),
+                        energy=jnp.zeros((batch_size,)),
+                        latent_grad=jnp.zeros(shape),
+                    )
+                state = GraphState(nodes=nodes, batch_size=batch_size)
+                return set_latents_to_clamps(state, clamps)
+
+        structure = _two_source_graph()
+        params = initialize_params(structure, rng_key)
+        batch_size = 4
+        clamps = {"inp": jax.random.normal(rng_key, (batch_size, 12))}
+
+        state = initialize_graph_state(
+            structure,
+            batch_size,
+            rng_key,
+            clamps,
+            state_init=GarbageInit(),
+            params=params,
+        )
+
+        for name in ("inp", "prior"):
+            node_state = state.nodes[name]
+            assert jnp.array_equal(
+                node_state.z_mu, node_state.z_latent.astype(node_state.z_mu.dtype)
+            ), f"{name}: post-pass did not overwrite the garbage z_mu"
+            assert jnp.all(
+                node_state.error == 0
+            ), f"{name}: post-pass did not zero the garbage error"
+
     def test_int_clamped_source_zmu_stays_float(self, rng_key):
         """An int source clamp mirrors into z_mu cast to float, keeping the
         float-only carry invariant."""
@@ -420,15 +476,33 @@ class TestSourceZmuInvariant:
         assert jnp.all(node_state.error == 0)
 
 
-def _cycle_graph(unroll):
-    """x -> a <-> b -> y with the 2-node cycle unrolled `unroll` times."""
+def _cycle_graph(unroll, scaling=None, zero_latents=False):
+    """x -> a <-> b -> y with the 2-node cycle unrolled `unroll` times.
+
+    zero_latents pins a's and b's latent_init to zeros, making the pass-1
+    fallback latents (a cycle member's value before its first visit)
+    deterministic so a test can hand-compute the propagation.
+    """
     from fabricpc.core.activations import TanhActivation
     from fabricpc.nodes.identity import IdentityNode
 
     w_init = NormalInitializer(std=0.1)
+    l_init = ZerosInitializer() if zero_latents else NormalInitializer(std=0.05)
     x = IdentityNode(shape=(6,), name="x")
-    a = Linear(shape=(8,), name="a", activation=TanhActivation(), weight_init=w_init)
-    b = Linear(shape=(8,), name="b", activation=TanhActivation(), weight_init=w_init)
+    a = Linear(
+        shape=(8,),
+        name="a",
+        activation=TanhActivation(),
+        weight_init=w_init,
+        latent_init=l_init,
+    )
+    b = Linear(
+        shape=(8,),
+        name="b",
+        activation=TanhActivation(),
+        weight_init=w_init,
+        latent_init=l_init,
+    )
     y = Linear(
         shape=(4,), name="y", activation=IdentityActivation(), weight_init=w_init
     )
@@ -443,15 +517,33 @@ def _cycle_graph(unroll):
         task_map=TaskMap(x=x, y=y),
         inference=InferenceSGD(eta_infer=0.05, infer_steps=1),
         unroll=unroll,
+        scaling=scaling,
     )
+
+
+def _fscale(structure, node_name, edge_key):
+    """Read the muPC forward scale for an edge (1.0 when scaling is off,
+    the node's scalings are None, or the edge is non-scalable)."""
+    sc = structure.nodes[node_name].node_info.scaling_config
+    if sc is None or sc.forward_scale is None:
+        return 1.0
+    return sc.forward_scale.get(edge_key, 1.0)
 
 
 class TestFeedforwardThroughCycles:
     """FeedforwardStateInit pass 2 walks structure.schedule, so cyclic graphs
     get true feedforward initialization through the cycle."""
 
-    def test_cycle_feedforward_matches_manual_replay(self, rng_key):
-        structure = _cycle_graph(unroll=2)
+    @pytest.mark.parametrize("scaling", [None, MuPCConfig()], ids=["unscaled", "mupc"])
+    def test_cycle_feedforward_hand_computed(self, scaling, rng_key):
+        """U=2 on x -> a <-> b -> y with zero fallback latents, computed by
+        hand from the documented schedule (x, a, b, a, b, y) with explicit
+        matmuls — the schedule and the per-visit propagation are hardcoded
+        here, not replayed through the implementation. The muPC variant
+        multiplies each in-edge by its forward_scale (read as data from
+        scaling_config), pinning that pass 2 applies scale_inputs."""
+        structure = _cycle_graph(unroll=2, scaling=scaling, zero_latents=True)
+        assert structure.schedule == ("x", "a", "b", "a", "b", "y")
         params = initialize_params(structure, rng_key)
         batch_size = 3
         x = jax.random.normal(rng_key, (batch_size, 6))
@@ -466,34 +558,33 @@ class TestFeedforwardThroughCycles:
             params=params,
         )
 
-        # Pass 1 of FeedforwardStateInit draws each node's latent_init with
-        # the same rng split NodeDistributionStateInit uses, so that
-        # initializer reproduces the pre-propagation latents.
-        pass1 = initialize_graph_state(
-            structure,
-            batch_size,
-            rng_key,
-            clamps,
-            state_init=NodeDistributionStateInit(),
-            params=params,
-        )
+        W_xa = params.nodes["a"].weights["x->a:in"]
+        W_ba = params.nodes["a"].weights["b->a:in"]
+        W_ab = params.nodes["b"].weights["a->b:in"]
+        W_by = params.nodes["y"].weights["b->y:in"]
+        b_a = params.nodes["a"].biases["b"]
+        b_b = params.nodes["b"].biases["b"]
+        b_y = params.nodes["y"].biases["b"]
+        s_xa = _fscale(structure, "a", "x->a:in")
+        s_ba = _fscale(structure, "a", "b->a:in")
+        s_ab = _fscale(structure, "b", "a->b:in")
+        s_by = _fscale(structure, "y", "b->y:in")
 
-        z = {name: pass1.nodes[name].z_latent for name in structure.nodes}
-        for node_name in structure.schedule:
-            info = structure.nodes[node_name].node_info
-            if info.in_degree == 0:
-                continue
-            inputs = {ek: z[structure.edges[ek].source] for ek in info.in_edges}
-            projected = info.node_class.forward(
-                params.nodes[node_name], inputs, pass1.nodes[node_name], info
-            )
-            if node_name not in clamps:
-                z[node_name] = projected.z_mu
+        # Visit 1 of a: b's fallback latent is zero (ZerosInitializer).
+        z_a = jnp.tanh((s_xa * x) @ W_xa + b_a)
+        z_b = jnp.tanh((s_ab * z_a) @ W_ab + b_b)
+        # Visit 2: the cycle re-propagates at the updated latents.
+        z_a = jnp.tanh((s_xa * x) @ W_xa + (s_ba * z_b) @ W_ba + b_a)
+        z_b = jnp.tanh((s_ab * z_a) @ W_ab + b_b)
+        z_y = (s_by * z_b) @ W_by + b_y
 
-        for node_name in structure.nodes:
+        for name, expected in (("a", z_a), ("b", z_b), ("y", z_y)):
             assert jnp.allclose(
-                state.nodes[node_name].z_latent, z[node_name], atol=1e-6
-            ), f"{node_name}: feedforward init != manual schedule replay"
+                state.nodes[name].z_latent, expected, atol=1e-6
+            ), f"{name}: feedforward init != hand-computed propagation"
+            assert jnp.allclose(
+                state.nodes[name].z_mu, expected, atol=1e-6
+            ), f"{name}: z_mu != z_latent at feedforward init"
 
     def test_unroll_degree_changes_init(self, rng_key):
         """U=2 propagates one more traversal through the cycle than U=1, so

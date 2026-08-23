@@ -397,7 +397,8 @@ def initialize_graph_state(
         if node.node_info.in_degree == 0:
             node_state = state.nodes[node_name]
             node_state = node_state._replace(
-                z_mu=node_state.z_latent.astype(node_state.z_mu.dtype)
+                z_mu=node_state.z_latent.astype(node_state.z_mu.dtype),
+                error=jnp.zeros_like(node_state.error),
             )
             state = state._replace(nodes={**state.nodes, node_name: node_state})
 

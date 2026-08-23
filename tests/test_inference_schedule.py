@@ -1,10 +1,11 @@
 """
 Tests for InferenceSchedule — composable per-update solver segments.
 
-A schedule folds the state through its component solvers in order; the
-handoff passes z_latent/z_mu/error exactly as the previous segment left
-them (each solver applies its own begin_segment/finalize_state). segments()
-flattens for per-step consumers; the per-step stubs raise.
+A schedule folds the state through its component solvers in order; each
+segment receives the previous segment's latents, and each solver's
+begin_segment adapts the derived fields to its own parameterization without
+moving them (ePC resyncs ε := z_latent - z_mu at the carried latents).
+segments() flattens for per-step consumers; the per-step stubs raise.
 """
 
 import jax
@@ -12,9 +13,14 @@ import jax.numpy as jnp
 import optax
 import pytest
 
+from conftest import total_energy
+from fabricpc.core import (
+    EPCInference,
+    InferenceSGD,
+    InferenceSchedule,
+    run_inference,
+)
 from fabricpc.core.activations import IdentityActivation, TanhActivation
-from fabricpc.core.inference import InferenceSGD, InferenceSchedule, run_inference
-from fabricpc.core.inference_epc import EPCInference
 from fabricpc.core.initializers import NormalInitializer
 from fabricpc.core.topology import Edge
 from fabricpc.graph_assembly import TaskMap, graph
@@ -23,7 +29,10 @@ from fabricpc.graph_initialization.state_initializer import initialize_graph_sta
 from fabricpc.nodes import Linear
 from fabricpc.nodes.identity import IdentityNode
 from fabricpc.training import train_step
-from fabricpc.utils.dashboarding.inference_tracking import run_inference_with_history
+from fabricpc.utils.dashboarding.inference_tracking import (
+    run_inference_with_full_history,
+    run_inference_with_history,
+)
 
 W_INIT = NormalInitializer(std=0.3)
 
@@ -58,14 +67,6 @@ def _setup(inference, rng_key, batch_size=4):
     return structure, params, clamps, state
 
 
-def _total_energy(state, structure):
-    return sum(
-        jnp.sum(state.nodes[name].energy)
-        for name in structure.nodes
-        if structure.nodes[name].node_info.in_degree > 0
-    )
-
-
 class TestConstruction:
     def test_empty_raises(self):
         with pytest.raises(ValueError, match="at least one"):
@@ -74,6 +75,10 @@ class TestConstruction:
     def test_non_inference_raises(self):
         with pytest.raises(TypeError, match="InferenceBase"):
             InferenceSchedule(InferenceSGD(), "not a solver")
+
+    def test_class_instead_of_instance_raises(self):
+        with pytest.raises(TypeError, match="InferenceBase"):
+            InferenceSchedule(InferenceSGD)
 
     def test_per_step_stubs_raise(self):
         schedule = InferenceSchedule(InferenceSGD())
@@ -116,8 +121,9 @@ class TestExecution:
                 ), f"{name}.{field} differs between schedule and plain solver"
 
     def test_epc_then_spc_equals_manual_sequential_calls(self, rng_key):
-        """The schedule is the manual fold — z_latent/z_mu/error pass every
-        segment boundary bit-identical (no resync)."""
+        """The schedule is the manual fold — every field passes each segment
+        boundary bit-identical (each solver's own begin_segment/finalize run
+        inside its run_inference either way)."""
         epc = EPCInference(eta_infer=0.01, infer_steps=3)
         spc = InferenceSGD(eta_infer=0.05, infer_steps=5)
         structure, params, clamps, state = _setup(InferenceSchedule(epc, spc), rng_key)
@@ -133,22 +139,49 @@ class TestExecution:
                     getattr(manual.nodes[name], field),
                 ), f"{name}.{field} differs between schedule and manual fold"
 
-    def test_handoff_energy_non_increasing(self, rng_key):
-        """sPC refinement from ePC's finalized state descends the same
-        energy: the round trip does not undo ePC's progress."""
+    def test_schedule_descends_energy(self, rng_key):
+        """The composed schedule strictly descends the energy: ePC makes real
+        progress from init, and the sPC segment strictly improves on ePC's
+        handoff (both clamps are active, so neither segment starts at the
+        minimum)."""
         epc = EPCInference(eta_infer=0.01, infer_steps=5)
         spc = InferenceSGD(eta_infer=0.02, infer_steps=10)
-        structure, params, clamps, state = _setup(InferenceSchedule(epc, spc), rng_key)
+        schedule = InferenceSchedule(epc, spc)
+        structure, params, clamps, state = _setup(schedule, rng_key)
 
         after_epc = epc.run_inference(params, state, clamps, structure)
-        after_spc = spc.run_inference(params, after_epc, clamps, structure)
-        e_init = _total_energy(
-            EPCInference.derive_states(params, state, clamps, structure), structure
-        )
-        e_epc = _total_energy(after_epc, structure)
-        e_spc = _total_energy(after_spc, structure)
-        assert e_epc <= e_init + 1e-6
-        assert e_spc <= e_epc + 1e-6
+        final = run_inference(params, state, clamps, structure)  # the schedule
+
+        e_init = float(total_energy(state, structure))
+        e_epc = float(total_energy(after_epc, structure))
+        e_final = float(total_energy(final, structure))
+        assert e_epc < e_init, "ePC segment made no progress from init"
+        assert e_final < e_epc, "sPC segment made no progress from ePC's handoff"
+
+    def test_nested_schedule_executes_like_flat(self, rng_key):
+        """Nesting is execution-transparent: a schedule containing a schedule
+        folds the state through the same segment sequence bit-identically."""
+
+        def solvers():
+            return (
+                EPCInference(eta_infer=0.01, infer_steps=3),
+                InferenceSGD(eta_infer=0.05, infer_steps=4),
+                InferenceSGD(eta_infer=0.02, infer_steps=2),
+            )
+
+        epc, spc1, spc2 = solvers()
+        nested = InferenceSchedule(InferenceSchedule(epc, spc1), spc2)
+        flat = InferenceSchedule(*solvers())
+        structure, params, clamps, state = _setup(nested, rng_key)
+
+        via_nested = nested.run_inference(params, state, clamps, structure)
+        via_flat = flat.run_inference(params, state, clamps, structure)
+        for name in structure.nodes:
+            for field in ("z_latent", "z_mu", "error", "energy", "latent_grad"):
+                assert jnp.array_equal(
+                    getattr(via_nested.nodes[name], field),
+                    getattr(via_flat.nodes[name], field),
+                ), f"{name}.{field} differs between nested and flat schedules"
 
     def test_runs_inside_jit_train_step(self, rng_key):
         schedule = InferenceSchedule(
@@ -194,6 +227,23 @@ class TestTrackingParity:
                 final_plain.nodes[name].z_latent,
                 atol=1e-6,
             ), f"{name}: tracked final state differs from run_inference"
+
+    def test_full_history_schedule_rows_and_final(self, rng_key):
+        epc = EPCInference(eta_infer=0.01, infer_steps=3)
+        spc = InferenceSGD(eta_infer=0.05, infer_steps=5)
+        structure, params, clamps, state = _setup(InferenceSchedule(epc, spc), rng_key)
+
+        final_tracked, history = run_inference_with_full_history(
+            params, state, clamps, structure
+        )
+        assert len(history) == 3 + 5
+        final_plain = run_inference(params, state, clamps, structure)
+        for name in structure.nodes:
+            assert jnp.allclose(
+                final_tracked.nodes[name].z_latent,
+                final_plain.nodes[name].z_latent,
+                atol=1e-6,
+            ), f"{name}: full-history final state differs from run_inference"
 
     def test_single_solver_tracking_unchanged(self, rng_key):
         solver = InferenceSGD(eta_infer=0.05, infer_steps=4)

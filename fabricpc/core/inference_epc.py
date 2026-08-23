@@ -51,14 +51,14 @@ class EPCInference(InferenceBase):
         eta_infer: Inference rate on ε (default: 1e-2). The ε gradient is
             taken through the full network's transfer function — a change in
             one node's ε moves every downstream derived latent — so tune it
-            like a weight learning rate, not like sPC's local rate: sPC's
-            typical 0.05-0.1 conditions a per-node step against that node's
-            own energy and can overshoot the minimum along the global
-            gradient. Measured on the resnet18/CIFAR-10 demo
+            like a weight learning rate, not like sPC's local per-node rate.
+            Measured on the resnet18/CIFAR-10 demo
             (examples/epc_spc_resnet18_compare.py --mode convergence),
-            reaching sPC-120's final total energy took 105 steps at 1e-3,
-            12 at 1e-2, and 5 at 3e-2, so the default sits an order of
-            magnitude above the demos' adamw weight rate.
+            reaching sPC's final recorded total energy (120-step run) took
+            104 ε updates at 1e-3, 11 at 1e-2, 4 at 3e-2, and 1 at 0.1. The
+            default is 1e-2 rather than the fastest measured rate: one batch
+            on one architecture is thin evidence for 0.1's stability across
+            models, and 1e-2 already converges in about a dozen updates.
         infer_steps: Number of inference iterations (default: 5). One
             reverse pass per step reaches every layer, so a few steps replace
             sPC's hundreds on deep DAGs.
@@ -198,6 +198,46 @@ class EPCInference(InferenceBase):
             "EPCInference relaxes errors, not latents; the per-step update is "
             "compute_new_error()."
         )
+
+    @classmethod
+    def begin_segment(
+        cls,
+        params: GraphParams,
+        state: GraphState,
+        clamps: Dict[str, jnp.ndarray],
+        structure: GraphStructure,
+    ) -> GraphState:
+        """
+        Resync ε to the incoming latents before the first ε update.
+
+        One sPC-direction forward pass at the carried z_latents: each node's
+        z_mu is recomputed from its sources' carried latents via the template
+        ``forward`` and ε := z_latent - z_mu. The first ``derive_states``
+        then reproduces the incoming z_latent exactly on DAGs — in schedule
+        order, z_mu is recomputed at the already-preserved upstream latents,
+        so z_mu + ε = z_latent node by node. A distribution initializer's
+        random internal latents and a preceding sPC segment's final latent
+        update both survive the handoff instead of being overwritten by a
+        derive from stale ε. On cyclic graphs, repeated visits re-inject the
+        same ε at updated latents, so cycle members are preserved at their
+        first visit only (the unrolled parameterization has no exact inverse
+        there).
+
+        z_latent never changes during this sweep, so one visit per node
+        suffices whatever the schedule's unroll degree.
+        """
+        for node_name in structure.node_order:
+            node_info = structure.nodes[node_name].node_info
+            in_edges_data = gather_inputs(node_info, structure, state)
+            scaled_inputs = scale_inputs(in_edges_data, node_info.scaling_config)
+            new_node_state = node_info.node_class.forward(
+                params.nodes[node_name],
+                scaled_inputs,
+                state.nodes[node_name],
+                node_info,
+            )
+            state = state._replace(nodes={**state.nodes, node_name: new_node_state})
+        return state
 
     @classmethod
     def finalize_state(

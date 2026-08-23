@@ -21,35 +21,49 @@ sets the granularity of the time axis. Derived per-trial metrics:
   reaches the trial's sPC accuracy, reporting its train_time and the ratio
   to sPC's.
 
-Both are tested with a paired t-test and Cohen's d across trials; at the
-default n = 5 the test has 4 degrees of freedom, so read the per-trial
-table alongside the p-value. Chart written to ``epc_step_sweep.html``
-(and ``.png`` when kaleido is installed).
+Both derived metrics interpolate or select over the arm grid, so they are
+reported descriptively (per-trial table plus mean +/- SE), with no test
+attached — the runner's contrast family is declared empty. To confirm a
+chosen operating point, declare it as a planned contrast on accuracy in a
+follow-up run, e.g. ``contrasts=[("ePC-8", "sPC-120")]``.
 
 ``--mode convergence`` — single seed, no training: identical params and
-initial state for both solvers on one test batch, tracked with
+initial state for all solvers on one test batch, tracked with
 ``run_inference_with_history``. Reports **per-node** energy-vs-step (total
 energy is dominated by output-adjacent nodes — the energy imbalance in
 Pinchetti et al., arXiv 2407.01163 — so a global curve can read as sPC
 near-convergence while deep nodes have received no signal), the E*
-head-to-head criterion (E* = sPC's final total energy; ePC's steps to reach
-<= E*), and post-warmup per-step wall-clock for both solvers. Chart written
-to ``epc_convergence.html`` (and ``.png`` when kaleido is installed).
+head-to-head criterion (E* = sPC's final recorded total energy; each ePC
+eta's updates to reach <= E*), and post-warmup wall-clock. Step counting:
+the tracked history records each step's energy before that step's latent/ε
+update (phase 2 runs before phase 3), so history index i is the energy
+after i updates, and "updates to reach E*" counts updates, not tracked
+steps. ``--epc_eta`` accepts a comma-separated list here, producing the
+whole eta table in one invocation. Wall-clock is the min over repeated
+post-warmup runs, reported two ways: asymptotic ms/step (a full
+``--track_steps`` run divided by its step count) and ms per update at
+T1 = 1 — ePC's ``run_inference`` brackets its step loop with a
+``begin_segment`` resync forward and a ``finalize_state`` derive forward,
+which the asymptotic number amortizes but which dominate a T1 = 1 arm.
+Chart written to ``epc_convergence.html`` (and ``.png`` when kaleido is
+installed).
 
 Usage:
-    python examples/epc_spc_resnet18_compare.py --mode convergence
+    python examples/epc_spc_resnet18_compare.py --mode convergence \
+        --epc_eta 0.001,0.01,0.03,0.1
     python examples/epc_spc_resnet18_compare.py --mode sweep --n_trials 5
 
 Convergence results (RTX 3090, cuda13; batch 256, 120 tracked steps,
-sPC = InferenceSGDNormClip @ eta 0.1; E* = sPC's final total energy):
+sPC = InferenceSGDNormClip @ eta 0.1; E* = sPC's final recorded total
+energy):
 
-    epc_eta   ePC steps to reach <= E*
-    0.001     105
-    0.01      12
-    0.03      5
-    0.1       2
+    epc_eta   ePC updates to reach <= E*
+    0.001     104
+    0.01      11
+    0.03      4
+    0.1       1
 
-    per-step wall-clock ratio (ePC / sPC): 0.88-0.95x
+    asymptotic per-step wall-clock ratio (ePC / sPC): 0.88-0.95x
 
 Sweep results (paste the per-trial tables here after running per house
 convention):
@@ -69,12 +83,10 @@ from pathlib import Path
 import jax
 import jax.numpy as jnp
 import numpy as np
-import optax
 
 from fabricpc.core.inference import InferenceSGDNormClip
 from fabricpc.core.inference_epc import EPCInference
 from fabricpc.experiments import ExperimentArm, PlannedMultiContrastExperiment
-from fabricpc.experiments.statistics import cohens_d, paired_ttest
 from fabricpc.graph_initialization.state_initializer import initialize_graph_state
 from fabricpc.training import evaluate_pcn, train_pcn
 from fabricpc.utils.data.dataloader import Cifar10Loader
@@ -93,11 +105,11 @@ _spec.loader.exec_module(_demo)
 # =============================================================================
 
 
-def resolve_epc_eta(args):
-    """--epc_eta, falling back to EPCInference's constructor default."""
-    if args.epc_eta is not None:
-        return args.epc_eta
-    return EPCInference().config["eta_infer"]
+def parse_epc_etas(args):
+    """--epc_eta as a list of floats, falling back to EPCInference's default."""
+    if args.epc_eta is None:
+        return [EPCInference().config["eta_infer"]]
+    return [float(s) for s in args.epc_eta.split(",")]
 
 
 def make_model_factory(inference, activation_name):
@@ -122,19 +134,6 @@ def make_loader_factory(batch_size):
     return factory
 
 
-def make_optimizer(lr, weight_decay, num_epochs, steps_per_epoch):
-    total_steps = num_epochs * steps_per_epoch
-    warmup_steps = int(0.05 * total_steps)
-    schedule = optax.warmup_cosine_decay_schedule(
-        init_value=0.0,
-        peak_value=lr,
-        warmup_steps=warmup_steps,
-        decay_steps=total_steps,
-        end_value=lr * 0.01,
-    )
-    return optax.adamw(schedule, weight_decay=weight_decay)
-
-
 def _write_chart(fig, stem):
     """html always; png only behind a kaleido import guard."""
     fig.write_html(f"{stem}.html")
@@ -155,13 +154,19 @@ def _write_chart(fig, stem):
 
 def run_sweep(args):
     epc_steps = [int(s) for s in args.epc_step_sweep.split(",")]
-    epc_eta = resolve_epc_eta(args)
+    epc_etas = parse_epc_etas(args)
+    if len(epc_etas) != 1:
+        raise ValueError(
+            "--mode sweep takes a single --epc_eta; the comma-separated list "
+            "is a convergence-mode input."
+        )
+    epc_eta = epc_etas[0]
     spc_name = f"sPC-{args.spc_steps}"
 
     steps_per_epoch = len(
         Cifar10Loader("train", batch_size=args.batch_size, shuffle=True, seed=0)
     )
-    optimizer = make_optimizer(
+    optimizer = _demo.make_optimizer(
         args.lr, args.weight_decay, args.num_epochs, steps_per_epoch
     )
     train_config = {"num_epochs": args.num_epochs}
@@ -205,9 +210,11 @@ def run_sweep(args):
         f"trials: {args.n_trials}"
     )
 
-    # The runner supplies the paired trial loop; the contrast family is
-    # empty — the derived equal-wall-clock / equal-accuracy comparisons
-    # below are computed from the per-trial (train_time, accuracy) pairs.
+    # The runner supplies the paired trial loop. The contrast family is
+    # declared empty on purpose: the comparisons below interpolate or select
+    # over the arm grid, so they are reported descriptively (no p-values).
+    # A confirmatory comparison of a chosen T1 belongs in a follow-up run
+    # with contrasts=[("ePC-<T1>", spc_name)] on accuracy.
     runner = PlannedMultiContrastExperiment(
         arms=arms,
         contrasts=[],
@@ -261,7 +268,8 @@ def _report_sweep(results, epc_steps, spc_name, args):
         acc = results.per_arm_metrics(name) * 100
         t = results.per_arm_times(name)
         se = acc.std(ddof=1) / np.sqrt(n_trials) if n_trials > 1 else 0.0
-        print(f"{name:<12} {acc.mean():.2f} +/- {se:.2f}     {t.mean():.1f}")
+        acc_field = f"{acc.mean():.2f} +/- {se:.2f}"
+        print(f"{name:<12} {acc_field:<18} {t.mean():.1f}")
 
     print()
     print("--- Accuracy at equal wall-clock (per trial) ---")
@@ -283,27 +291,25 @@ def _report_sweep(results, epc_steps, spc_name, args):
             f"{t1_to_equal_acc[i]:<6.0f} {ratio:<8.2f}"
         )
 
-    # -- paired tests ---------------------------------------------------------
-    def _paired_report(label, a, b):
-        mask = ~(np.isnan(a) | np.isnan(b))
-        if mask.sum() >= 2:
-            tt = paired_ttest(a[mask], b[mask])
-            eff = cohens_d(a[mask], b[mask])
-            print(
-                f"{label}: mean diff {tt.mean_difference:+.4f}, "
-                f"t = {tt.t_statistic:.3f}, p = {tt.p_value:.4f} "
-                f"(n = {tt.n}), Cohen's d = {eff.d:.3f}"
-            )
-        else:
-            print(f"{label}: fewer than 2 complete trials; no test.")
+    # -- descriptive summaries ------------------------------------------------
+    # These metrics interpolate (acc @ equal time) or select the smallest
+    # qualifying arm (time to equal accuracy), so no test is attached; see
+    # the module docstring for the planned-contrast route.
+    def _descriptive(label, diffs):
+        mask = ~np.isnan(diffs)
+        n = int(mask.sum())
+        if n == 0:
+            print(f"{label}: no complete trials.")
+            return
+        d = diffs[mask]
+        se = d.std(ddof=1) / np.sqrt(n) if n > 1 else 0.0
+        print(f"{label}: mean {d.mean():+.4f} +/- {se:.4f} SE (n = {n})")
 
     print()
-    print(f"--- Paired tests across trials (n = {n_trials}, df = {n_trials - 1}) ---")
-    _paired_report(
-        "accuracy @ equal wall-clock (ePC - sPC)", acc_at_equal_time, spc_acc
-    )
-    _paired_report(
-        "wall-clock to equal accuracy (ePC - sPC, s)", time_to_equal_acc, spc_time
+    print("--- Descriptive summaries (no test; see docstring) ---")
+    _descriptive("accuracy @ equal wall-clock (ePC - sPC)", acc_at_equal_time - spc_acc)
+    _descriptive(
+        "wall-clock to equal accuracy (ePC - sPC, s)", time_to_equal_acc - spc_time
     )
 
     _plot_sweep(results, epc_steps, spc_name, n_trials)
@@ -390,24 +396,42 @@ def _plot_sweep(results, epc_steps, spc_name, n_trials):
 # =============================================================================
 
 
+def _time_min(solver, structure, params, init_state, clamps, repeats=5):
+    """Post-warmup wall-clock of one run_inference call: min over repeats."""
+    runner = jax.jit(
+        lambda p, s, solver=solver, structure=structure: solver.run_inference(
+            p, s, clamps, structure
+        )
+    )
+    jax.block_until_ready(runner(params, init_state))  # compile
+    best = np.inf
+    for _ in range(repeats):
+        t0 = time.time()
+        jax.block_until_ready(runner(params, init_state))
+        best = min(best, time.time() - t0)
+    return best
+
+
 def run_convergence(args):
-    epc_eta = resolve_epc_eta(args)
+    epc_etas = parse_epc_etas(args)
     activation = _demo.get_activation(args.activation)
     track_steps = args.track_steps
 
     solvers = {
         "sPC": InferenceSGDNormClip(
             eta_infer=args.spc_eta, infer_steps=track_steps, max_norm=1.0
-        ),
-        "ePC": EPCInference(eta_infer=epc_eta, infer_steps=track_steps),
+        )
     }
+    for eta in epc_etas:
+        solvers[f"ePC@{eta:g}"] = EPCInference(eta_infer=eta, infer_steps=track_steps)
+    epc_labels = [label for label in solvers if label != "sPC"]
 
     print("=" * 70)
     print("ePC vs sPC inference convergence — ResNet-18 / CIFAR-10, one batch")
     print("=" * 70)
     print(
         f"tracked steps: {track_steps}  |  sPC eta: {args.spc_eta}  |  "
-        f"ePC eta: {epc_eta}"
+        f"ePC etas: {epc_etas}"
     )
 
     # One structure per solver over identical params and initial state: the
@@ -420,13 +444,14 @@ def run_convergence(args):
 
     test_loader = Cifar10Loader("test", batch_size=args.batch_size, shuffle=False)
     images, labels_onehot = next(iter(test_loader))  # labels arrive one-hot
+    batch_size = images.shape[0]
     clamps = {
         base_structure.task_map["x"]: jnp.asarray(images),
         base_structure.task_map["y"]: jnp.asarray(labels_onehot),
     }
 
     init_state = initialize_graph_state(
-        base_structure, images.shape[0], state_key, clamps=clamps, params=params
+        base_structure, batch_size, state_key, clamps=clamps, params=params
     )
 
     in_degree_nodes = [
@@ -436,56 +461,66 @@ def run_convergence(args):
     ]
 
     histories = {}
-    step_seconds = {}
     for label, solver in solvers.items():
         structure = base_structure._replace(
             config={**base_structure.config, "inference": solver}
         )
-
         tracked = jax.jit(
             lambda p, s, structure=structure: run_inference_with_history(
                 p, s, clamps, structure
             )
         )
-        final_state, metrics = tracked(params, init_state)  # warmup + result
+        _, metrics = tracked(params, init_state)  # warmup + result
         jax.block_until_ready(metrics)
         histories[label] = jax.tree_util.tree_map(np.asarray, metrics)
 
-        # Post-warmup per-step wall-clock on the untracked path.
-        runner = jax.jit(
-            lambda p, s, solver=solver, structure=structure: solver.run_inference(
-                p, s, clamps, structure
-            )
+    # Post-warmup wall-clock, min over repeats, on the untracked path.
+    # Two readings per solver: asymptotic ms/step (full track_steps run /
+    # track_steps) and ms per update at T1 = 1. ePC's run_inference brackets
+    # the step loop with a begin_segment resync forward and a finalize_state
+    # derive forward; the asymptotic number amortizes them, the T1 = 1
+    # number shows them — it is the real per-update cost of a small-T1 arm.
+    # The per-step cost is eta-independent, so one ePC solver suffices.
+    print()
+    timed = {"sPC": solvers["sPC"], "ePC": solvers[epc_labels[0]]}
+    per_step = {}
+    for label, solver in timed.items():
+        full = _time_min(solver, base_structure, params, init_state, clamps)
+        one_step = type(solver)(**{**solver.config, "infer_steps": 1})
+        single = _time_min(one_step, base_structure, params, init_state, clamps)
+        per_step[label] = full / track_steps
+        print(
+            f"  {label}: {per_step[label] * 1000:.1f} ms/step asymptotic "
+            f"({track_steps} steps, min over 5 runs); "
+            f"{single * 1000:.1f} ms per update at T1=1"
         )
-        jax.block_until_ready(runner(params, init_state))  # compile
-        t0 = time.time()
-        jax.block_until_ready(runner(params, init_state))
-        step_seconds[label] = (time.time() - t0) / track_steps
-        print(f"  {label}: {step_seconds[label] * 1000:.1f} ms/step (post-warmup)")
+    ratio = per_step["ePC"] / per_step["sPC"]
+    print(f"  asymptotic per-step cost ratio (ePC / sPC): {ratio:.2f}x")
 
-    ratio = step_seconds["ePC"] / step_seconds["sPC"]
-    print(f"  per-step cost ratio (ePC / sPC): {ratio:.2f}x")
-
-    # Total energy series over in_degree > 0 nodes.
+    # Total energy series over in_degree > 0 nodes. History index i records
+    # the energy computed before that step's update (phase 2 runs before
+    # phase 3), i.e. the energy after i updates.
     totals = {
         label: np.sum(
-            [history[name]["energy"] * args.batch_size for name in in_degree_nodes],
+            [history[name]["energy"] * batch_size for name in in_degree_nodes],
             axis=0,
         )
         for label, history in histories.items()
     }
     e_star = totals["sPC"][-1]
-    reached = np.nonzero(totals["ePC"] <= e_star)[0]
-    if reached.size:
-        print(
-            f"  E* = sPC total energy after {track_steps} steps = {e_star:.4f}; "
-            f"ePC reaches <= E* at step {reached[0] + 1}"
-        )
-    else:
-        print(
-            f"  E* = {e_star:.4f}; ePC did not reach <= E* within "
-            f"{track_steps} steps (final {totals['ePC'][-1]:.4f})"
-        )
+    print(
+        f"  E* = sPC final recorded total energy ({track_steps}-step run) "
+        f"= {e_star:.4g}"
+    )
+    for label in epc_labels:
+        reached = np.nonzero(totals[label] <= e_star)[0]
+        if reached.size:
+            print(f"  {label}: reaches <= E* after {reached[0]} eps updates")
+        else:
+            print(
+                f"  {label}: did not reach <= E* within {track_steps} steps "
+                f"(final {totals[label][-1]:.4g})"
+            )
 
     _plot_convergence(histories, base_structure, in_degree_nodes, track_steps)
 
@@ -498,19 +533,21 @@ def _plot_convergence(histories, structure, in_degree_nodes, track_steps):
     # Color per node by schedule depth (first-occurrence position).
     depth = {name: i for i, name in enumerate(structure.node_order)}
     max_depth = max(depth.values())
-    steps = np.arange(1, track_steps + 1)
+    # History index i records the energy after i updates.
+    updates = np.arange(track_steps)
 
+    labels = list(histories.keys())
     fig = make_subplots(
-        rows=1, cols=2, shared_yaxes=True, subplot_titles=("sPC", "ePC")
+        rows=1, cols=len(labels), shared_yaxes=True, subplot_titles=labels
     )
-    for col, label in ((1, "sPC"), (2, "ePC")):
+    for col, label in enumerate(labels, start=1):
         history = histories[label]
         for name in in_degree_nodes:
             energy = np.maximum(history[name]["energy"], 1e-12)
             color = pcolors.sample_colorscale("Viridis", depth[name] / max_depth)[0]
             fig.add_trace(
                 go.Scatter(
-                    x=steps,
+                    x=updates,
                     y=np.log10(energy),
                     mode="lines",
                     line=dict(color=color, width=1),
@@ -521,13 +558,12 @@ def _plot_convergence(histories, structure, in_degree_nodes, track_steps):
                 row=1,
                 col=col,
             )
-    fig.update_xaxes(title_text="inference step", row=1, col=1)
-    fig.update_xaxes(title_text="inference step", row=1, col=2)
+        fig.update_xaxes(title_text="updates applied", row=1, col=col)
     fig.update_yaxes(title_text="log10 per-node energy (batch mean)", row=1, col=1)
     fig.update_layout(
         height=550,
-        width=1100,
-        title="Per-node energy vs inference step (color = schedule depth)",
+        width=550 * len(labels),
+        title="Per-node energy vs updates applied (color = schedule depth)",
     )
 
     _write_chart(fig, "epc_convergence")
@@ -559,20 +595,24 @@ def parse_args():
     parser.add_argument("--spc_eta", type=float, default=0.1)
     parser.add_argument(
         "--epc_eta",
-        type=float,
+        type=str,
         default=None,
         help="ePC inference rate (default: EPCInference's default, 1e-2; the "
         "epsilon step descends the full-transfer-function gradient, so tune "
-        "it like a weight learning rate)",
+        "it like a weight learning rate). Convergence mode accepts a "
+        "comma-separated list and reports one E* row per eta; sweep mode "
+        "takes a single value.",
     )
     parser.add_argument("--lr", type=float, default=0.001)
     parser.add_argument("--weight_decay", type=float, default=0.01)
     parser.add_argument(
         "--epc_step_sweep",
         type=str,
-        default="1,2,3,4,5,6,7,8,9,10,16,32,64,128",
+        default="1,2,3,4,5,6,7,8,9,10,16,32,64,128,160",
         help="Comma-separated T1 grid: dense 1-10 where accuracy moves "
-        "fastest, log-spaced above; must bracket sPC's wall-clock point",
+        "fastest, log-spaced above; must bracket sPC's wall-clock point "
+        "(at the ~0.9x per-step ratio, sPC-120 lands near ePC T1~130, "
+        "hence the 160 top entry)",
     )
     parser.add_argument(
         "--track_steps",

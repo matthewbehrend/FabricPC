@@ -20,7 +20,7 @@ Both are trained with identical PC hyperparameters to isolate the effect
 of cyclic structure on classification accuracy.
 
 Usage:
-    python examples/mnist_cyclic_graph.py                # 10 trials (default)
+    python examples/mnist_cyclic_graph.py                # 3 trials (default)
     python examples/mnist_cyclic_graph.py --n_trials 20  # 20 trials
     python examples/mnist_cyclic_graph.py --verbose       # show per-epoch output
 """
@@ -63,7 +63,7 @@ def parse_args():
         "--n_trials",
         type=int,
         default=3,
-        help="Number of independent training trials per architecture (default: 10)",
+        help="Number of independent training trials per architecture (default: 3)",
     )
     parser.add_argument(
         "--verbose",

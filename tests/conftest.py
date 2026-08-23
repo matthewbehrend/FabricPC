@@ -31,6 +31,15 @@ def rng_key():
     return jax.random.PRNGKey(42)
 
 
+def total_energy(state, structure):
+    """Total energy over in_degree > 0 nodes (the set the training loop sums)."""
+    return sum(
+        jnp.sum(state.nodes[name].energy)
+        for name in structure.nodes
+        if structure.nodes[name].node_info.in_degree > 0
+    )
+
+
 def with_inference(structure, inference=None, **kwargs):
     """Return structure with modified inference config for testing.
 

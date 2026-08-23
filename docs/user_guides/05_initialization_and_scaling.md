@@ -550,7 +550,7 @@ structure = graph(
 - May require more inference steps to converge
 - Latent states start far from equilibrium
 
-**Best for**: Debugging, baselines, or when forward initialization is not applicable (e.g., cyclic graphs).
+**Best for**: Debugging and baselines. (Cyclic graphs no longer need it: `FeedforwardStateInit` walks `structure.schedule`, so a graph built with `graph(..., unroll=U)` gets feedforward initialization through its cycles at degree U.)
 
 ### NodeDistributionStateInit
 

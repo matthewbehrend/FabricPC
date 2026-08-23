@@ -151,8 +151,11 @@ class TestCyclicSchedule:
 
 
 class TestGraphUnrollValidation:
-    @pytest.mark.parametrize("bad_unroll", [0, -1, 1.5, "2"])
+    @pytest.mark.parametrize("bad_unroll", [0, -1, 1.5, "2", True, False])
     def test_graph_rejects_bad_unroll(self, bad_unroll):
+        """Bools are rejected too: isinstance(True, int) holds, so without
+        the explicit bool check graph(..., unroll=True) would silently build
+        a degree-1 schedule."""
         with pytest.raises(ValueError, match="unroll"):
             _build_dag(("x", "a", "b", "y"), unroll=bad_unroll)
 
@@ -161,6 +164,101 @@ class TestGraphUnrollValidation:
         assert structure.config["unroll"] == 2
         dag = _build_dag(("x", "a", "b", "y"))
         assert dag.config["unroll"] is None
+
+
+def _identity_nodes(names, dim=4):
+    from fabricpc.nodes.identity import IdentityNode
+
+    return {name: IdentityNode(shape=(dim,), name=name) for name in names}
+
+
+def _graph_of(nodes_by_name, edge_pairs, task_map, unroll):
+    """Build a graph from IdentityNodes and (source, target) name pairs."""
+    return graph(
+        nodes=list(nodes_by_name.values()),
+        edges=[
+            Edge(source=nodes_by_name[s], target=nodes_by_name[t].slot("in"))
+            for s, t in edge_pairs
+        ],
+        task_map=task_map,
+        inference=InferenceSGD(eta_infer=0.1, infer_steps=1),
+        unroll=unroll,
+    )
+
+
+class TestComplexTopologies:
+    def test_three_node_scc(self):
+        """x -> a -> b -> c -> a, c -> y: BFS from the entry a walks the
+        cycle in edge order, repeated U times."""
+        n = _identity_nodes(("x", "a", "b", "c", "y"))
+        structure = _graph_of(
+            n,
+            [("x", "a"), ("a", "b"), ("b", "c"), ("c", "a"), ("c", "y")],
+            TaskMap(x=n["x"], y=n["y"]),
+            unroll=2,
+        )
+        assert structure.schedule == ("x", "a", "b", "c", "a", "b", "c", "y")
+        assert structure.node_order == ("x", "a", "b", "c", "y")
+
+    def test_two_disjoint_cycles(self):
+        """Two independent SCCs unroll independently, ordered by the
+        condensation Kahn (seeded from dict order, successors in edge
+        order)."""
+        n = _identity_nodes(("x", "a", "b", "c", "d", "y"))
+        structure = _graph_of(
+            n,
+            [
+                ("x", "a"),
+                ("a", "b"),
+                ("b", "a"),
+                ("x", "c"),
+                ("c", "d"),
+                ("d", "c"),
+                ("b", "y"),
+                ("d", "y"),
+            ],
+            TaskMap(x=n["x"], y=n["y"]),
+            unroll=2,
+        )
+        assert structure.schedule == ("x", "a", "b", "a", "b", "c", "d", "c", "d", "y")
+        assert structure.node_order == ("x", "a", "b", "c", "d", "y")
+
+    def test_overlapping_cycles_share_one_scc(self):
+        """a <-> b and b <-> c overlap in b, so Tarjan merges them into one
+        SCC {a, b, c}: the whole component repeats U times as a unit."""
+        n = _identity_nodes(("x", "a", "b", "c", "y"))
+        structure = _graph_of(
+            n,
+            [("x", "a"), ("a", "b"), ("b", "a"), ("b", "c"), ("c", "b"), ("c", "y")],
+            TaskMap(x=n["x"], y=n["y"]),
+            unroll=2,
+        )
+        assert structure.schedule == ("x", "a", "b", "c", "a", "b", "c", "y")
+
+    def test_multi_entry_scc(self):
+        """Both a and b have external in-edges, so both seed the intra-SCC
+        BFS (in member dict order)."""
+        n = _identity_nodes(("x1", "x2", "a", "b", "y"))
+        structure = _graph_of(
+            n,
+            [("x1", "a"), ("x2", "b"), ("a", "b"), ("b", "a"), ("b", "y")],
+            TaskMap(x=n["x1"], y=n["y"]),
+            unroll=2,
+        )
+        assert structure.schedule == ("x1", "x2", "a", "b", "a", "b", "y")
+
+    def test_entryless_scc_falls_back_to_first_member(self):
+        """A cycle with no external in-edge (no source feeds it) seeds its
+        BFS from the first member in dict order."""
+        n = _identity_nodes(("a", "b", "y"))
+        structure = _graph_of(
+            n,
+            [("a", "b"), ("b", "a"), ("b", "y")],
+            TaskMap(y=n["y"]),
+            unroll=2,
+        )
+        assert structure.schedule == ("a", "b", "a", "b", "y")
+        assert structure.node_order == ("a", "b", "y")
 
 
 class TestFirstOccurrenceOrder:
