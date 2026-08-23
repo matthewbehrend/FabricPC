@@ -2,7 +2,7 @@
 
 ## Context
 
-FabricPC's two inference solvers (`InferenceSGD`, `InferenceSGDNormClip`) implement state-based predictive coding (sPC): latent states relax by local gradient descent, so the output-loss signal attenuates by the state learning rate per layer per step and deep graphs need 100s of inference steps (resnet18 demo: 120 steps, 476 s/epoch). The ePC paper (Goemaere et al., arXiv 2505.20137, `docs/dev_plans/2505.20137v5.pdf`) reparameterizes PC over prediction errors: one reverse-mode AD pass through the whole network delivers the loss signal to every layer unattenuated, reaching the same equilibrium in ~several steps. sPC remains the general solver for arbitrary graphs; ePC is the efficient solver for DAG (or unrolled-cyclic) representations.
+FabricPC's two inference solvers (`InferenceSGD`, `InferenceSGDNormClip`) implement state-based predictive coding (sPC): latent states relax by local gradient descent, so the output-loss signal attenuates by the state learning rate per layer per step and deep graphs need 100s of inference steps (resnet18 demo: 120 steps, 476 s/epoch). The ePC paper (Goemaere et al., arXiv 2505.20137) reparameterizes PC over prediction errors: one reverse-mode AD pass through the whole network delivers the loss signal to every layer unattenuated, reaching the same equilibrium in ~several steps. sPC remains the general solver for arbitrary graphs; ePC is the efficient solver for DAG (or unrolled-cyclic) representations.
 
 This plan adds five things: a split of the node forward contract into `predict` / `pair` / `energy` (Component 3), so one node-level prediction pass serves both parameterizations; ePC as an `InferenceBase` subclass; a composable inference schedule (a few ePC steps to near-equilibrium, then sPC refinement on the true arbitrary-graph energy); a generalization of the topological-order method to an unroll degree `U`, so ePC also accepts cyclic/self-recurrent graphs by unrolling; and an ePC-vs-sPC benchmark on the resnet18 demo.
 
@@ -353,4 +353,3 @@ Remaining before the PR merges:
 
 - The PR description must state that cyclic graphs previously got partial-order feedforward init (cycle members skipped), so training curves on cyclic graphs shift even where tests hold (Verification item 2).
 - The sweep table is pending its ~5 h run; the equal-wall-clock claim is unmeasured until then and the PR text must not imply otherwise.
-- `docs/dev_plans/2505.20137v5.pdf` (1.6 MB) stays out of the repository — delete or gitignore; the arXiv ID is cited in Context.
