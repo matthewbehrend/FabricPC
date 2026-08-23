@@ -158,7 +158,7 @@ from fabricpc.core.activations import SoftmaxActivation
 from fabricpc.core.energy import CrossEntropyEnergy
 from fabricpc.core.inference import InferenceSGD
 from fabricpc.core.initializers import XavierInitializer
-from fabricpc.training import train_pcn, evaluate_pcn
+from fabricpc.training import train, evaluate
 from fabricpc.experiments import ExperimentArm, PlannedMultiContrastExperiment
 from fabricpc.utils.data.dataloader import (
     FashionMnistLoader,
@@ -631,8 +631,8 @@ def main():
             model_factory=make_model_factory(
                 ARCH_CONFIGS[arm_name], hopfield_strength, HIDDEN_WIDTH
             ),
-            train_fn=train_pcn,
-            eval_fn=evaluate_pcn,
+            train_fn=train,
+            eval_fn=evaluate,
             optimizer=optimizer,
             train_config=train_config,
         )

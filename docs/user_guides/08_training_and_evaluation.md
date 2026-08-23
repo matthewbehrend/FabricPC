@@ -1,172 +1,285 @@
 # Training and Evaluation
 
-Tutorial-style guide covering training loops, evaluation, callbacks, multi-GPU.
+Tutorial-style guide covering `train`/`evaluate`, resume, callbacks, custom
+loops, metrics, autoregressive generation, and mesh-based multi-device
+training.
 
-## High-Level API: train_pcn()
+One API trains every FabricPC graph with either learning rule, selected by
+`algorithm`:
 
 ```python
-from fabricpc.training import train_pcn
+from fabricpc.training import train, evaluate
 
-trained_params, energy_history, epoch_results = train_pcn(
-    params=params,
-    structure=structure,
-    train_loader=train_loader,
-    optimizer=optimizer,
-    config={"num_epochs": 20},
-    rng_key=train_key,
+result = train(params, structure, train_loader, optimizer,
+               {"num_epochs": 20}, train_key)                      # PC (default)
+result = train(params, structure, train_loader, optimizer,
+               {"num_epochs": 20}, train_key, algorithm="backprop")
+```
+
+## The Energy Framing
+
+Both algorithms clamp identically during training: the input **and** the
+target are clamped into their task-mapped nodes. They differ in three places
+inside the step:
+
+| sub-step | PC | backprop |
+|---|---|---|
+| produce state | initialize, then settle the latents via `run_inference` | single feedforward pass (`FeedforwardStateInit`), no inference |
+| objective | energy summed over all internal (`in_degree > 0`) nodes, per sample | energy of the clamped target nodes, per sample |
+| gradients | local per-node Hebbian gradients | `jax.value_and_grad` through the forward pass |
+
+The backprop objective is the clamped target node's energy — the negative log
+probability the output node's energy functional assigns to the clamped target
+given the feedforward prediction. There is no `loss_type` option: **the
+output node's energy functional in the graph definition selects the loss.**
+`CrossEntropyEnergy()` on the output gives cross-entropy training;
+`GaussianEnergy(precision=p)` gives `0.5 * p * ||y - mu||^2` per sample.
+
+Integer or bool targets are one-hot encoded automatically from their dtype
+(with the class count taken from the target node's last shape axis), so token
+loaders can keep yielding compact int32 ids.
+
+## train()
+
+```python
+from fabricpc.training import train
+
+result = train(
+    params,                    # initial (or checkpointed) parameters
+    structure,                 # GraphStructure from graph()
+    train_loader,              # iterable of (x, y) tuples or {"x": ..., "y": ...} dicts
+    optimizer,                 # any optax optimizer
+    {"num_epochs": 20},        # config; fractional epochs supported (e.g. 1.5)
+    train_key,                 # base RNG key
+    algorithm="pc",            # or "backprop"
     verbose=True,
 )
 ```
 
-**Arguments**:
-- `params` — Initial parameters from `initialize_params()`
-- `structure` — `GraphStructure` from `graph()`
-- `train_loader` — Iterable yielding `(x, y)` tuples or `{"x": ..., "y": ...}` dicts
-- `optimizer` — Any Optax optimizer
-- `config` — Dict with `num_epochs` (supports fractional epochs, e.g., `1.5`)
-- `rng_key` — JAX random key (split internally per batch)
-- `verbose` — Print progress per epoch
+`config` reads only `num_epochs`; everything else passes through untouched to
+callbacks and experiment harnesses. Settling parameters (`infer_steps`,
+`eta_infer`) live in the inference object inside the graph
+(`graph(..., inference=InferenceSGD(eta_infer=0.05, infer_steps=20))`), not
+in `config`. The retired keys `loss_type` and `use_causal_mask` raise
+`ValueError` with migration instructions.
 
-**Returns**: `(trained_params, energy_history, epoch_results)`
-- `energy_history` — 2D list `[epoch][batch]` of per-batch average energy
-- `epoch_results` — List of epoch_callback return values (or None)
+### TrainResult and resume
 
-## Evaluation: evaluate_pcn()
+`train` returns a `TrainResult` named tuple:
+
+- `params` — the trained parameters,
+- `opt_state` — the final optimizer state,
+- `step` — optimizer updates applied in this call,
+- `iter_results` — 2D list `[epoch][batch]` of per-batch metric dicts,
+- `epoch_results` — list of per-epoch mean metric dicts.
+
+Because `opt_state` is returned and accepted, training is resumable without
+resetting Adam moments or an optax schedule's count:
 
 ```python
-from fabricpc.training import evaluate_pcn
+first = train(params, structure, train_loader, optimizer,
+              {"num_epochs": 5}, train_key)
 
-metrics = evaluate_pcn(trained_params, structure, test_loader, config, eval_key)
-print(f"Accuracy: {metrics['accuracy'] * 100:.2f}%")
-print(f"Energy:   {metrics['energy']:.4f}")
+# ... later: continue exactly where the first call stopped
+second = train(first.params, structure, train_loader, optimizer,
+               {"num_epochs": 5}, train_key,
+               opt_state=first.opt_state, start_epoch=5)
 ```
 
-Returns `{"energy": float, "accuracy": float}`.
+`start_epoch` offsets the epoch index used for RNG derivation, so the
+interrupted run reproduces the uninterrupted run's random stream bitwise.
 
-**How accuracy works**: The output node's `z_mu` prediction is compared to the target using argmax. This works for classification with one-hot targets.
+### The RNG contract
 
-**Note on energy**: For feedforward DAGs with `FeedforwardStateInit`, evaluation energy will be near zero because `z_latent` starts equal to `z_mu`. Use accuracy (or other task-specific metrics) to assess model quality.
+The training key affects only latent initialization
+(`initialize_graph_state`); inference is deterministic and the package has no
+dropout or noise. Keys derive as `fold_in(rng_key, epoch_idx)` then
+`fold_in(epoch_key, batch_idx)` — a pure function of
+`(rng_key, epoch_idx, batch_idx)`, independent of loader length.
 
-Next-token models use `evaluate_autoregressive` instead, which reports perplexity (see [Autoregressive Language Modeling](#autoregressive-language-modeling)).
+### Training metrics
 
-## Understanding Training Energy
+Each step produces two device scalars, materialized to floats at epoch
+boundaries (or per batch when `verbose=True` or an `iter_callback` is
+supplied — both force a per-batch device sync):
 
-Energy is the sum of per-node energies across the batch. It decreases during training as the network learns to predict its own states. Energy is **not** directly comparable to cross-entropy loss — it measures internal prediction consistency, not task performance.
+- `energy` — the per-sample objective the gradients descend. This is
+  **algorithm-dependent** (all internal nodes for PC, target nodes only for
+  backprop), so comparing it across algorithms is invalid.
+- `target_energy` — the target-node energy divided by the number of
+  predictions (`batch * seq_len` for sequences, `batch` for classification).
+  Under `CrossEntropyEnergy` this is the teacher-forced per-token
+  cross-entropy, so `exp(target_energy)` is the training perplexity.
+
+Note the two keys use different normalizations (per sample vs per
+prediction).
 
 ## Callbacks
 
-**Iteration callback** — Called after each batch:
+**Iteration callback** — called after each batch with float metrics:
 
 ```python
-def my_iter_callback(epoch_idx, batch_idx, energy):
+def my_iter_callback(epoch_idx, batch_idx, metrics):
     if batch_idx % 100 == 0:
-        print(f"  batch {batch_idx}: energy={energy:.4f}")
-    return float(energy)
+        print(f"  batch {batch_idx}: energy={metrics['energy']:.4f}")
 
-trained_params, _, _ = train_pcn(..., iter_callback=my_iter_callback)
+result = train(..., iter_callback=my_iter_callback)
 ```
 
-**Epoch callback** — Called after each epoch:
+**Epoch callback** — called after each epoch with a single `EpochContext`
+argument (fields: `epoch_idx`, `step`, `params`, `opt_state`, `structure`,
+`config`, `rng_key`, `metrics`):
 
 ```python
-def my_epoch_callback(epoch_idx, params, structure, config, rng_key):
-    metrics = evaluate_pcn(params, structure, test_loader, config, rng_key)
-    print(f"  Epoch {epoch_idx}: acc={metrics['accuracy']:.4f}")
+from fabricpc.training import evaluate
+
+def my_epoch_callback(ctx):
+    metrics = evaluate(ctx.params, ctx.structure, test_loader, ctx.config, ctx.rng_key)
+    print(f"  Epoch {ctx.epoch_idx}: acc={metrics['accuracy']:.4f}")
     return metrics
 
-trained_params, _, epoch_results = train_pcn(..., epoch_callback=my_epoch_callback)
+result = train(..., epoch_callback=my_epoch_callback)
 ```
 
-## Custom Training Loops
+Contract guarantees:
 
-For more control, use `train_step()` directly:
+- Callback exceptions propagate — the Bayesian tuner's pruning is
+  exception-based and depends on this.
+- A non-None return replaces the stored history entry: the callback above
+  stores its eval metrics in `result.epoch_results[epoch]`.
+- The internal step donates its parameter buffers, so copy `ctx.params`
+  (`jax.tree_util.tree_map(jnp.copy, ctx.params)`) if you retain it past the
+  callback; the next training step invalidates it.
+
+## evaluate()
+
+Evaluation clamps the inputs and leaves the targets free; PC settles the
+latents, backprop takes the feedforward pass.
 
 ```python
-from fabricpc.training.train import train_step
-import jax
+from fabricpc.training import evaluate
 
+metrics = evaluate(result.params, structure, test_loader, {}, eval_key)
+print(f"Accuracy: {metrics['accuracy'] * 100:.2f}%")
+```
+
+### Default metrics are graph-derived
+
+With `metrics=None` (the default), the reported keys follow the graph — the
+target node's own energy functional selects them, mirroring the training-side
+energy framing:
+
+| key | when | definition |
+|---|---|---|
+| `target_energy` | always | `E(y, z_mu)` under the target node's functional, per prediction |
+| `accuracy` | always | `argmax(z_mu, -1) == argmax(y, -1)` per prediction (argmax-based: meaningful for class-like targets, not continuous ones) |
+| `cross_entropy` | target functional is `CrossEntropyEnergy` | identical to `target_energy` in that case; the conventional name |
+| `perplexity` | target functional is `CrossEntropyEnergy` | `exp(cross_entropy)` |
+| `energy` | `algorithm="pc"` | per-sample energy over internal nodes — the PC training objective's definition |
+
+A graph with no target task key raises under the defaults; pass an explicit
+metrics dict to evaluate such a graph.
+
+**Note on eval energy**: for feedforward DAGs with `FeedforwardStateInit`,
+evaluation energy is near zero because a free output starts at its
+feedforward equilibrium (`z_latent = z_mu`, zero error). Use accuracy or
+perplexity to assess task quality.
+
+### Custom metrics: the EvalMetric contract
+
+A metric is an `EvalMetric(fn, finalize)`:
+
+- `fn(state, batch, structure) -> (value, weight)` — two per-sample arrays of
+  shape `(batch,)`, computed inside the jitted eval step on the settled
+  state. The weight is the metric's own denominator (predictions per sample),
+  so per-sample and per-token metrics aggregate correctly.
+- Aggregation is owned by `evaluate`: Σvalue and Σweight accumulate across
+  batches (and devices), padded samples get zero weight, and the result is
+  `finalize(Σvalue / Σweight)`. A ragged final batch never skews a mean.
+- `finalize` applies once to the global mean: perplexity is `exp` of the
+  aggregated cross-entropy, not a mean of per-batch `exp`s.
+
+```python
+from fabricpc.training import EvalMetric, evaluate, metrics
+import jax.numpy as jnp
+
+def top2_fn(state, batch, structure):
+    z_mu = state.nodes[structure.task_map["y"]].z_mu
+    top2 = jnp.argsort(-z_mu, axis=-1)[..., :2]
+    labels = jnp.argmax(batch["y"], axis=-1)
+    hit = jnp.any(top2 == labels[..., None], axis=-1).astype(jnp.float32)
+    return hit, jnp.ones_like(hit)
+
+evaluate(params, structure, test_loader, {}, eval_key,
+         metrics={"top2_accuracy": EvalMetric(fn=top2_fn)})          # exactly this
+evaluate(params, structure, test_loader, {}, eval_key,
+         metrics={**metrics.default_metrics(structure, "pc"),
+                  "top2_accuracy": EvalMetric(fn=top2_fn)})          # defaults + custom
+```
+
+A bare callable is accepted too (wrapped with the identity finalize). The
+built-ins live in `fabricpc.training.metrics`: `accuracy`, `cross_entropy`,
+`perplexity`, `target_energy`, `internal_energy`.
+
+## Custom Training Loops: make_train_step()
+
+For per-step control (custom schedules, state inspection, dashboards that
+need the settled state), build the jitted step directly:
+
+```python
+from fabricpc.training import make_train_step
+import jax
+import jax.numpy as jnp
+
+step = make_train_step(structure, optimizer)          # or algorithm="backprop"
 opt_state = optimizer.init(params)
-jit_step = jax.jit(lambda p, o, b, k: train_step(p, o, b, structure, optimizer, k))
 
 for epoch in range(num_epochs):
     for batch_idx, (x, y) in enumerate(train_loader):
         batch = {"x": jnp.array(x), "y": jnp.array(y)}
         rng_key, step_key = jax.random.split(rng_key)
-        params, opt_state, energy, final_state = jit_step(params, opt_state, batch, step_key)
+        params, opt_state, metrics, final_state = step(params, opt_state, batch, step_key)
 ```
 
-## Backpropagation Comparison Mode
-
-FabricPC can train the same graph architecture with standard backpropagation for comparison:
-
-```python
-from fabricpc.training import train_backprop, evaluate_backprop
-
-trained_params_bp, _, _ = train_backprop(
-    params=params, structure=structure, train_loader=train_loader,
-    optimizer=optimizer, config=config, rng_key=train_key,
-)
-metrics_bp = evaluate_backprop(trained_params_bp, structure, test_loader, config, eval_key)
-```
-
-This is useful for validating that the PC network architecture is capable, independently of PC-specific dynamics.
+`metrics` holds the `energy`/`target_energy` device scalars; `final_state` is
+the settled (PC) or feedforward (backprop) `GraphState`. The step does not
+donate its inputs, so the initial `params` stay valid.
 
 ## Autoregressive Language Modeling
 
-Next-token models train with `train_autoregressive`. The loader contract differs from `train_pcn`: both `x` and `y` are `(batch, seq_len)` int32 token ids, with `y` being `x` shifted one position left (see [Data Loaders](14_api_data.md)); one-hot encoding of the target happens inside the training step.
+Next-token models use the same `train`/`evaluate` — there is no
+autoregressive flag. Two things make a run autoregressive, both derived from
+the graph and the data:
 
-### train_autoregressive
+- **Causal masking is graph-derived.** A v1 transformer graph declares a
+  `causal_mask` entry in its `TaskMap`; `train`/`evaluate`/`generate` then
+  clamp a lower-triangular `(batch, 1, seq, seq)` mask into that node. The
+  decomposed v2 transformer masks internally via
+  `MhaResidualNode(is_causal=True)`, so its task map has no such entry and
+  nothing is clamped. No caller flag exists.
+- **One-hot is dtype-derived.** Loaders yield `(batch, seq_len)` int32 token
+  ids for both `x` and `y` (`y` is `x` shifted one position left, see
+  [Data Loaders](14_api_data.md)); the integer target is one-hot encoded
+  inside the step.
 
-```python
-from fabricpc.training import train_autoregressive
+Perplexity comes free during training as `exp(metrics["target_energy"])`,
+because the clamped target's energy under `CrossEntropyEnergy` is the
+teacher-forced per-token cross-entropy. Evaluation reports `cross_entropy`
+and `perplexity` whenever the output functional is `CrossEntropyEnergy`.
 
-trained_params, energy_history, epoch_results = train_autoregressive(
-    params=params,
-    structure=structure,
-    train_loader=train_loader,
-    optimizer=optimizer,
-    config={"num_epochs": 5},
-    rng_key=train_key,
-)
-```
+**Perplexity** is the effective number of tokens the model chooses among at
+each step: a model with perplexity 20 is as uncertain as a uniform choice
+over 20 tokens. It is `exp(CE)` for the mean per-token cross-entropy `CE`.
 
-Same core signature as `train_pcn` (`train_pcn` additionally accepts `use_tqdm` and `pmap_single_device`). Returns `(trained_params, energy_history, epoch_results)`.
-
-**Config keys:**
-- `num_epochs` — supports fractional values (e.g. `1.5` trains half of the second epoch)
-- `use_causal_mask` (default `True`) — clamps a lower-triangular attention mask on graphs whose task map declares a `"causal_mask"` node (the v1 `TransformerBlock` pattern). The decomposed transformer masks internally via `is_causal`, so its task map has no such node and nothing is clamped.
-
-**Epoch callback** — called as `epoch_callback(epoch_idx, params, structure, config, rng_key, energy=avg_energy, ce_loss=avg_ce_loss)`, where `energy` is the epoch's average training energy and `ce_loss` its average per-token cross-entropy:
-
-```python
-def my_epoch_callback(epoch_idx, params, structure, config, rng_key, energy=None, ce_loss=None):
-    print(f"Epoch {epoch_idx}: energy={energy:.4f} ce={ce_loss:.4f}")
-
-trained_params, _, _ = train_autoregressive(..., epoch_callback=my_epoch_callback)
-```
-
-### evaluate_autoregressive
+### generate()
 
 ```python
-from fabricpc.training import evaluate_autoregressive
-
-metrics = evaluate_autoregressive(trained_params, structure, val_loader, config, eval_key)
-print(f"Perplexity: {metrics['perplexity']:.2f}")
-```
-
-Returns `{"loss", "perplexity", "accuracy", "num_batches"}` — average per-token cross-entropy, perplexity, next-token accuracy, and the number of evaluated batches. `use_causal_mask` follows the same default as training.
-
-**Perplexity** is the effective number of tokens the model chooses among at each step: a model with perplexity 20 is as uncertain as a uniform choice over 20 tokens. It is computed from the mean per-token cross-entropy `CE` over the evaluation set as `perplexity = exp(CE)`.
-
-### generate_autoregressive
-
-```python
-from fabricpc.training import generate_autoregressive
+from fabricpc.training import generate
 
 x_indices, _ = next(iter(loader))
 prompt = x_indices[0]        # one sequence: 1-D int32 token ids, shape (seq_len,)
 
-tokens = generate_autoregressive(
+tokens = generate(
     trained_params,
     structure,
     prompt=prompt,
@@ -178,53 +291,79 @@ tokens = generate_autoregressive(
 print(loader.decode(tokens))  # tokens: shape (seq_len + 200,)
 ```
 
-The prompt is 1-D `(prompt_len,)` for a single sequence or 2-D `(batch, prompt_len)` for a batch; the returned tokens match (`(prompt_len + max_new_tokens,)` or `(batch, prompt_len + max_new_tokens)`). `loader.decode` accepts one 1-D sequence, so decode a batched result row by row.
+The prompt is 1-D `(prompt_len,)` for a single sequence or 2-D
+`(batch, prompt_len)` for a batch; the returned tokens match
+(`(prompt_len + max_new_tokens,)` or `(batch, prompt_len + max_new_tokens)`).
+`loader.decode` accepts one 1-D sequence, so decode a batched result row by
+row.
 
-- `temperature` divides the logits before sampling: below 1.0 concentrates probability on the most likely tokens, above 1.0 flattens the distribution.
+- `temperature` divides the logits before sampling: below 1.0 concentrates
+  probability on the most likely tokens, above 1.0 flattens the distribution.
 - `top_k` keeps only the k most probable tokens.
 - `top_p` keeps the smallest token set whose cumulative probability reaches p.
 
-Generation slides a context window of the model's `seq_len`: once the sequence exceeds it, the oldest tokens drop out of the context.
+Generation slides a context window of the model's `seq_len`: once the
+sequence exceeds it, the oldest tokens drop out of the context.
 
-The backprop counterparts `train_backprop_autoregressive` and `evaluate_backprop_autoregressive` share these interfaces. End-to-end example: `examples/transformer_v2_demo.py` (`--mode pc|backprop`, `--tokenizer char|bpe`); hyperparameter search: [Experiment Framework API](15_api_experiments.md).
+End-to-end example: `examples/transformer_v2_demo.py`
+(`--mode pc|backprop`, `--tokenizer char|bpe`); hyperparameter search:
+[Experiment Framework API](15_api_experiments.md).
 
-## Multi-GPU Training
+## Multi-Device Training (mesh)
 
-`train_pcn` and `evaluate_pcn` automatically detect available devices and use
-pmap data parallelism when multiple GPUs are present. No separate import is needed:
+Data parallelism runs on jit + `NamedSharding` over an explicit mesh. Build a
+mesh over the `data` axis and pass it to `train`/`evaluate`/`make_train_step`
+(the `model` axis name is reserved for future model parallelism):
 
 ```python
-from fabricpc.training import train_pcn, evaluate_pcn
+import jax
+from fabricpc.training import train, evaluate
 
-# Same API for 1 or N devices — multi-GPU is automatic
-trained_params, energies, epoch_results = train_pcn(
-    params=params, structure=structure, train_loader=train_loader,
-    optimizer=optimizer, config=config, rng_key=train_key,
-)
-metrics = evaluate_pcn(trained_params, structure, test_loader, config, eval_key)
+mesh = jax.make_mesh((jax.device_count(),), ("data",))
+
+result = train(params, structure, train_loader, optimizer,
+               {"num_epochs": 20}, train_key, mesh=mesh)
+metrics = evaluate(result.params, structure, test_loader, {}, eval_key, mesh=mesh)
 ```
 
-The total batch size must be divisible by the number of devices (batches that
-aren't divisible are skipped with a warning). To force the pmap code path on a
-single device (useful for testing), pass `pmap_single_device=True`.
+Parameters are replicated; each batch is sharded on its leading axis across
+the `data` mesh axis. Ragged batches: training skips a batch whose size is
+not divisible by the data-axis size (one-time warning); evaluation zero-pads
+it and gives the padded samples zero metric weight, so every real sample
+counts exactly once. Without `mesh`, the same jitted step runs on a single
+device.
+
+To test multi-device code on a CPU-only machine:
+
+```bash
+XLA_FLAGS=--xla_force_host_platform_device_count=2 python your_script.py
+```
 
 ## Statistical A/B Experiments
 
-For rigorous comparisons across multiple trials, use the experiment framework:
+For rigorous comparisons across multiple trials, use the experiment
+framework. Arms stay trainer-agnostic: the algorithm is bound with
+`functools.partial`, and the arm metric should be `accuracy` or `perplexity`
+(the training `energy` is not cross-algorithm comparable):
 
 ```python
+import functools
 from fabricpc.experiments import ExperimentArm, ABExperiment
-from fabricpc.training import train_pcn, evaluate_pcn, train_backprop, evaluate_backprop
+from fabricpc.training import train, evaluate
 
-arm_a = ExperimentArm(name="PC", model_factory=create_model, train_fn=train_pcn,
-                      eval_fn=evaluate_pcn, optimizer=optimizer, train_config=config)
-arm_b = ExperimentArm(name="Backprop", model_factory=create_model, train_fn=train_backprop,
-                      eval_fn=evaluate_backprop, optimizer=optimizer, train_config=config)
+arm_pc = ExperimentArm(name="PC", model_factory=create_model, train_fn=train,
+                       eval_fn=evaluate, optimizer=optimizer, train_config=config)
+arm_bp = ExperimentArm(name="Backprop", model_factory=create_model,
+                       train_fn=functools.partial(train, algorithm="backprop"),
+                       eval_fn=functools.partial(evaluate, algorithm="backprop"),
+                       optimizer=optimizer, train_config=config)
 
-experiment = ABExperiment(arm_a=arm_a, arm_b=arm_b, metric="accuracy",
+experiment = ABExperiment(arm_a=arm_pc, arm_b=arm_bp, metric="accuracy",
                           data_loader_factory=loader_fn, n_trials=5)
 results = experiment.run()
 results.print_summary()  # Paired t-test, Cohen's d, effect sizes
 ```
 
-For more than two arms, `PlannedMultiContrastExperiment` runs N arms with constructor-declared planned contrasts; `ABExperiment` is its 2-arm wrapper. See the [Experiment Framework API](15_api_experiments.md) for full details.
+For more than two arms, `PlannedMultiContrastExperiment` runs N arms with
+constructor-declared planned contrasts; `ABExperiment` is its 2-arm wrapper.
+See the [Experiment Framework API](15_api_experiments.md) for full details.

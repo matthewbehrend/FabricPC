@@ -1045,7 +1045,7 @@ class TestEndToEnd:
     def test_train_step_reduces_energy(self, rng_key):
         """Training steps should reduce total energy."""
         import optax
-        from fabricpc.training import train_step
+        from fabricpc.training import make_train_step
 
         x = IdentityNode(shape=(10,), name="x")
         h = Linear(
@@ -1088,11 +1088,10 @@ class TestEndToEnd:
         energy_0 = sum(float(jnp.mean(state0.nodes[n].energy)) for n in structure.nodes)
 
         # Train for a few steps
+        step = make_train_step(structure, optimizer)
         for i in range(5):
             step_key = jax.random.fold_in(k3, i)
-            params, opt_state, loss, _ = train_step(
-                params, opt_state, batch, structure, optimizer, step_key
-            )
+            params, opt_state, _, _ = step(params, opt_state, batch, step_key)
 
         # Final energy
         state_f = initialize_graph_state(structure, batch_size, rng_key, params=params)

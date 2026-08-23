@@ -1,5 +1,111 @@
 # Changelog
 
+## [0.5.0] - 2026-08-21
+One trainer replaces the four training harnesses. `train`/`evaluate` serve both
+learning algorithms, selected by `algorithm="pc"|"backprop"`; backprop is framed
+in energy (its objective is the clamped target node's energy, so the output
+node's energy functional selects the loss), causal masking and target one-hot
+encoding are derived from the graph and target dtype, training is resumable
+(`opt_state`/`start_epoch`), and multi-device data parallelism runs on jit +
+`NamedSharding` meshes instead of pmap. Clean break: the legacy names are
+removed, not deprecated.
+
+### Migration table
+
+| Removed | Replacement |
+|---|---|
+| `train_pcn` | `train` (returns `TrainResult`; use `result.params`) |
+| `evaluate_pcn` | `evaluate` |
+| `train_backprop` | `train(..., algorithm="backprop")` |
+| `evaluate_backprop` | `evaluate(..., algorithm="backprop")` |
+| `train_autoregressive` | `train` (mask graph-derived, one-hot dtype-derived) |
+| `evaluate_autoregressive` | `evaluate` |
+| `train_backprop_autoregressive` | `train(..., algorithm="backprop")` |
+| `evaluate_backprop_autoregressive` | `evaluate(..., algorithm="backprop")` |
+| `evaluate_transformer` | `evaluate` |
+| `generate_autoregressive` | `generate` (same sampling parameters) |
+| `train_step` | `make_train_step(structure, optimizer)` -> `step(params, opt_state, batch, rng_key)` |
+| `train_step_backprop`, `train_step_autoregressive`, `train_step_backprop_autoregressive` | `make_train_step(..., algorithm=...)` |
+| `train_step_pmap`, `create_pmap_train_step` | `make_train_step(..., mesh=...)` |
+| `get_graph_param_gradient` | compose `build_clamps` + `initialize_graph_state` + `run_inference` + `compute_local_weight_gradients` |
+| `build_train_clamps` | `build_clamps(batch, structure, clamp_target=True)` |
+| `causal_mask_clamps` | `build_clamps` (injected when the `TaskMap` declares `causal_mask`) |
+| `compute_loss`, `compute_loss_autoregressive`, `compute_forward_pass` | the output node's energy functional + `graph_energy` |
+| `replicate_params`, `replicate_opt_state`, `shard_batch`, `unshard_energies` | not needed: pass `mesh=jax.make_mesh((jax.device_count(),), ("data",))` |
+| `train_pcn_multi_gpu`, `evaluate_pcn_multi_gpu`, `evaluate_transformer_multi_gpu`, `fabricpc.training.multi_gpu` | `train`/`evaluate` with `mesh=` |
+| `pmap_single_device=`, `use_tqdm=` | removed (`verbose` controls tqdm; test meshes via `XLA_FLAGS=--xla_force_host_platform_device_count=2`) |
+| `config["loss_type"]` | removed — raises `ValueError`; set the output node's energy functional |
+| `config["use_causal_mask"]` | removed — raises `ValueError`; the mask follows the graph |
+| `autoregressive=` (never released) | removed — mask graph-derived, one-hot dtype-derived |
+
+### New
+
+- `train(...) -> TrainResult(params, opt_state, step, iter_results, epoch_results)`,
+  with `opt_state=` and `start_epoch=` for resume: optimizer moments and optax
+  schedule counts survive a save/load boundary, and the fold_in RNG stream makes
+  an interrupted run bitwise-equal to the uninterrupted one.
+- `epoch_callback(ctx: EpochContext)` — one context argument (`epoch_idx`,
+  `step`, `params`, `opt_state`, `structure`, `config`, `rng_key`, `metrics`)
+  that grows by field addition. Callback exceptions propagate (tested; tuner
+  pruning depends on it); a non-None return replaces the stored history entry.
+- Pluggable eval metrics: `evaluate(..., metrics=)` takes named
+  `EvalMetric(fn, finalize)` entries with a per-sample `(value, weight)`
+  contract and weighted aggregation `finalize(Σvalue/Σweight)`; `None` selects
+  graph-derived defaults (`target_energy`, `accuracy`; + `cross_entropy`,
+  `perplexity` for `CrossEntropyEnergy` targets; + `energy` for PC).
+- `graph_energy(state, structure, node_names=None)` in `fabricpc.core.energy`:
+  the one graph-level energy sum (default: all `in_degree>0` nodes, order fixed
+  by the structure).
+- `make_train_step(structure, optimizer, algorithm=, mesh=)` — the public
+  jitted step for custom loops; returns `(params, opt_state, metrics,
+  final_state)` and does not donate its inputs.
+- Non-float targets: int **and bool** class/token targets are one-hot encoded
+  from their dtype (class count from the target node's `shape[-1]`); stock
+  int32 token loaders now work with backprop training too.
+- Backprop training gains tqdm progress and multi-device data parallelism.
+
+### Behavior changes
+
+- Eval result keys: `loss` is renamed `cross_entropy`; `target_energy` is new;
+  `cross_entropy`/`perplexity` are reported only for `CrossEntropyEnergy`
+  targets (previously a finite-but-meaningless cross-entropy could be reported
+  on Gaussian outputs); `num_batches` and `debug=` are dropped. Eval `energy`
+  (PC) now sums internal (`in_degree>0`) nodes only, matching the training
+  objective (the legacy all-node sum differed only by `E(z,z)` terms on
+  terminal nodes, zero under `GaussianEnergy`).
+- Accuracy argmaxes on `axis=-1` (the legacy hard-coded `axis=1` mis-reduced
+  rank>2 outputs).
+- AR-backprop objective is per-sample (sum over sequence positions ÷ batch),
+  not the legacy per-token mean: the effective learning rate shifts by
+  `×seq_len`; divide legacy learning rates by `seq_len` to reproduce.
+- Gaussian-output backprop objective is `0.5·precision·SSE` per sample, not an
+  element-mean MSE.
+- Cross-entropy numerics: the output functional clips `clip(mu, 1e-7, 1)`
+  (the legacy loss used `log(mu + 1e-10)`).
+- Transformer evaluation fixes: the legacy eval applied a softmax to
+  `z_latent`, which for a free output already holds post-softmax probabilities
+  (a double softmax), and added an external squared-error term to energy; the
+  unified evaluate reads `z_mu` directly and reports pure internal energy.
+  Pre-0.5 transformer eval numbers are not reproducible.
+- RNG stream: keys derive as `fold_in(base_key, epoch_idx)` →
+  `fold_in(epoch_key, batch_idx)` (loader-length-independent, resumable);
+  0.4 training runs are not bitwise reproducible under 0.5.
+- `evaluate` clamps all non-target task keys (legacy clamped only `x`);
+  affects only multi-input eval batches, which no shipped code uses.
+- `train_step_with_history` (dashboarding) reports per-sample internal energy
+  (was an unnormalized all-node sum).
+- Training metrics are per-batch dicts `{"energy", "target_energy"}` held as
+  device scalars and materialized at epoch boundaries; a supplied
+  `iter_callback` (or tqdm under `verbose`) forces the per-batch sync.
+- The `BayesianTuner` reports train perplexity `exp(target_energy)` to Optuna
+  and logs the validation `cross_entropy`; its training-energy diagnostic is
+  keyed `train_energy`.
+
+### Packaging
+
+- `flax` removed from the dependencies — nothing imports it (the checkpointing
+  follow-up uses Orbax).
+
 ## [0.4.0] - 2026-08-19
 First release published to PyPI: `pip install fabricpc`. Also a muPC scaling correctness release — deep residual and pooling graphs previously trained with an attenuated signal; activations, losses, and tuned learning rates will shift. See `docs/user_guides/05_initialization_and_scaling.md`.
 

@@ -8,7 +8,7 @@ Built on JAX for GPU and multi-GPU acceleration with local (node-level) automati
 
 ## What It Does
 
-FabricPC supports arbitrary graph topologies: feedforward, recurrent, skip connections, and cyclic architectures. Heterogeneous components such as linear, convolutional, and pooling nodes, transformer blocks, and Storkey-Hopfield associative memory coexist within the same energy-minimization graph. The same graph topology can be trained by predictive coding (`train_pcn`) or by backpropagation (`train_backprop`), so controlled PC-vs-backprop comparisons reuse one model definition instead of two. See `examples/PC_backprop_compare.py`.
+FabricPC supports arbitrary graph topologies: feedforward, recurrent, skip connections, and cyclic architectures. Heterogeneous components such as linear, convolutional, and pooling nodes, transformer blocks, and Storkey-Hopfield associative memory coexist within the same energy-minimization graph. The same graph topology can be trained by predictive coding (`train(..., algorithm="pc")`) or by backpropagation (`train(..., algorithm="backprop")`), so controlled PC-vs-backprop comparisons reuse one model definition instead of two. See `examples/PC_backprop_compare.py`.
 
 Internally, everything is organized around three abstractions: nodes (state and computation), edges (connections between nodes), and updates (inference and learning algorithms).
 

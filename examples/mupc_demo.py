@@ -54,7 +54,7 @@ from fabricpc.core.energy import CrossEntropyEnergy
 from fabricpc.core.inference import InferenceSGD
 from fabricpc.core.initializers import MuPCInitializer, XavierInitializer
 from fabricpc.core.mupc import MuPCConfig
-from fabricpc.training import train_pcn, evaluate_pcn
+from fabricpc.training import train, evaluate
 from fabricpc.utils.data.dataloader import MnistLoader
 from fabricpc import setup_jax
 
@@ -359,7 +359,7 @@ def main():
     )
     start_time = time.time()
 
-    trained_params, energy_history, _ = train_pcn(
+    result = train(
         params=params,
         structure=structure,
         train_loader=train_loader,
@@ -368,15 +368,14 @@ def main():
         rng_key=train_key,
         verbose=args.verbose,
     )
+    trained_params = result.params
 
     elapsed = time.time() - start_time
     print(f"Training time: {elapsed:.1f}s ({elapsed / args.num_epochs:.1f}s per epoch)")
 
     # Evaluate
     print("\nEvaluating...")
-    metrics = evaluate_pcn(
-        trained_params, structure, test_loader, train_config, eval_key
-    )
+    metrics = evaluate(trained_params, structure, test_loader, train_config, eval_key)
     print(f"Test Accuracy: {metrics['accuracy'] * 100:.2f}%")
 
     if metrics["accuracy"] >= 0.85:

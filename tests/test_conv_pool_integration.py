@@ -21,7 +21,7 @@ from fabricpc.graph_initialization import initialize_params
 from fabricpc.core.activations import ReLUActivation, SoftmaxActivation
 from fabricpc.core.energy import CrossEntropyEnergy
 from fabricpc.core.inference import InferenceSGD
-from fabricpc.training import train_step
+from fabricpc.training import make_train_step
 
 
 def _build_structure():
@@ -97,13 +97,12 @@ def test_conv_pool_linear_trains(rng_key):
         "y": labels,
     }
 
+    step = make_train_step(structure, optimizer)
     p, os = params, opt_state
     energies = []
     for _ in range(3):
-        p, os, energy, final_state = train_step(
-            p, os, batch, structure, optimizer, rng_key
-        )
-        energies.append(energy)
+        p, os, metrics, final_state = step(p, os, batch, rng_key)
+        energies.append(metrics["energy"])
 
     # Energy is finite at every step (no NaN/Inf through conv/pool/inference).
     for e in energies:

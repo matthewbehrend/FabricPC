@@ -12,6 +12,7 @@ import pytest
 from fabricpc.core.inference import InferenceSGDNormClip
 from fabricpc.models import create_deep_transformer
 from fabricpc.graph_initialization import initialize_params
+from fabricpc.training import EpochContext, TrainResult
 from fabricpc.tuning.bayesian_tuner import BayesianTuner
 import fabricpc.tuning.bayesian_tuner as tuner_mod
 
@@ -49,7 +50,7 @@ def _tiny_loader(vocab_size=10, n_batches=1, batch=2, seq=4, seed=0):
 
 
 def _fake_train(energies, ces):
-    """Stand-in for train_autoregressive that drives epoch_callback directly."""
+    """Stand-in for train that drives epoch_callback with EpochContext."""
 
     def fake(
         params,
@@ -61,11 +62,30 @@ def _fake_train(energies, ces):
         verbose=False,
         iter_callback=None,
         epoch_callback=None,
+        **kwargs,
     ):
+        opt_state = optimizer.init(params)
         for i, (e, ce) in enumerate(zip(energies, ces)):
             if epoch_callback is not None:
-                epoch_callback(i, params, structure, config, rng, energy=e, ce_loss=ce)
-        return params, [], []
+                epoch_callback(
+                    EpochContext(
+                        epoch_idx=i,
+                        step=i + 1,
+                        params=params,
+                        opt_state=opt_state,
+                        structure=structure,
+                        config=config,
+                        rng_key=rng,
+                        metrics={"energy": e, "target_energy": ce},
+                    )
+                )
+        return TrainResult(
+            params=params,
+            opt_state=opt_state,
+            step=len(energies),
+            iter_results=[],
+            epoch_results=[],
+        )
 
     return fake
 
@@ -109,9 +129,7 @@ def test_run_trial_returns_finite_perplexity(tmp_path):
 def test_divergence_guard_prunes(tmp_path, monkeypatch):
     """Energy that rises above its best epoch by > rel_tol is pruned."""
     tuner = _make_tuner(tmp_path)
-    monkeypatch.setattr(
-        tuner_mod, "train_autoregressive", _fake_train([100.0, 500.0], [2.0, 2.0])
-    )
+    monkeypatch.setattr(tuner_mod, "train", _fake_train([100.0, 500.0], [2.0, 2.0]))
     config = {**tuner.base_config, "depth": 1, "lr": 1e-3}
     t = _run_one(tuner, config)
     assert t.state == optuna.trial.TrialState.PRUNED
@@ -120,9 +138,7 @@ def test_divergence_guard_prunes(tmp_path, monkeypatch):
 
 def test_nonfinite_energy_prunes(tmp_path, monkeypatch):
     tuner = _make_tuner(tmp_path)
-    monkeypatch.setattr(
-        tuner_mod, "train_autoregressive", _fake_train([float("inf")], [2.0])
-    )
+    monkeypatch.setattr(tuner_mod, "train", _fake_train([float("inf")], [2.0]))
     config = {**tuner.base_config, "depth": 1, "lr": 1e-3}
     t = _run_one(tuner, config)
     assert t.state == optuna.trial.TrialState.PRUNED
@@ -141,28 +157,18 @@ def test_four_tuple_trial_model_loaders_used(tmp_path, monkeypatch):
 
     seen = {}
 
-    def fake_train(
-        params,
-        structure,
-        loader,
-        optimizer,
-        config,
-        rng,
-        verbose=False,
-        iter_callback=None,
-        epoch_callback=None,
-    ):
+    inner_fake = _fake_train([100.0], [2.0])
+
+    def fake_train(params, structure, loader, *args, **kwargs):
         seen["train_loader"] = loader
-        if epoch_callback is not None:
-            epoch_callback(0, params, structure, config, rng, energy=100.0, ce_loss=2.0)
-        return params, [], []
+        return inner_fake(params, structure, loader, *args, **kwargs)
 
     def fake_eval(params, structure, loader, config, rng):
         seen["val_loader"] = loader
-        return {"perplexity": 7.0, "loss": float(np.log(7.0))}
+        return {"perplexity": 7.0, "cross_entropy": float(np.log(7.0))}
 
-    monkeypatch.setattr(tuner_mod, "train_autoregressive", fake_train)
-    monkeypatch.setattr(tuner_mod, "evaluate_autoregressive", fake_eval)
+    monkeypatch.setattr(tuner_mod, "train", fake_train)
+    monkeypatch.setattr(tuner_mod, "evaluate", fake_eval)
 
     tuner = _make_tuner(tmp_path, trial_model=four_tuple_model)
     config = {**tuner.base_config, "depth": 1, "lr": 1e-3}
@@ -194,9 +200,7 @@ def _p2_space(trial, best):
 def test_both_phases_return_perplexity(tmp_path, monkeypatch):
     """tune() returns perplexity-keyed results for both phases (finding 3 rename)."""
     tuner = _make_tuner(tmp_path)
-    monkeypatch.setattr(
-        tuner_mod, "train_autoregressive", _fake_train([100.0, 95.0], [2.0, 1.5])
-    )
+    monkeypatch.setattr(tuner_mod, "train", _fake_train([100.0, 95.0], [2.0, 1.5]))
     results = tuner.tune(
         phase1_search_space=_p1_space,
         phase2_search_space=_p2_space,

@@ -108,7 +108,7 @@ from fabricpc.core.energy import GaussianEnergy
 from fabricpc.core.inference import InferenceSGDNormClip
 from fabricpc.core.initializers import NormalInitializer, initialize
 from fabricpc.core.types import NodeParams
-from fabricpc.training import train_pcn, evaluate_pcn
+from fabricpc.training import train, evaluate
 from fabricpc.utils.data.dataloader import MnistLoader
 from fabricpc import setup_jax
 
@@ -716,7 +716,7 @@ def main():
     )
     start_time = time.time()
 
-    trained_params, energy_history, _ = train_pcn(
+    result = train(
         params=params,
         structure=structure,
         train_loader=train_loader,
@@ -725,15 +725,14 @@ def main():
         rng_key=train_key,
         verbose=args.verbose,
     )
+    trained_params = result.params
 
     elapsed = time.time() - start_time
     print(f"Training time: {elapsed:.1f}s")
 
     # Evaluate
     print("\nEvaluating...")
-    metrics = evaluate_pcn(
-        trained_params, structure, test_loader, train_config, eval_key
-    )
+    metrics = evaluate(trained_params, structure, test_loader, train_config, eval_key)
     accuracy = metrics["accuracy"] * 100
     print(f"Test Accuracy: {accuracy:.2f}%")
 

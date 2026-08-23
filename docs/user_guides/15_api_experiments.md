@@ -10,12 +10,13 @@ Defines one condition (arm) of an experiment. Shared by both runners below.
 
 ```python
 from fabricpc.experiments import ExperimentArm
+from fabricpc.training import train, evaluate
 
 arm = ExperimentArm(
     name="muPC",
     model_factory=create_model,    # (rng_key) -> (params, structure)
-    train_fn=train_pcn,
-    eval_fn=evaluate_pcn,
+    train_fn=train,
+    eval_fn=evaluate,
     optimizer=optax.adamw(1e-3),
     train_config={"num_epochs": 5},
 )
@@ -25,8 +26,8 @@ arm = ExperimentArm(
 |-------|------|-------------|
 | `name` | `str` | Display name for this condition |
 | `model_factory` | `Callable` | `(rng_key) -> (params, structure)` |
-| `train_fn` | `Callable` | Training function (e.g., `train_pcn`) |
-| `eval_fn` | `Callable` | Evaluation function (e.g., `evaluate_pcn`) |
+| `train_fn` | `Callable` | Training function with `train`'s positional prefix, returning a `TrainResult`; select the algorithm with `functools.partial(train, algorithm="backprop")` |
+| `eval_fn` | `Callable` | Evaluation function with `evaluate`'s signature, returning a metrics dict |
 | `optimizer` | `optax.GradientTransformation` | Optimizer |
 | `train_config` | `dict` | Training configuration |
 

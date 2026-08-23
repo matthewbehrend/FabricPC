@@ -17,7 +17,7 @@ from fabricpc.graph_initialization import initialize_params
 from fabricpc.graph_initialization.state_initializer import initialize_graph_state
 from fabricpc.core.inference import InferenceSGD
 import optax
-from fabricpc.training import train_step
+from fabricpc.training import make_train_step
 from fabricpc.nodes import Linear
 from fabricpc.nodes.identity import IdentityNode
 from fabricpc.core.topology import Edge
@@ -264,14 +264,11 @@ class TestTraining:
         optimizer = optax.adam(0.01)
         opt_state = optimizer.init(params)
 
-        new_params, new_opt_state, energy, final_state = train_step(
-            params,
-            opt_state,
-            batch,
-            structure,
-            optimizer,
-            rng_key,
+        step = make_train_step(structure, optimizer)
+        new_params, new_opt_state, metrics, final_state = step(
+            params, opt_state, batch, rng_key
         )
+        energy = metrics["energy"]
 
         for node_name in ["hidden1", "hidden2", "output"]:
             edge_key = next(iter(structure.nodes[node_name].node_info.in_edges))
@@ -514,8 +511,8 @@ class TestFractionalEpochs:
     """Test fractional epoch support in PC training."""
 
     def test_fractional_epoch_runs(self, rng_key):
-        """train_pcn with num_epochs=0.5 runs fewer batches than a full epoch."""
-        from fabricpc.training.train import train_pcn
+        """train with num_epochs=0.5 runs fewer batches than a full epoch."""
+        from fabricpc.training import train
 
         x = IdentityNode(shape=(4,), name="x")
         h = Linear(shape=(8,), activation=TanhActivation(), name="h")
@@ -538,7 +535,7 @@ class TestFractionalEpochs:
         loader = [(x_data[:8], y_data[:8]), (x_data[8:], y_data[8:])]
 
         iters_half = []
-        params_half, _, _ = train_pcn(
+        train(
             params,
             structure,
             loader,
@@ -546,12 +543,11 @@ class TestFractionalEpochs:
             {"num_epochs": 0.5},
             rng_key,
             verbose=False,
-            use_tqdm=False,
-            iter_callback=lambda e, b, energy: iters_half.append(1) or energy,
+            iter_callback=lambda e, b, metrics: iters_half.append(1) or metrics,
         )
 
         iters_full = []
-        params_full, _, _ = train_pcn(
+        train(
             params,
             structure,
             loader,
@@ -559,8 +555,7 @@ class TestFractionalEpochs:
             {"num_epochs": 1},
             rng_key,
             verbose=False,
-            use_tqdm=False,
-            iter_callback=lambda e, b, energy: iters_full.append(1) or energy,
+            iter_callback=lambda e, b, metrics: iters_full.append(1) or metrics,
         )
 
         assert len(iters_half) < len(iters_full)

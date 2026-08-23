@@ -36,11 +36,12 @@ Energy functionals are instantiated with their parameters:
 """
 
 from abc import ABC, abstractmethod
-from typing import Dict, Any, Tuple
+from typing import Dict, Any, Optional, Sequence, Tuple
 
 import jax.numpy as jnp
 
 from fabricpc.core._frozen import FrozenConfig
+from fabricpc.core.types import GraphState, GraphStructure
 
 # =============================================================================
 # Energy Functional Base Class
@@ -448,6 +449,63 @@ class KLDivergenceEnergy(EnergyFunctional):
         grad = jnp.where(z_latent < eps, -jnp.log(z_mu_safe), grad)
 
         return grad
+
+
+# =============================================================================
+# Graph-level energy
+# =============================================================================
+
+
+def graph_energy(
+    state: GraphState,
+    structure: GraphStructure,
+    *,
+    node_names: Optional[Sequence[str]] = None,
+) -> jnp.ndarray:
+    """Total energy summed over the selected nodes and the batch.
+
+    ``node_names=None`` selects all ``in_degree > 0`` nodes (the training
+    objective's node set: terminal source nodes hold no prediction error).
+    Callers normalize explicitly: divide by ``state.batch_size`` for
+    per-sample energy, or by the prediction count for per-token energy.
+
+    Float addition is not associative, so the summation order is fixed by
+    the structure, not by the caller: nodes are visited in
+    ``structure.node_order``, then any nodes the topological sort omitted
+    (cycle members) in ``structure.nodes`` insertion order.
+
+    Args:
+        state: GraphState whose per-node ``energy`` fields are summed.
+        structure: Graph structure supplying the node set and order.
+        node_names: Optional subset of node names to sum over.
+
+    Returns:
+        Scalar array: the energy summed over the selected nodes and batch.
+    """
+    if node_names is not None:
+        unknown = set(node_names) - set(structure.nodes)
+        if unknown:
+            raise ValueError(
+                f"graph_energy: unknown node names {sorted(unknown)}; "
+                f"available: {sorted(structure.nodes)}"
+            )
+        selected = set(node_names)
+    else:
+        selected = {
+            name
+            for name, node in structure.nodes.items()
+            if node.node_info.in_degree > 0
+        }
+
+    ordered = [n for n in structure.node_order if n in selected]
+    ordered += [
+        n for n in structure.nodes if n in selected and n not in structure.node_order
+    ]
+
+    total = jnp.zeros(())
+    for name in ordered:
+        total = total + jnp.sum(state.nodes[name].energy)
+    return total
 
 
 # =============================================================================

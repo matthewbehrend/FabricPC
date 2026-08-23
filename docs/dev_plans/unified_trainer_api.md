@@ -628,3 +628,30 @@ XLA_FLAGS=--xla_force_host_platform_device_count=2 JAX_PLATFORMS=cpu \
   multi-input eval batches — CHANGELOG line.
 - `TrainResult` breaks every `p, _, _ = train(...)` unpack loudly (5 fields) — intended; the
   migration list covers all in-repo sites, and the CHANGELOG table covers PyPI users.
+
+## Deviations from the plan worth knowing
+
+1. **`graph_energy` iteration order:** the plan said iterate `structure.node_order`, but the BFS
+   topological sort omits cycle members, which would silently drop their energy on cyclic graphs
+   (`mnist_cyclic_graph`). The implementation iterates `node_order` first, then the omitted nodes in
+   `structure.nodes` insertion order — deterministic and total.
+2. **Parity gate metric tolerance:** parameters are bitwise identical, but the reported per-batch
+   energy differs at ~1e-7 relative — the legacy sum folded elements with Python `sum` where the new
+   path uses `jnp.sum`. Reduction order only; the gradient path never reads the scalar. The gate ran
+   on random MNIST-shaped data with the exact demo graph and optimizer; parity is data-independent.
+3. **Donation safety:** `train` copies `params`/`opt_state` once at loop start, so the internal
+   step's buffer donation cannot invalidate the caller's arrays. `EpochContext` documents that a
+   retained `ctx.params` must be copied.
+4. **Tuner key collision:** the tuner's training-energy diagnostic is stored as `train_energy`,
+   because `evaluate` now legitimately returns an `energy` key it would otherwise have silently
+   overwritten.
+5. **`mlp_scaling.py`:** its backprop objective now follows the output node's `GaussianEnergy` (the
+   positional `loss_type="cross_entropy"` is gone). The script only measures step time and memory, so
+   its result semantics are unchanged.
+6. **Verification scale:** `PC_backprop_compare` ran with `--n_trials 1` (the full 10-trial study
+   takes hours), and the transformer smoke legs ran on GPU — the CPU legs are dominated by the
+   stride-1 test loader (~3,400 eval batches), a cost identical before and after this change.
+
+
+## Followups TODO
+- Support non-deterministic nodes. RNG seed splitting into the inference path for future dropout and other stochastic processing in nodes.

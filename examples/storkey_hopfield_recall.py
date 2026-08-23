@@ -38,7 +38,7 @@ from fabricpc.graph_initialization import initialize_params
 from fabricpc.graph_initialization.state_initializer import initialize_graph_state
 from fabricpc.core.inference import InferenceSGD, run_inference
 from fabricpc.core.initializers import NormalInitializer
-from fabricpc.training import train_pcn
+from fabricpc.training import train
 from fabricpc import setup_jax
 
 setup_jax(platform="cpu")
@@ -201,7 +201,7 @@ def train_recall_model(
     train_config = {"num_epochs": num_epochs}
 
     rng_key, train_key = jax.random.split(rng_key)
-    trained_params, _, _ = train_pcn(
+    result = train(
         params,
         structure,
         train_loader,
@@ -210,7 +210,7 @@ def train_recall_model(
         train_key,
         verbose=True,
     )
-    return trained_params, structure
+    return result.params, structure
 
 
 # ---------------------------------------------------------------------------

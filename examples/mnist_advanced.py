@@ -29,7 +29,7 @@ from fabricpc.core.energy import GaussianEnergy
 from fabricpc.core.initializers import NormalInitializer
 from fabricpc.core.inference import InferenceSGD
 import optax
-from fabricpc.training import train_step, evaluate_pcn
+from fabricpc.training import evaluate, make_train_step
 from fabricpc.training.natural_gradients import (
     scale_by_natural_gradient_diag,
     scale_by_natural_gradient_layerwise,
@@ -168,9 +168,7 @@ if __name__ == "__main__":
 
     opt_state = optimizer.init(params)
 
-    jit_train_step = jax.jit(
-        lambda p, o, b, k: train_step(p, o, b, structure, optimizer, k)
-    )
+    step = make_train_step(structure, optimizer)
 
     print(f"\nTraining for {num_epochs} epochs (JIT compilation on first batch)...\n")
 
@@ -188,10 +186,10 @@ if __name__ == "__main__":
         for batch_idx, (x, y) in enumerate(train_loader):
             batch = {"x": jnp.array(x), "y": y}
 
-            params, opt_state, energy, _ = jit_train_step(
+            params, opt_state, train_metrics, _ = step(
                 params, opt_state, batch, all_rng_keys[epoch, batch_idx]
             )
-            epoch_energies.append(float(energy))
+            epoch_energies.append(float(train_metrics["energy"]))
 
             if (batch_idx + 1) % 100 == 0:
                 avg_energy = sum(epoch_energies[-100:]) / len(epoch_energies[-100:])
@@ -205,9 +203,7 @@ if __name__ == "__main__":
         avg_energy = sum(epoch_energies) / len(epoch_energies)
 
         epoch_eval_key, eval_key = jax.random.split(eval_key)
-        metrics = evaluate_pcn(
-            params, structure, test_loader, train_config, epoch_eval_key
-        )
+        metrics = evaluate(params, structure, test_loader, train_config, epoch_eval_key)
         accuracy = metrics["accuracy"] * 100
 
         if accuracy > best_accuracy:

@@ -9,7 +9,7 @@ import optax as _optax
 from pathlib import Path
 from typing import Callable, Any, Dict, Tuple, Optional
 
-from fabricpc.training import train_autoregressive, evaluate_autoregressive
+from fabricpc.training import train, evaluate
 from fabricpc.core.types import GraphParams, GraphStructure
 
 
@@ -97,38 +97,30 @@ class BayesianTuner:
             raise optuna.TrialPruned()
 
         optimizer = _optax.adam(config.get("lr", 1e-3))
-        train_config = {**config, "use_causal_mask": True}
+        train_config = dict(config)
 
-        def iter_callback(epoch_idx, batch_idx, energy):
+        def iter_callback(epoch_idx, batch_idx, metrics):
             if self.verbose and (batch_idx + 1) % 50 == 0:
                 print(
                     f"  [Phase {phase}] Trial {trial.number} | "
-                    f"Epoch {epoch_idx + 1} | Batch {batch_idx + 1} | Energy: {energy:.4f}"
+                    f"Epoch {epoch_idx + 1} | Batch {batch_idx + 1} | "
+                    f"Energy: {metrics['energy']:.4f}"
                 )
-            return energy
 
         # Per-epoch mean energy, accumulated by epoch_callback for the divergence
         # guard so a diverging trial is stopped mid-training.
         trial_energy_means = []
 
-        def epoch_callback(
-            epoch_idx,
-            e_params,
-            e_structure,
-            e_config,
-            e_rng,
-            energy=None,
-            ce_loss=None,
-            **_,
-        ):
+        def epoch_callback(ctx):
             # 1) Scale-free divergence guard, applied each epoch. Energy is not
             #    comparable across architectures, so we prune only on size-free
             #    instability: non-finite energy, or energy risen above its best
             #    epoch by divergence_rel_tol. Running it here stops a blowing-up
             #    trial early instead of wasting the full budget.
+            energy = ctx.metrics.get("energy")
             if energy is not None:
                 if not np.isfinite(energy):
-                    reason = f"Non-finite energy at epoch {epoch_idx + 1}"
+                    reason = f"Non-finite energy at epoch {ctx.epoch_idx + 1}"
                     trial.set_user_attr("prune_reason", reason)
                     print(f"  Trial {trial.number} pruned — {reason}")
                     raise optuna.TrialPruned()
@@ -136,7 +128,7 @@ class BayesianTuner:
                 baseline = min(trial_energy_means)
                 if float(energy) > baseline * (1.0 + self.divergence_rel_tol):
                     reason = (
-                        f"Energy diverged at epoch {epoch_idx + 1}: "
+                        f"Energy diverged at epoch {ctx.epoch_idx + 1}: "
                         f"rose to {energy:.4f} from a low of {baseline:.4f}"
                     )
                     trial.set_user_attr("prune_reason", reason)
@@ -145,12 +137,19 @@ class BayesianTuner:
 
             # 2) Report training perplexity for the study's pruner (Hyperband in
             #    Phase 1) so stable but underperforming trials are halved early.
-            #    Training PPL is free (already computed) and, unlike energy, is
-            #    comparable across architectures.
-            train_ppl = float(np.exp(ce_loss)) if ce_loss is not None else float("inf")
+            #    Train PPL is free: the clamped target node's energy under
+            #    CrossEntropyEnergy is the teacher-forced cross-entropy, so
+            #    exp(target_energy) is the training perplexity — and, unlike
+            #    energy, it is comparable across architectures.
+            target_energy = ctx.metrics.get("target_energy")
+            train_ppl = (
+                float(np.exp(target_energy))
+                if target_energy is not None
+                else float("inf")
+            )
             if not np.isfinite(train_ppl):
                 train_ppl = 1e9  # keep reports finite; diverged trials rank worst
-            trial.report(train_ppl, step=epoch_idx + 1)
+            trial.report(train_ppl, step=ctx.epoch_idx + 1)
             if trial.should_prune():
                 # Surface the comparison that justified the prune: this trial's
                 # train PPL at this epoch vs the median of completed trials at
@@ -159,19 +158,19 @@ class BayesianTuner:
                     deepcopy=False, states=(optuna.trial.TrialState.COMPLETE,)
                 )
                 peers = [
-                    t.intermediate_values[epoch_idx + 1]
+                    t.intermediate_values[ctx.epoch_idx + 1]
                     for t in completed
-                    if (epoch_idx + 1) in t.intermediate_values
+                    if (ctx.epoch_idx + 1) in t.intermediate_values
                 ]
                 bar = (
-                    f"above the epoch-{epoch_idx + 1} median of "
+                    f"above the epoch-{ctx.epoch_idx + 1} median of "
                     f"{float(np.median(peers)):.4f} over {len(peers)} trials"
                     if peers
                     else "below the pruner's rung threshold"
                 )
                 reason = (
                     f"Pruned by {type(trial.study.pruner).__name__} at epoch "
-                    f"{epoch_idx + 1}: train PPL {train_ppl:.4f} {bar}"
+                    f"{ctx.epoch_idx + 1}: train PPL {train_ppl:.4f} {bar}"
                 )
                 trial.set_user_attr("prune_reason", reason)
                 print(f"  Trial {trial.number} — {reason}")
@@ -179,7 +178,7 @@ class BayesianTuner:
             return train_ppl
 
         try:
-            trained_params, _, _ = train_autoregressive(
+            result = train(
                 params,
                 structure,
                 train_loader,
@@ -190,6 +189,7 @@ class BayesianTuner:
                 iter_callback=iter_callback,
                 epoch_callback=epoch_callback,
             )
+            trained_params = result.params
         except optuna.TrialPruned:
             raise  # pruned mid-training by the epoch report above
         except Exception as e:
@@ -202,14 +202,16 @@ class BayesianTuner:
         avg_energy = trial_energy_means[-1] if trial_energy_means else float("inf")
 
         try:
-            metrics = evaluate_autoregressive(
+            metrics = evaluate(
                 trained_params, structure, val_loader, train_config, eval_key
             )
         except Exception as e:
             print(f"  Trial {trial.number} failed during eval: {e}")
             raise optuna.TrialPruned()
 
-        metrics["energy"] = avg_energy
+        # evaluate() already returns an "energy" key (eval internal energy);
+        # keep the training diagnostic under its own name.
+        metrics["train_energy"] = avg_energy
 
         # Both phases optimize the same predictive metric: validation perplexity.
         # The energy above is only a stability diagnostic/guard, never the score.
@@ -229,9 +231,9 @@ class BayesianTuner:
             return
         line = (
             f"[Phase {phase}] Trial {trial_number:<4} | {duration:<7.1f}s | "
-            f"Energy: {metrics.get('energy', 0.0):<10.4f} | "
+            f"Energy: {metrics.get('train_energy', 0.0):<10.4f} | "
             f"PPL: {metrics.get('perplexity', 0.0):<10.4f} | "
-            f"Loss: {metrics.get('loss', 0.0):<8.4f} | "
+            f"Loss: {metrics.get('cross_entropy', 0.0):<8.4f} | "
             f"LR: {config.get('lr', 'N/A')} | "
             f"Embed: {config.get('embed_dim', 'N/A')} | "
             f"MLP: {config.get('mlp_dim', 'N/A')} | "
@@ -243,7 +245,7 @@ class BayesianTuner:
         with open(self.log_file, "a") as f:
             f.write(line)
         print(
-            f"  → Score: {score:.4f} | PPL: {metrics.get('perplexity', 0.0):.4f} | Energy: {metrics.get('energy', 0.0):.4f}"
+            f"  → Score: {score:.4f} | PPL: {metrics.get('perplexity', 0.0):.4f} | Energy: {metrics.get('train_energy', 0.0):.4f}"
         )
 
     # ------------------------------------------------------------------

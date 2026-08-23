@@ -14,7 +14,7 @@ from fabricpc.core.inference import InferenceSGD, run_inference
 from fabricpc.core.activations import SigmoidActivation, SoftmaxActivation
 from fabricpc.core.energy import CrossEntropyEnergy
 from fabricpc.core.initializers import XavierInitializer, NormalInitializer
-from fabricpc.training import train_step
+from fabricpc.training import make_train_step
 from conftest import with_inference
 import optax
 
@@ -331,10 +331,9 @@ class TestIntegration:
         optimizer = optax.adam(1e-3)
         opt_state = optimizer.init(params)
 
-        new_params, opt_state, energy, _ = train_step(
-            params, opt_state, batch, structure, optimizer, train_key
-        )
-        assert jnp.isfinite(energy)
+        step = make_train_step(structure, optimizer)
+        new_params, opt_state, metrics, _ = step(params, opt_state, batch, train_key)
+        assert jnp.isfinite(metrics["energy"])
         # Params should have changed
         edge_key = list(params.nodes["hopfield"].weights.keys())[0]
         assert not jnp.allclose(

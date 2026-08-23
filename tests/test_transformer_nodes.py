@@ -18,7 +18,7 @@ from fabricpc.graph_initialization.state_initializer import (
     FeedforwardStateInit,
 )
 from fabricpc.core.inference import run_inference, InferenceSGDNormClip
-from fabricpc.training import train_step
+from fabricpc.training import evaluate, make_train_step
 import optax
 from fabricpc.nodes import Linear
 from fabricpc.core.topology import Edge
@@ -171,14 +171,8 @@ class TestEmbeddingNode:
 
         # Run one training step
         rng_key, step_key = jax.random.split(rng_key)
-        new_params, _, loss, final_state = train_step(
-            params,
-            opt_state,
-            batch,
-            structure,
-            optimizer,
-            step_key,
-        )
+        step = make_train_step(structure, optimizer)
+        new_params, _, _, final_state = step(params, opt_state, batch, step_key)
 
         new_embeddings = new_params.nodes["embed"].weights["embeddings"]
         new_row_5 = new_embeddings[idx]
@@ -332,18 +326,12 @@ class TestTransformerBlock:
         target = jax.random.normal(rng_key, (4, 10, 32))
         batch = {"x": target, "y": target}
 
+        step = make_train_step(structure, optimizer)
         losses = []
         for _ in range(5):
             rng_key, step_key = jax.random.split(rng_key)
-            params, opt_state, loss, _ = train_step(
-                params,
-                opt_state,
-                batch,
-                structure,
-                optimizer,
-                step_key,
-            )
-            losses.append(loss)
+            params, opt_state, metrics, _ = step(params, opt_state, batch, step_key)
+            losses.append(metrics["energy"])
 
         assert losses[-1] < losses[0], "Transformer block failed to learn."
 
@@ -439,9 +427,8 @@ class TestTransformerBlock:
 class TestEvaluateTransformer:
 
     def test_smoke(self, rng_key):
-        """evaluate_transformer returns expected keys with finite values."""
-        from fabricpc.training.train import evaluate_transformer
-
+        """evaluate on a transformer graph returns the CE-target key set with
+        finite values."""
         vocab_size = 20
         seq_len = 6
         embed_dim = 16
@@ -463,13 +450,14 @@ class TestEvaluateTransformer:
 
         test_loader = [{"x": x_data, "y": y_data}]
 
-        metrics = evaluate_transformer(params, structure, test_loader, {}, rng_key)
+        metrics = evaluate(params, structure, test_loader, {}, rng_key)
 
         assert set(metrics.keys()) == {
             "accuracy",
             "cross_entropy",
             "perplexity",
             "energy",
+            "target_energy",
         }
         for k, v in metrics.items():
             assert np.isfinite(v), f"{k} is not finite: {v}"

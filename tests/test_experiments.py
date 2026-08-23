@@ -26,6 +26,7 @@ from fabricpc.experiments import (
     PlannedMultiContrastExperiment,
     PlannedMultiContrastResults,
 )
+from fabricpc.training import TrainResult
 
 # ---------------------------------------------------------------------------
 # Stubs
@@ -76,7 +77,13 @@ def _stream_fingerprint(loader, num_epochs):
 
 def stub_train(params, structure, train_loader, optimizer, config, key, verbose=False):
     fp = _stream_fingerprint(train_loader, config.get("num_epochs", 1))
-    return {"train_fingerprint": fp}, None, None
+    return TrainResult(
+        params={"train_fingerprint": fp},
+        opt_state=None,
+        step=0,
+        iter_results=[],
+        epoch_results=[],
+    )
 
 
 def stub_eval(trained_params, structure, test_loader, config, key):

@@ -8,7 +8,7 @@ using JAX for automatic differentiation, JIT compilation, and multi-device paral
 Key Features:
 - Functional programming paradigm (immutable data structures)
 - JIT-compiled inference and training loops
-- Multi-GPU/TPU support with pmap
+- Multi-GPU/TPU data parallelism with jit + NamedSharding meshes
 - XLA optimization for maximum performance
 
 Example:
@@ -16,7 +16,7 @@ Example:
     >>> from fabricpc.core.topology import Edge
     >>> from fabricpc.graph_assembly import TaskMap, graph
     >>> from fabricpc.graph_initialization import initialize_params
-    >>> from fabricpc.training import train_pcn, evaluate_pcn
+    >>> from fabricpc import train, evaluate
     >>>
     >>> # Define nodes
     >>> input_node = Linear(shape=(784,), name="input")
@@ -34,8 +34,8 @@ Example:
     ...     inference=InferenceSGD(eta_infer=0.05, infer_steps=10),
     ... )
     >>> params = initialize_params(structure, rng_key)
-    >>> trained_params, history, _ = train_pcn(params, structure, train_loader, config)
-    >>> metrics = evaluate_pcn(trained_params, structure, test_loader, config)
+    >>> result = train(params, structure, train_loader, optimizer, config, rng_key)
+    >>> metrics = evaluate(result.params, structure, test_loader, config, rng_key)
 """
 
 from importlib.metadata import version
@@ -56,7 +56,7 @@ from fabricpc import (
 
 # Core API - what most users need
 from fabricpc.graph_initialization import initialize_params
-from fabricpc.training import train_pcn, evaluate_pcn
+from fabricpc.training import train, evaluate
 from fabricpc.jax_config import setup_jax
 
 # Types - for type hints
@@ -65,8 +65,8 @@ from fabricpc.core.types import GraphParams, GraphState, GraphStructure
 __all__ = [
     # Core API (common use)
     "initialize_params",
-    "train_pcn",
-    "evaluate_pcn",
+    "train",
+    "evaluate",
     "setup_jax",
     # Types (for type hints)
     "GraphParams",

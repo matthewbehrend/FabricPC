@@ -14,8 +14,10 @@ from fabricpc.core.types import (
     GraphState,
     GraphStructure,
 )
+from fabricpc.core.energy import graph_energy
 from fabricpc.core.learning import compute_local_weight_gradients
 from fabricpc.graph_initialization.state_initializer import initialize_graph_state
+from fabricpc.training.trainer import build_clamps
 
 
 # TODO clarify collect_every refers to either batches or inference steps
@@ -156,9 +158,6 @@ def run_inference_with_full_history(
     return state, history
 
 
-# TODO create a generic training loop that can optionally collect history on some interval of inference steps. The main difference is in run_inference_with_history() vs run_inference().
-# TODO merge the multi-gpu training loop into the generic loop.
-# TODO remove train loop duplicates in mnist_advanced.p, train.py, multi_gpu.py, train_autoregressive.py, and here inference_tracking.py.
 def train_step_with_history(
     params: GraphParams,
     opt_state: optax.OptState,
@@ -174,10 +173,12 @@ def train_step_with_history(
     GraphState,
     Dict[str, Dict[str, jnp.ndarray]],
 ]:
-    """Training step that also returns inference history.
+    """PC training step that also returns inference history.
 
-    This is a modified version of train_step that uses run_inference_with_history.
-    Use this when you need to track inference dynamics.
+    Same step as the trainer's PC path (build_clamps -> initialize_graph_state
+    -> inference -> graph_energy -> compute_local_weight_gradients -> optax),
+    with run_inference swapped for run_inference_with_history. Use this when
+    you need to track inference dynamics.
 
     Note: This function is designed to be JIT-compiled. The returned energy and
     inference_history are JAX arrays. Use unstack_inference_history() to convert
@@ -195,18 +196,14 @@ def train_step_with_history(
 
     Returns:
         Tuple of (params, opt_state, energy, final_state, stacked_inference_history).
+        ``energy`` is the per-sample internal energy — the training objective:
+        ``graph_energy`` over in_degree>0 nodes divided by the batch size.
         Call unstack_inference_history() on stacked_inference_history outside JIT.
     """
     batch_size = next(iter(batch.values())).shape[0]
 
-    # Map task names to node names
-    clamps = {}
-    for task_name, task_value in batch.items():
-        if task_name in structure.task_map:
-            node_name = structure.task_map[task_name]
-            clamps[node_name] = task_value
+    clamps = build_clamps(batch, structure, clamp_target=True)
 
-    # Initialize state
     init_state = initialize_graph_state(
         structure,
         batch_size,
@@ -220,10 +217,7 @@ def train_step_with_history(
         params, init_state, clamps, structure, collect_every
     )
 
-    # Compute energy
-    energy = sum(
-        [jnp.sum(final_state.nodes[node_name].energy) for node_name in structure.nodes]
-    )
+    energy = graph_energy(final_state, structure) / batch_size
 
     # Compute gradients and update
     grads = compute_local_weight_gradients(params, final_state, structure)
