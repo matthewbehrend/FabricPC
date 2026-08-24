@@ -48,9 +48,22 @@ which the asymptotic number amortizes but which dominate a T1 = 1 arm.
 Chart written to ``epc_convergence.html`` (and ``.png`` when kaleido is
 installed).
 
+``--log_train_percent p1,p2,...`` adds trained checkpoints to convergence mode:
+one training run per solver (sPC at ``--spc_steps`` @ ``--spc_eta``, one ePC
+run per eta at ``--epc_steps``), every run seeing the same batch schedule
+(shared loader seed and rng stream). Percent p logs a tracked
+``--track_steps`` history with the params after round(p/100 * total
+updates) weight updates, probed on the same test batch and init key as the
+untrained report — params are the only variable across checkpoints and
+solvers, so E* is comparable between checkpoints and p = 0 reproduces the
+untrained histories. Writes ``epc_convergence__train_<p>pct.html`` plus
+that checkpoint's E* table.
+
 Usage:
     python examples/epc_spc_resnet18_compare.py --mode convergence \
         --epc_eta 0.001,0.01,0.03,0.1
+    python examples/epc_spc_resnet18_compare.py --mode convergence \
+        --epc_eta 0.01,0.1 --log_train_percent 50,100
     python examples/epc_spc_resnet18_compare.py --mode sweep --n_trials 5
 
 Convergence results (RTX 3090, cuda13; batch 256, 120 tracked steps,
@@ -70,10 +83,6 @@ convention):
     (pending — run --mode sweep --n_trials 5, ~5 h on the reference 3090)
 """
 
-from jax_setup import set_jax_flags_before_importing_jax
-
-set_jax_flags_before_importing_jax()
-
 import argparse
 import importlib.util
 import sys
@@ -83,14 +92,16 @@ from pathlib import Path
 import jax
 import jax.numpy as jnp
 import numpy as np
+from tqdm.auto import tqdm
 
 from fabricpc.core.inference import InferenceSGDNormClip
 from fabricpc.core.inference_epc import EPCInference
 from fabricpc.experiments import ExperimentArm, PlannedMultiContrastExperiment
 from fabricpc.graph_initialization.state_initializer import initialize_graph_state
-from fabricpc.training import evaluate_pcn, train_pcn
+from fabricpc.training import evaluate_pcn, train_pcn, train_step
 from fabricpc.utils.data.dataloader import Cifar10Loader
 from fabricpc.utils.dashboarding.inference_tracking import run_inference_with_history
+from fabricpc import setup_jax
 
 # Load the demo module directly (avoids triggering examples/__init__.py).
 _demo_path = Path(__file__).parent / "resnet18_cifar10_demo.py"
@@ -99,6 +110,7 @@ _demo = importlib.util.module_from_spec(_spec)
 sys.modules["resnet18_cifar10_demo"] = _demo
 _spec.loader.exec_module(_demo)
 
+setup_jax()
 
 # =============================================================================
 # Shared model / data plumbing
@@ -161,6 +173,8 @@ def run_sweep(args):
             "is a convergence-mode input."
         )
     epc_eta = epc_etas[0]
+    if args.log_train_percent is not None:
+        raise ValueError("--log_train_percent is a convergence-mode input.")
     spc_name = f"sPC-{args.spc_steps}"
 
     steps_per_epoch = len(
@@ -412,6 +426,120 @@ def _time_min(solver, structure, params, init_state, clamps, repeats=5):
     return best
 
 
+def _report_e_star(histories, in_degree_nodes, batch_size, track_steps, epc_labels):
+    """E* head-to-head: E* = sPC's final recorded total energy; per ePC eta,
+    the number of eps updates to reach <= E* within the tracked run."""
+    totals = {
+        label: np.sum(
+            [history[name]["energy"] * batch_size for name in in_degree_nodes],
+            axis=0,
+        )
+        for label, history in histories.items()
+    }
+    e_star = totals["sPC"][-1]
+    print(
+        f"  E* = sPC final recorded total energy ({track_steps}-step run) "
+        f"= {e_star:.4g}"
+    )
+    for label in epc_labels:
+        reached = np.nonzero(totals[label] <= e_star)[0]
+        if reached.size:
+            print(f"  {label}: reaches <= E* after {reached[0]} eps updates")
+        else:
+            print(
+                f"  {label}: did not reach <= E* within {track_steps} steps "
+                f"(final {totals[label][-1]:.4g})"
+            )
+
+
+def _train_with_checkpoints(
+    label,
+    train_solver,
+    track_solver,
+    params,
+    base_structure,
+    args,
+    pcts,
+    probe_clamps,
+    probe_key,
+    rng_key,
+):
+    """One training run; returns {pct: tracked history on the probe batch}.
+
+    A checkpoint at percent p logs a tracked inference history (track_solver,
+    --track_steps) with the params after round(p/100 * total updates) weight
+    updates. Every checkpoint of every run probes the same batch
+    (probe_clamps — the untrained report's test batch) with the same init key
+    (probe_key), so params are the only variable across checkpoints and
+    solvers, and a p = 0 checkpoint reproduces the untrained histories. The
+    caller passes the same rng_key to every run and the loader seed is fixed
+    here, so all solvers also see the same training batch schedule.
+    """
+    loader = Cifar10Loader("train", batch_size=args.batch_size, shuffle=True, seed=0)
+    steps_per_epoch = len(loader)
+    total_updates = args.num_epochs * steps_per_epoch
+
+    triggers = {}  # update count k -> pcts probed with params after k updates
+    tail_pcts = []  # pcts probed after the final update
+    for pct in pcts:
+        k = round(pct / 100 * total_updates)
+        if k >= total_updates:
+            tail_pcts.append(pct)
+        else:
+            triggers.setdefault(k, []).append(pct)
+
+    train_structure = base_structure._replace(
+        config={**base_structure.config, "inference": train_solver}
+    )
+    track_structure = base_structure._replace(
+        config={**base_structure.config, "inference": track_solver}
+    )
+    optimizer = _demo.make_optimizer(
+        args.lr, args.weight_decay, args.num_epochs, steps_per_epoch
+    )
+    opt_state = optimizer.init(params)
+    step_fn = jax.jit(
+        lambda p, o, b, k: train_step(p, o, b, train_structure, optimizer, k)
+    )
+    tracked = jax.jit(
+        lambda p, s: run_inference_with_history(p, s, probe_clamps, track_structure)
+    )
+    probe_batch_size = next(iter(probe_clamps.values())).shape[0]
+
+    def log_probe(current_params):
+        init_state = initialize_graph_state(
+            track_structure,
+            probe_batch_size,
+            probe_key,
+            clamps=probe_clamps,
+            params=current_params,
+        )
+        _, metrics = tracked(current_params, init_state)
+        jax.block_until_ready(metrics)
+        return jax.tree_util.tree_map(np.asarray, metrics)
+
+    checkpoints = {}
+    progress = tqdm(total=total_updates, desc=f"train {label}", leave=True)
+    update_idx = 0
+    for _ in range(args.num_epochs):
+        epoch_key, rng_key = jax.random.split(rng_key)
+        batch_keys = jax.random.split(epoch_key, steps_per_epoch)
+        for batch_idx, (images, labels) in enumerate(loader):
+            for pct in triggers.get(update_idx, ()):
+                checkpoints[pct] = log_probe(params)
+            batch = {"x": jnp.asarray(images), "y": jnp.asarray(labels)}
+            params, opt_state, energy, _ = step_fn(
+                params, opt_state, batch, batch_keys[batch_idx]
+            )
+            update_idx += 1
+            progress.set_postfix(energy=f"{float(energy):.4f}")
+            progress.update(1)
+    progress.close()
+    for pct in tail_pcts:
+        checkpoints[pct] = log_probe(params)
+    return checkpoints
+
+
 def run_convergence(args):
     epc_etas = parse_epc_etas(args)
     activation = _demo.get_activation(args.activation)
@@ -442,8 +570,13 @@ def run_convergence(args):
         graph_key, inference=solvers["sPC"], activation=activation
     )
 
-    test_loader = Cifar10Loader("test", batch_size=args.batch_size, shuffle=False)
-    images, labels_onehot = next(iter(test_loader))  # labels arrive one-hot
+    # Slice the split to exactly one batch and read it fully: abandoning the
+    # iterator after next() leaves tfds's autocache partially read and TF
+    # warns on teardown (cache_dataset_ops "did not fully read the dataset").
+    test_loader = Cifar10Loader(
+        f"test[:{args.batch_size}]", batch_size=args.batch_size, shuffle=False
+    )
+    [(images, labels_onehot)] = list(test_loader)  # labels arrive one-hot
     batch_size = images.shape[0]
     clamps = {
         base_structure.task_map["x"]: jnp.asarray(images),
@@ -500,32 +633,85 @@ def run_convergence(args):
     # Total energy series over in_degree > 0 nodes. History index i records
     # the energy computed before that step's update (phase 2 runs before
     # phase 3), i.e. the energy after i updates.
-    totals = {
-        label: np.sum(
-            [history[name]["energy"] * batch_size for name in in_degree_nodes],
-            axis=0,
-        )
-        for label, history in histories.items()
-    }
-    e_star = totals["sPC"][-1]
-    print(
-        f"  E* = sPC final recorded total energy ({track_steps}-step run) "
-        f"= {e_star:.4g}"
+    _report_e_star(histories, in_degree_nodes, batch_size, track_steps, epc_labels)
+
+    _plot_convergence(
+        histories,
+        base_structure,
+        in_degree_nodes,
+        track_steps,
+        stem="epc_convergence",
+        title_suffix=" — untrained",
     )
-    for label in epc_labels:
-        reached = np.nonzero(totals[label] <= e_star)[0]
-        if reached.size:
-            print(f"  {label}: reaches <= E* after {reached[0]} eps updates")
-        else:
-            print(
-                f"  {label}: did not reach <= E* within {track_steps} steps "
-                f"(final {totals[label][-1]:.4g})"
-            )
 
-    _plot_convergence(histories, base_structure, in_degree_nodes, track_steps)
+    if args.log_train_percent is None:
+        return
+
+    pcts = [float(s) for s in args.log_train_percent.split(",")]
+    if any(not 0 <= pct <= 100 for pct in pcts):
+        raise ValueError(f"--log_train_percent entries must be in [0, 100]: {pcts}")
+    epc_steps = (
+        args.epc_steps
+        if args.epc_steps is not None
+        else EPCInference().config["infer_steps"]
+    )
+    train_solvers = {
+        "sPC": InferenceSGDNormClip(
+            eta_infer=args.spc_eta, infer_steps=args.spc_steps, max_norm=1.0
+        )
+    }
+    for eta in epc_etas:
+        train_solvers[f"ePC@{eta:g}"] = EPCInference(
+            eta_infer=eta, infer_steps=epc_steps
+        )
+
+    print()
+    print(
+        f"Training checkpoints at {args.log_train_percent}% of {args.num_epochs} "
+        f"epochs — sPC: {args.spc_steps} steps @ eta {args.spc_eta}; "
+        f"ePC: {epc_steps} steps per minibatch; probes reuse the untrained "
+        f"report's test batch and init key"
+    )
+
+    # fold_in rather than widening the master_key split so graph_key and
+    # state_key above keep the values of a no-checkpoint run.
+    train_key = jax.random.fold_in(master_key, 1)
+    checkpoints = {
+        label: _train_with_checkpoints(
+            label,
+            train_solver,
+            solvers[label],
+            params,
+            base_structure,
+            args,
+            pcts,
+            clamps,
+            state_key,
+            train_key,
+        )
+        for label, train_solver in train_solvers.items()
+    }
+
+    for pct in pcts:
+        ckpt_histories = {label: checkpoints[label][pct] for label in train_solvers}
+        print()
+        print(f"--- After {pct:g}% of training ---")
+        _report_e_star(
+            ckpt_histories, in_degree_nodes, batch_size, track_steps, epc_labels
+        )
+        _plot_convergence(
+            ckpt_histories,
+            base_structure,
+            in_degree_nodes,
+            track_steps,
+            stem=f"epc_convergence__train_{pct:g}pct",
+            title_suffix=f" — after {pct:g}% of training",
+        )
 
 
-def _plot_convergence(histories, structure, in_degree_nodes, track_steps):
+def _plot_convergence(
+    histories, structure, in_degree_nodes, track_steps, stem, title_suffix
+):
     from plotly.subplots import make_subplots
     import plotly.graph_objects as go
     import plotly.colors as pcolors
@@ -563,10 +749,11 @@ def _plot_convergence(histories, structure, in_degree_nodes, track_steps):
     fig.update_layout(
         height=550,
         width=550 * len(labels),
-        title="Per-node energy vs updates applied (color = schedule depth)",
+        title="Per-node energy vs updates applied (color = schedule depth)"
+        + title_suffix,
     )
 
-    _write_chart(fig, "epc_convergence")
+    _write_chart(fig, stem)
 
 
 # =============================================================================
@@ -602,6 +789,24 @@ def parse_args():
         "it like a weight learning rate). Convergence mode accepts a "
         "comma-separated list and reports one E* row per eta; sweep mode "
         "takes a single value.",
+    )
+    parser.add_argument(
+        "--epc_steps",
+        type=int,
+        default=None,
+        help="ePC inference steps per training minibatch in the "
+        "--log_train_percent training runs (default: EPCInference's default). "
+        "Sweep mode's T1 grid is --epc_step_sweep instead.",
+    )
+    parser.add_argument(
+        "--log_train_percent",
+        type=str,
+        default=None,
+        help="Convergence mode only: comma-separated training-completion "
+        "percents (e.g. 50,100). Trains one model per solver (sPC and each "
+        "--epc_eta) for --num_epochs and, at each percent, logs a tracked "
+        "inference history on the untrained report's test batch, writing "
+        "epc_convergence__train_<pct>pct.html plus its E* table.",
     )
     parser.add_argument("--lr", type=float, default=0.001)
     parser.add_argument("--weight_decay", type=float, default=0.01)
