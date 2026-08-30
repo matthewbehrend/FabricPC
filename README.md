@@ -100,7 +100,7 @@ See [`docs/user_guides/06_custom_nodes.md`](https://github.com/trueagi-io/Fabric
 
 ## Contributing
 
-Contributions are welcome! Please open issues or pull requests on the GitHub repository. See [CONTRIBUTING.md](https://github.com/trueagi-io/FabricPC/blob/main/CONTRIBUTING.md) for the development setup, the pull-request expectations, and the design-first workflow for `design`-labeled issues.
+Contributions are welcome! Please open issues or pull requests on the GitHub repository. See [CONTRIBUTING.md](https://github.com/trueagi-io/FabricPC/blob/main/CONTRIBUTING.md) for the development setup, the pull-request expectations, and the design-first workflow.
 
 This is a research-first project.
 - APIs may change frequently until the v1.0 release.
