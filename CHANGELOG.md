@@ -1,6 +1,6 @@
 # Changelog
 
-## [0.5.0] - 2026-08-21
+## [0.5.0] - 2026-08-30
 One trainer replaces the four training harnesses. `train`/`evaluate` serve both
 learning algorithms, selected by `algorithm="pc"|"backprop"`; backprop is framed
 in energy (its objective is the clamped target node's energy, so the output
