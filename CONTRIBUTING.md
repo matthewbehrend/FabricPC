@@ -5,7 +5,7 @@
 ```bash
 git clone https://github.com/trueagi-io/FabricPC.git
 cd FabricPC
-pip install -e ".[dev,experiments]"   # what CI installs; [experiments] carries optuna for the tuner tests
+pip install -e ".[all,dev]"   # the contributor install per pyproject; CI installs the narrower [dev,experiments]
 pre-commit install
 pytest -q
 ```
