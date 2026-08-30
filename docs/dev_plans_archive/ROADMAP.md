@@ -2,7 +2,7 @@
 
 **A JAX-native predictive coding framework.** FabricPC trains predictive-coding networks on arbitrary graph topologies — feedforward, recurrent, skip, cyclic — with heterogeneous nodes in one energy graph, using node-local learning rules and JAX transformations end to end.
 
-Status date: 2026-08-29. Work items are tracked as issue drafts in `docs/github_issues/` (posted manually after review) and as filed GitHub issues. Future milestones are dated; version numbers are assigned at release time.
+Status date: 2026-08-29. Work items are tracked as filed GitHub issues. Future milestones are dated; version numbers are assigned at release time.
 
 ## Shipped
 
@@ -38,13 +38,12 @@ Status date: 2026-08-29. Work items are tracked as issue drafts in `docs/github_
 
 ### October 2026 — hackathon release
 - XLA flag profiles: production default plus deterministic opt-in.
-- Stop-gradients on any edge or node output; implementable on main now, coordinated with the ePC branch (only the ePC acceptance test waits for its merge).
+- Stop-gradients on any edge or node output
 - Starter-kit template project, Colab quickstart, issue and PR templates.
 - The event is late October; the final two weeks before it admit only docs, demos, and packaging — no engine or API changes, so the two engine items above land early in the month.
 
 ### November 2026
 - Node parallelism: group-vmap over stackable nodes, reducing per-step cost from a Python loop over nodes to batched kernels. Gate metrics: equivalence against the sequential engine, plus wall-clock, compile time, and executable size on deep chains.
-- Model zoo: pretrained checkpoints with one-line load, each with a Colab that reproduces one figure.
 
 ### December 2026
 - `fabricpc.bench` reproducible benchmark suite: match the pcx suite's tasks and reference numbers first, then the arms only FabricPC can run — muPC-scaled 100+ layer graphs, and ePC vs sPC vs backprop on one graph in both arms. Every row is a paired N-arm experiment reporting effect sizes and significance, runs from one command, and records wall-clock, realized step counts, the PC-to-backprop matmul ratio, compile time, peak memory, XLA flag profile, and solver configuration.
@@ -55,6 +54,7 @@ Status date: 2026-08-29. Work items are tracked as issue drafts in `docs/github_
 ### January 2027
 - Adaptive termination for sPC refinement: replaces the composed schedule's fixed refinement step count T2 with a tolerance predicate; realized ticks R become the reported cost of cyclicity.
 - Refine-vs-unroll measurement: the same cyclic graph solved by the composed schedule and by unrolling, compared on full-graph energy, task metric, matmul count, and wall-clock; settles the default cycle path.
+- Model zoo: pretrained checkpoints with one-line load, each with a Colab that reproduces one figure.
 
 ### Backlog
 - GPU CI runners, a nightly full-suite job, and benchmark trend tracking (owner wanted); the benchmark suite's nightly wall-clock regression testing depends on them.
