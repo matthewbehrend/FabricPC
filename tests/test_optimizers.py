@@ -12,7 +12,7 @@ from fabricpc.training.optimizers import (
     scale_by_natural_gradient_diag,
     scale_by_natural_gradient_layerwise,
 )
-from fabricpc.training import train_step
+from fabricpc.training import make_train_step
 from fabricpc.nodes import Linear
 from fabricpc.core.topology import Edge
 from fabricpc.graph_assembly import TaskMap, graph
@@ -88,14 +88,9 @@ def test_natural_gradients_work_in_train_step(rng_key, ngd_transform):
         "y": jax.random.normal(key_y, (batch_size, 3)),
     }
 
-    updated_params, _, energy, _ = train_step(
-        params,
-        opt_state,
-        batch,
-        structure,
-        optimizer,
-        rng_key,
-    )
+    step = make_train_step(structure, optimizer)
+    updated_params, _, metrics, _ = step(params, opt_state, batch, rng_key)
+    energy = metrics["energy"]
 
     old_w = params.nodes["hidden"].weights["x->hidden:in"]
     new_w = updated_params.nodes["hidden"].weights["x->hidden:in"]

@@ -166,7 +166,7 @@ noisy = NoisyTestLoader(base_loader=base, noise_std=2.0, seed=42)
 
 ## Using Custom Data
 
-`train_pcn()` accepts any iterable yielding batches in one of two formats. `train_autoregressive()` uses the same loader contract with integer-id targets: both `x` and `y` are `(batch, seq_len)` int32 token ids.
+`train()` accepts any iterable yielding batches in one of two formats. Language-model training uses the same loader contract with integer-id targets: both `x` and `y` are `(batch, seq_len)` int32 token ids.
 
 **Tuple format** (recommended):
 ```python

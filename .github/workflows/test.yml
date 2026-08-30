@@ -49,3 +49,10 @@ jobs:
         run: python -c "import jax, jaxlib; print(jax.__version__, jaxlib.__version__)"
       - name: Run tests
         run: pytest -q
+      - name: Run multi-device sharding tests
+        # tests/test_sharding.py skips its multi-device legs unless XLA is
+        # forced to expose >=2 host devices; without this step CI would never
+        # execute the mesh-vs-single-device parity tests.
+        env:
+          XLA_FLAGS: --xla_force_host_platform_device_count=2
+        run: pytest tests/test_sharding.py -q

@@ -68,7 +68,7 @@ from fabricpc.experiments.statistics import (
 
 # Type aliases
 ModelFactory = Callable[[jax.Array], Tuple[Any, Any]]  # rng_key -> (params, structure)
-TrainFn = Callable  # (params, structure, loader, config, rng_key, verbose=...) -> (params, history, epoch_results)
+TrainFn = Callable  # (params, structure, loader, optimizer, config, rng_key, verbose=...) -> TrainResult
 EvalFn = Callable  # (params, structure, loader, config, rng_key) -> dict
 DataLoaderFactory = Callable[
     [int], Tuple[Any, Any]
@@ -84,8 +84,12 @@ class ExperimentArm:
             unique within a single experiment's arms list.
         model_factory: Callable taking a JAX rng_key and returning
             (GraphParams, GraphStructure). Called fresh each trial.
-        train_fn: Training function with signature matching train_pcn.
-        eval_fn: Evaluation function with signature matching evaluate_pcn.
+        train_fn: Training function with fabricpc.training.train's positional
+            prefix, returning a TrainResult. Select the algorithm with
+            functools.partial(train, algorithm="backprop") — the arm stays
+            trainer-agnostic.
+        eval_fn: Evaluation function with fabricpc.training.evaluate's
+            signature, returning a metrics dict.
         optimizer: Optax optimizer (e.g., optax.adam(1e-3)).
         train_config: Training configuration dict (scalar hyperparams only).
     """
@@ -167,7 +171,7 @@ class PlannedMultiContrastResults:
     per_arm_trials: Dict[str, List[TrialResult]]
     seeds: List[int]
     total_time: float
-    num_epochs: int
+    num_epochs: float
 
     def per_arm_metrics(self, arm_name: str) -> np.ndarray:
         """Per-trial metric values for one arm (length n_trials)."""
@@ -341,7 +345,7 @@ class PlannedMultiContrastExperiment:
         params, structure = arm.model_factory(graph_key)
 
         t0 = time.time()
-        trained_params, _, _ = arm.train_fn(
+        train_result = arm.train_fn(
             params,
             structure,
             train_loader,
@@ -350,6 +354,7 @@ class PlannedMultiContrastExperiment:
             train_key,
             verbose=self.verbose,
         )
+        trained_params = train_result.params
         train_time = time.time() - t0
 
         metrics = arm.eval_fn(
@@ -379,6 +384,10 @@ class PlannedMultiContrastExperiment:
         per_arm_trials: Dict[str, List[TrialResult]] = {a.name: [] for a in self.arms}
         seeds: List[int] = []
 
+        # fabricpc.training.train requires num_epochs, so any arm using it
+        # declares the key; the fallback of 1 is reachable only with a custom
+        # train_fn that reads no config, where dividing wall time by 1 leaves
+        # the reported "per-epoch" time as the raw trial time.
         num_epochs = next(
             (
                 arm.train_config["num_epochs"]
@@ -444,7 +453,7 @@ class ABResults:
     arm_b_trials: List[TrialResult]
     seeds: List[int]
     total_time: float
-    num_epochs: int
+    num_epochs: float
 
     @property
     def arm_a_metrics(self) -> np.ndarray:

@@ -68,7 +68,7 @@ from fabricpc.core.initializers import (
     XavierInitializer,
 )
 from fabricpc.core.mupc import MuPCConfig
-from fabricpc.training import train_pcn, evaluate_pcn
+from fabricpc.training import train, evaluate
 from fabricpc.utils.data.dataloader import Cifar10Loader
 from fabricpc import setup_jax
 
@@ -406,12 +406,14 @@ def run_single_mupc(args):
     # Periodic evaluation callback
     eval_every = args.eval_every
 
-    def epoch_callback(epoch_idx, params, structure, config, rng_key):
-        epoch_num = epoch_idx + 1
+    def epoch_callback(ctx):
+        epoch_num = ctx.epoch_idx + 1
         if eval_every > 0 and (
             epoch_num % eval_every == 0 or epoch_num == args.num_epochs
         ):
-            metrics = evaluate_pcn(params, structure, test_loader, config, eval_key)
+            metrics = evaluate(
+                ctx.params, ctx.structure, test_loader, ctx.config, eval_key
+            )
             print(f"  Epoch {epoch_num}: accuracy={metrics['accuracy'] * 100:.2f}%")
             return metrics
         return None
@@ -422,7 +424,7 @@ def run_single_mupc(args):
     )
     start_time = time.time()
 
-    trained_params, energy_history, _ = train_pcn(
+    result = train(
         params=params,
         structure=structure,
         train_loader=train_loader,
@@ -432,6 +434,7 @@ def run_single_mupc(args):
         verbose=False,
         epoch_callback=epoch_callback,
     )
+    trained_params = result.params
 
     elapsed = time.time() - start_time
     print(
@@ -440,9 +443,7 @@ def run_single_mupc(args):
 
     # Final evaluation
     print("Final evaluation...")
-    metrics = evaluate_pcn(
-        trained_params, structure, test_loader, train_config, eval_key
-    )
+    metrics = evaluate(trained_params, structure, test_loader, train_config, eval_key)
     print(f"Test Accuracy: {metrics['accuracy'] * 100:.2f}%")
 
 

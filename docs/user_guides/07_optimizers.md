@@ -14,20 +14,26 @@ optimizer = optax.adamw(1e-3, weight_decay=0.1)
 optimizer = optax.sgd(0.01, momentum=0.9)
 ```
 
-Pass the optimizer to `train_pcn()`:
+Pass the optimizer to `train()`:
 
 ```python
-trained_params, energy_history, _ = train_pcn(
+from fabricpc.training import train
+
+result = train(
     params=params, structure=structure, train_loader=train_loader,
     optimizer=optimizer, config={"num_epochs": 10}, rng_key=train_key,
 )
+trained_params = result.params
 ```
 
-Or manage state manually with `train_step()`:
+Or manage state manually with a step built by `make_train_step()`:
 
 ```python
+from fabricpc.training import make_train_step
+
+train_step = make_train_step(structure, optimizer)
 opt_state = optimizer.init(params)
-params, opt_state, energy, _ = train_step(params, opt_state, batch, structure, optimizer, rng_key)
+params, opt_state, metrics, _ = train_step(params, opt_state, batch, rng_key)
 ```
 
 ## Chaining Transforms

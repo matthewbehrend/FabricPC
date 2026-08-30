@@ -34,7 +34,7 @@ from fabricpc.core.activations import LeakyReLUActivation, SoftmaxActivation
 from fabricpc.core.energy import CrossEntropyEnergy, GaussianEnergy
 from fabricpc.core.inference import InferenceSGD
 from fabricpc.core.initializers import KaimingInitializer, XavierInitializer
-from fabricpc.training import train_pcn, evaluate_pcn
+from fabricpc.training import train, evaluate
 from fabricpc.utils.data.dataloader import MnistLoader
 
 jax.config.update("jax_default_prng_impl", "threefry2x32")
@@ -143,7 +143,7 @@ if __name__ == "__main__":
 
     print("\nTraining (JIT compilation on first batch)...")
     start_time = time.time()
-    trained_params, energy_history, _ = train_pcn(
+    result = train(
         params=params,
         structure=structure,
         train_loader=train_loader,
@@ -152,11 +152,10 @@ if __name__ == "__main__":
         rng_key=train_key,
         verbose=True,
     )
+    trained_params = result.params
     elapsed = time.time() - start_time
     print(f"Avg training time: {elapsed / train_config['num_epochs']:.2f}s per epoch")
 
     print("\nEvaluating...")
-    metrics = evaluate_pcn(
-        trained_params, structure, test_loader, train_config, eval_key
-    )
+    metrics = evaluate(trained_params, structure, test_loader, train_config, eval_key)
     print(f"Test Accuracy: {metrics['accuracy'] * 100:.2f}%")

@@ -10,12 +10,13 @@ Defines one condition (arm) of an experiment. Shared by both runners below.
 
 ```python
 from fabricpc.experiments import ExperimentArm
+from fabricpc.training import train, evaluate
 
 arm = ExperimentArm(
     name="muPC",
     model_factory=create_model,    # (rng_key) -> (params, structure)
-    train_fn=train_pcn,
-    eval_fn=evaluate_pcn,
+    train_fn=train,
+    eval_fn=evaluate,
     optimizer=optax.adamw(1e-3),
     train_config={"num_epochs": 5},
 )
@@ -25,8 +26,8 @@ arm = ExperimentArm(
 |-------|------|-------------|
 | `name` | `str` | Display name for this condition |
 | `model_factory` | `Callable` | `(rng_key) -> (params, structure)` |
-| `train_fn` | `Callable` | Training function (e.g., `train_pcn`) |
-| `eval_fn` | `Callable` | Evaluation function (e.g., `evaluate_pcn`) |
+| `train_fn` | `Callable` | Training function with `train`'s positional prefix, returning a `TrainResult`; select the algorithm with `functools.partial(train, algorithm="backprop")` |
+| `eval_fn` | `Callable` | Evaluation function with `evaluate`'s signature, returning a metrics dict |
 | `optimizer` | `optax.GradientTransformation` | Optimizer |
 | `train_config` | `dict` | Training configuration |
 
@@ -141,6 +142,8 @@ Optuna ships in the `[experiments]` extra, not the core install: `pip install "f
 
 Two-phase Optuna search for language-model hyperparameters, both phases minimizing validation perplexity. Phase 1 searches architecture and training parameters together, with Hyperband pruning that allocates training epochs as the trial resource: unpromising trials are stopped after few epochs while strong ones train longer. Phase 2 fixes the Phase 1 winning architecture and refines the continuous training parameters (`lr`, `eta_infer`, `infer_steps`) with a multivariate TPE sampler that models correlations between them. Training energy serves only as a divergence guard: a trial is pruned when its energy becomes non-finite or rises above its best epoch by more than `divergence_rel_tol`.
 
+The perplexity objective requires the trial graph's target node to use `CrossEntropyEnergy` — `evaluate` reports `perplexity` only then, and the tuner raises on a graph without it rather than scoring the trial silently. `algorithm=` selects the learning algorithm for every trial's `train`/`evaluate` call (`"pc"` default, `"backprop"` supported).
+
 ```python
 from fabricpc.tuning import BayesianTuner
 
@@ -192,6 +195,7 @@ Full runnable version: `examples/transformer_tuning.py`.
 | `log_file` | `str` | `"tuning_results.txt"` | Per-trial results log |
 | `divergence_rel_tol` | `float` | `0.5` | Relative energy rise over the trial's best epoch that triggers pruning |
 | `verbose` | `bool` | `False` | Print per-epoch trial progress |
+| `algorithm` | `str` | `"pc"` | Learning algorithm passed to every trial's `train`/`evaluate` |
 
 **Methods:**
 

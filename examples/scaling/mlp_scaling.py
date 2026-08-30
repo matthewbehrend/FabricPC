@@ -20,15 +20,15 @@ How it works:
   - Parent parses JSON and collects ScalingResult objects
 
 # TODO:
-Investigate node parallelization via vmap and pmap
+Investigate node parallelization via vmap
 potential strategy during inference phase and weight learning update phase (independent over nodes):
 - vmap the nodes within each the device
-- pmap batch over multiple devices (if available) for data parallelism
+- shard the batch over multiple devices (if available) for data parallelism
 
   Current Implementation:
   - Nodes are processed sequentially in a Python for-loop (inference.py:63-84)
-  - No vmap/pmap at the node level
-  - Multi-GPU uses data parallelism via pmap on the entire training step
+  - No vmap at the node level
+  - Multi-GPU uses data parallelism via the mesh argument, sharding each batch over the "data" mesh axis
   - Topological ordering is computed and stored (structure.node_order) but not actively exploited
 
   Node Independence in Predictive Coding:
@@ -61,8 +61,7 @@ from fabricpc.graph_initialization import initialize_params, FeedforwardStateIni
 from fabricpc.core.activations import IdentityActivation, SigmoidActivation
 from fabricpc.core.inference import InferenceSGD
 import optax
-from fabricpc.training.train import train_step
-from fabricpc.training.train_backprop import train_step_backprop
+from fabricpc.training import make_train_step
 
 # Reproducibility
 jax.config.update("jax_default_prng_impl", "threefry2x32")
@@ -215,16 +214,14 @@ def run_timed_training_pc(
     opt_state = optimizer.init(params)
 
     # JIT compile the training step
-    jit_train_step = jax.jit(
-        lambda p, o, b, k: train_step(p, o, b, structure, optimizer, k)
-    )
+    step = make_train_step(structure, optimizer)
 
     keys = jax.random.split(rng_key, num_steps + num_warmup)
 
     # Warmup (JIT compilation happens here)
     for i in range(num_warmup):
         batch = batches[i % len(batches)]
-        params, opt_state, _, _ = jit_train_step(params, opt_state, batch, keys[i])
+        params, opt_state, _, _ = step(params, opt_state, batch, keys[i])
     jax.block_until_ready(params)  # Force sync
 
     # Measure memory after warmup (accurate in isolated subprocess)
@@ -234,9 +231,7 @@ def run_timed_training_pc(
     start_time = time.perf_counter()
     for i in range(num_steps):
         batch = batches[(i + num_warmup) % len(batches)]
-        params, opt_state, _, _ = jit_train_step(
-            params, opt_state, batch, keys[i + num_warmup]
-        )
+        params, opt_state, _, _ = step(params, opt_state, batch, keys[i + num_warmup])
     jax.block_until_ready(params)  # Ensure all computation complete
     end_time = time.perf_counter()
 
@@ -259,18 +254,14 @@ def run_timed_training_backprop(
     opt_state = optimizer.init(params)
 
     # JIT compile the training step
-    jit_train_step = jax.jit(
-        lambda p, o, b, k: train_step_backprop(
-            p, o, b, structure, optimizer, k, "cross_entropy"
-        )
-    )
+    step = make_train_step(structure, optimizer, algorithm="backprop")
 
     keys = jax.random.split(rng_key, num_steps + num_warmup)
 
     # Warmup (JIT compilation happens here)
     for i in range(num_warmup):
         batch = batches[i % len(batches)]
-        params, opt_state, _ = jit_train_step(params, opt_state, batch, keys[i])
+        params, opt_state, _, _ = step(params, opt_state, batch, keys[i])
     jax.block_until_ready(params)  # Force sync
 
     # Measure memory after warmup (accurate in isolated subprocess)
@@ -280,9 +271,7 @@ def run_timed_training_backprop(
     start_time = time.perf_counter()
     for i in range(num_steps):
         batch = batches[(i + num_warmup) % len(batches)]
-        params, opt_state, _ = jit_train_step(
-            params, opt_state, batch, keys[i + num_warmup]
-        )
+        params, opt_state, _, _ = step(params, opt_state, batch, keys[i + num_warmup])
     jax.block_until_ready(params)  # Ensure all computation complete
     end_time = time.perf_counter()
 

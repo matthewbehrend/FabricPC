@@ -70,9 +70,10 @@ In FabricPC, local gradients are computed by `compute_local_weight_gradients`, t
 
 ```python
 import optax
+from fabricpc.training import train
 
 optimizer = optax.adamw(0.001, weight_decay=0.1)
-trained_params, _, _ = train_pcn(
+result = train(
     params=params,
     structure=structure,
     train_loader=train_loader,
@@ -80,6 +81,7 @@ trained_params, _, _ = train_pcn(
     config={"num_epochs": 20},
     rng_key=train_key,
 )
+trained_params = result.params
 ```
 
 The key difference from backpropagation: weight gradients are computed **locally** at each node from local information (its own error and inputs), not via a global backward pass through the network.
@@ -188,9 +190,9 @@ Under certain conditions, predictive coding converges to the same solution as ba
 - Linear nodes or small learning rates
 - Inference fully converged before weight updates
 
-FabricPC provides both modes on the same graph structure:
-- `train_pcn` — Predictive coding with local learning rules
-- `train_backprop` — Standard backpropagation for comparison
+FabricPC provides both modes on the same graph structure through `train`'s `algorithm` argument:
+- `train(..., algorithm="pc")` — Predictive coding with local learning rules (the default)
+- `train(..., algorithm="backprop")` — Standard backpropagation for comparison
 
 This allows direct A/B testing of the two approaches on identical architectures.
 

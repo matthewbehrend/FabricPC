@@ -21,12 +21,11 @@ Usage:
     python examples/transformer_demo.py --mode pc --num_blocks 2
 
 Results: PC training (cuda13, rtx3090, jax 0.10.2, can vary a few points in perplexity in different jax versions / hardware due to sensitivity to floating point rounding)
-Final train energy: 332.7728
-Test loss: 2.6713, Perplexity: 14.46
+Final train energy: 352.9587
+Test loss: 2.6988, Perplexity: 14.86
 Prompt: 'ROMEO: '
 ----------------------------------------
-ROMEO: hiteeeeeo he
-Wateeo
+ROMEO: hooofo!eoooraoathe o
 ----------------------------------------
 
 Backprop Training
@@ -70,19 +69,15 @@ from fabricpc.core.initializers import (
 )
 from fabricpc.core.inference import InferenceSGDNormClip
 import optax
-from fabricpc.training.train_autoregressive import (
-    train_step_autoregressive,
-    generate_autoregressive,
-    evaluate_autoregressive,
-    build_train_clamps,
+from fabricpc.training import (
+    build_clamps,
+    evaluate,
+    generate,
+    make_train_step,
 )
 from fabricpc.graph_initialization import initialize_graph_state
 from fabricpc.utils.dashboarding.inference_tracking import (
     run_inference_with_full_history,
-)
-from fabricpc.training.train_backprop import (
-    train_step_backprop_autoregressive,
-    evaluate_backprop_autoregressive,
 )
 from fabricpc.utils.dashboarding import (
     AimExperimentTracker,
@@ -237,6 +232,7 @@ def generate_text(
     temperature: float = 0.8,
     top_k: int = None,
     top_p: float = None,
+    algorithm: str = "pc",
 ) -> List[str]:
     """Generate text autoregressively from batched prompts."""
     if rng_key is None:
@@ -258,7 +254,7 @@ def generate_text(
 
     prompt_tokens = jnp.array(batch_indices)  # (batch_size, seq_len)
 
-    generated_tokens = generate_autoregressive(
+    generated_tokens = generate(
         params=params,
         structure=structure,
         prompt=prompt_tokens,
@@ -267,6 +263,7 @@ def generate_text(
         temperature=temperature,
         top_k=top_k,
         top_p=top_p,
+        algorithm=algorithm,
     )
 
     generated_texts = []
@@ -350,7 +347,8 @@ def main(args=None):
         """Repackage (x, y) tuples as {'x': ..., 'y': ...} dicts.
 
         Both x and y are integer token ids (batch, seq_len); y is one-hot
-        encoded later by build_train_clamps.
+        encoded later by build_clamps (non-float targets are one-hot by
+        dtype).
         """
 
         def __init__(self, base):
@@ -433,55 +431,28 @@ def main(args=None):
         alpha=0.01,
     )
     optimizer = optax.chain(
-        optax.clip_by_global_norm(1.0),
+        optax.clip_by_global_norm(0.8),
         optax.adamw(lr_schedule, weight_decay=0.1),
     )
-    train_config = {
-        "num_epochs": args.num_epochs,
-        "use_causal_mask": True,  # Enable causal masking for autoregressive
-    }
+    train_config = {"num_epochs": args.num_epochs}
 
-    def create_eval_callback(use_pc_mode: bool):
-        """Create appropriate eval callback based on training method."""
-        if use_pc_mode:
+    def eval_callback(epoch_idx, params, structure, config, rng_key):
+        eval_rng = jax.random.fold_in(rng_key, epoch_idx)
+        metrics = evaluate(
+            params,
+            structure,
+            test_batches,
+            {},
+            eval_rng,
+            algorithm="pc" if use_pc else "backprop",
+        )
+        tqdm.write(
+            f"  Test - Loss: {metrics['cross_entropy']:.4f}, "
+            f"Perplexity: {metrics['perplexity']:.2f}, "
+            f"Acc: {metrics['accuracy']:.4f}"
+        )
+        return metrics
 
-            def eval_callback(epoch_idx, params, structure, config, rng_key):
-                eval_rng = jax.random.fold_in(rng_key, epoch_idx)
-                metrics = evaluate_autoregressive(
-                    params,
-                    structure,
-                    test_batches,
-                    {
-                        "use_causal_mask": True,
-                    },  # No inference steps for eval because model predicts feedforward
-                    eval_rng,
-                    debug=(epoch_idx == 0),
-                )
-                tqdm.write(
-                    f"  Test - Loss: {metrics['loss']:.4f}, Perplexity: {metrics['perplexity']:.2f}, Acc: {metrics['accuracy']:.4f}"
-                )
-                return metrics
-
-        else:
-
-            def eval_callback(epoch_idx, params, structure, config, rng_key):
-                eval_rng = jax.random.fold_in(rng_key, epoch_idx)
-                metrics = evaluate_backprop_autoregressive(
-                    params,
-                    structure,
-                    test_batches,
-                    {"use_causal_mask": True},
-                    eval_rng,
-                    debug=(epoch_idx == 0),
-                )
-                tqdm.write(
-                    f"  Test - Loss: {metrics['loss']:.4f}, Perplexity: {metrics['perplexity']:.2f}, Acc: {metrics['accuracy']:.4f}"
-                )
-                return metrics
-
-        return eval_callback
-
-    eval_callback = create_eval_callback(use_pc)
     progress_bar = TrainingProgressBar(
         total_batches=len(train_batches),
         num_epochs=args.num_epochs,
@@ -521,26 +492,12 @@ def main(args=None):
     num_epochs = train_config["num_epochs"]
     total_epochs = math.ceil(num_epochs)
     frac = num_epochs - math.floor(num_epochs)
-    use_causal_mask = train_config.get("use_causal_mask", True)
 
-    if use_pc:
-        jit_train_step = jax.jit(
-            lambda p, o, b, k: train_step_autoregressive(
-                p,
-                o,
-                b,
-                structure,
-                optimizer,
-                k,
-                use_causal_mask,
-            )
-        )
-    else:
-        jit_train_step = jax.jit(
-            lambda p, o, b, k: train_step_backprop_autoregressive(
-                p, o, b, structure, optimizer, k, use_causal_mask
-            )
-        )
+    # The custom loop (Aim tracking needs the final state) runs on the public
+    # jitted step, which returns it.
+    train_step = make_train_step(
+        structure, optimizer, algorithm="pc" if use_pc else "backprop"
+    )
 
     energy_history = []
     eval_results = []
@@ -563,17 +520,15 @@ def main(args=None):
 
                 batch = {k: jnp.array(v) for k, v in batch_data.items()}
 
-                if use_pc:
-                    params, opt_state, energy, ce_loss, final_state = jit_train_step(
-                        params, opt_state, batch, batch_keys[batch_idx]
-                    )
-                    loss_val = float(energy)
-                else:
-                    params, opt_state, loss, _predictions = jit_train_step(
-                        params, opt_state, batch, batch_keys[batch_idx]
-                    )
-                    loss_val = float(loss)
-                    final_state = None
+                params, opt_state, metrics, final_state = train_step(
+                    params, opt_state, batch, batch_keys[batch_idx]
+                )
+                # PC tracks the settling objective (per-sample internal
+                # energy); backprop tracks the per-token cross-entropy
+                # (target_energy under CrossEntropyEnergy).
+                loss_val = float(
+                    metrics["energy"] if use_pc else metrics["target_energy"]
+                )
 
                 iter_callback(epoch, batch_idx, loss_val)
                 batch_energies.append(loss_val)
@@ -589,13 +544,11 @@ def main(args=None):
                     )
 
                     should_track_state = (
-                        final_state is not None
+                        use_pc
                         and batch_idx % tracker.config.tracking_every_n_batches == 0
                     )
                     if should_track_state:
-                        track_clamps = build_train_clamps(
-                            batch, structure, use_causal_mask
-                        )
+                        track_clamps = build_clamps(batch, structure, clamp_target=True)
                         track_init_state = initialize_graph_state(
                             structure,
                             batch["x"].shape[0],
@@ -655,6 +608,7 @@ def main(args=None):
         max_new_tokens=20,
         rng_key=gen_key,
         temperature=0.8,
+        algorithm="pc" if use_pc else "backprop",
     )
 
     for prompt, generated in zip(prompts, generated_texts):
@@ -671,7 +625,7 @@ def main(args=None):
     if eval_results and eval_results[-1]:
         final_eval = eval_results[-1]
         print(
-            f"Test loss: {final_eval['loss']:.4f}, Perplexity: {final_eval['perplexity']:.2f}"
+            f"Test loss: {final_eval['cross_entropy']:.4f}, Perplexity: {final_eval['perplexity']:.2f}"
         )
 
     return trained_params, structure, train_loader, test_loader

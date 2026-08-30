@@ -39,7 +39,7 @@ from fabricpc.core.activations import (
 from fabricpc.core.energy import CrossEntropyEnergy
 from fabricpc.core.inference import InferenceSGD
 import optax
-from fabricpc.training import train_pcn, evaluate_pcn
+from fabricpc.training import train, evaluate
 from fabricpc.experiments import ExperimentArm, ABExperiment
 from fabricpc.utils.data.dataloader import MnistLoader
 from fabricpc import setup_jax
@@ -141,8 +141,8 @@ def main():
     arm_lateral = ExperimentArm(
         name="Lateral",
         model_factory=create_lateral_model,
-        train_fn=train_pcn,
-        eval_fn=evaluate_pcn,
+        train_fn=train,
+        eval_fn=evaluate,
         optimizer=optimizer,
         train_config=train_config,
     )
@@ -150,8 +150,8 @@ def main():
     arm_mlp = ExperimentArm(
         name="MLP",
         model_factory=create_mlp_model,
-        train_fn=train_pcn,
-        eval_fn=evaluate_pcn,
+        train_fn=train,
+        eval_fn=evaluate,
         optimizer=optimizer,
         train_config=train_config,
     )

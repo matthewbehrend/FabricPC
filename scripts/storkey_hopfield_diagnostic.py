@@ -37,8 +37,7 @@ from fabricpc.core.activations import SoftmaxActivation, TanhActivation
 from fabricpc.core.energy import CrossEntropyEnergy
 from fabricpc.core.inference import InferenceSGD, gather_inputs, run_inference
 from fabricpc.core.initializers import XavierInitializer
-from fabricpc.training import train_pcn, evaluate_pcn
-from fabricpc.training.train import train_step
+from fabricpc.training import train, evaluate, make_train_step
 from fabricpc.graph_initialization.state_initializer import initialize_graph_state
 from fabricpc.core.state_ops import update_node_in_state
 from fabricpc.utils.data.dataloader import (
@@ -222,9 +221,7 @@ def custom_train_loop(
     few-shot loaders that may have fewer batches than max_batches).
     """
     opt_state = optimizer.init(params)
-    jit_train_step = jax.jit(
-        lambda p, o, b, k: train_step(p, o, b, structure, optimizer, k)
-    )
+    step = make_train_step(structure, optimizer)
     batch_count = 0
     while batch_count < max_batches:
         for batch_data in train_loader:
@@ -232,9 +229,7 @@ def custom_train_loop(
                 break
             batch = {"x": jnp.array(batch_data[0]), "y": jnp.array(batch_data[1])}
             rng_key, subkey = jax.random.split(rng_key)
-            params, opt_state, energy, _ = jit_train_step(
-                params, opt_state, batch, subkey
-            )
+            params, opt_state, _, _ = step(params, opt_state, batch, subkey)
             batch_count += 1
     return params
 
@@ -253,9 +248,7 @@ def custom_train_loop_with_snapshots(
     Loops over the loader multiple times if needed.
     """
     opt_state = optimizer.init(params)
-    jit_train_step = jax.jit(
-        lambda p, o, b, k: train_step(p, o, b, structure, optimizer, k)
-    )
+    step = make_train_step(structure, optimizer)
     w_snapshots = []
     batch_count = 0
     while batch_count < max_batches:
@@ -264,13 +257,11 @@ def custom_train_loop_with_snapshots(
                 break
             batch = {"x": jnp.array(batch_data[0]), "y": jnp.array(batch_data[1])}
             rng_key, subkey = jax.random.split(rng_key)
-            params, opt_state, energy, _ = jit_train_step(
-                params, opt_state, batch, subkey
-            )
+            params, opt_state, metrics, _ = step(params, opt_state, batch, subkey)
             if batch_count % snapshot_every == 0:
                 analysis = analyze_W_matrix(params, structure)
                 analysis["batch"] = batch_count
-                analysis["energy"] = float(energy)
+                analysis["energy"] = float(metrics["energy"])
                 w_snapshots.append(analysis)
             batch_count += 1
     return params, w_snapshots
@@ -319,8 +310,8 @@ def phase1_strength_sweep(n_trials, num_epochs):
     arm_mlp = ExperimentArm(
         name="MLP",
         model_factory=create_mlp_model,
-        train_fn=train_pcn,
-        eval_fn=evaluate_pcn,
+        train_fn=train,
+        eval_fn=evaluate,
         optimizer=optimizer,
         train_config=train_config,
     )
@@ -337,8 +328,8 @@ def phase1_strength_sweep(n_trials, num_epochs):
         arm_hop = ExperimentArm(
             name=f"Hop(s={label})",
             model_factory=make_hopfield_factory(s),
-            train_fn=train_pcn,
-            eval_fn=evaluate_pcn,
+            train_fn=train,
+            eval_fn=evaluate,
             optimizer=optimizer,
             train_config=train_config,
         )
@@ -392,10 +383,10 @@ def phase1_strength_sweep(n_trials, num_epochs):
             key = jax.random.PRNGKey(42)
             params, structure = make_hopfield_factory(None)(key)
             train_loader, _ = data_factory(42)
-            params, _, _ = train_pcn(
+            result = train(
                 params, structure, train_loader, optimizer, train_config, key
             )
-            learned_str = _get_learned_strength(params, structure)
+            learned_str = _get_learned_strength(result.params, structure)
 
         row["learned_str"] = learned_str
         sweep_results.append(row)
@@ -918,7 +909,7 @@ def phase5_latent_analysis():
 
         train_loader = _make_train_loader(seed=42)
 
-        trained_params, _, _ = train_pcn(
+        result = train(
             params,
             structure,
             train_loader,
@@ -927,6 +918,7 @@ def phase5_latent_analysis():
             train_key,
             verbose=False,
         )
+        trained_params = result.params
 
         test_loader = _make_test_loader(seed=42)
         z, labels = collect_latents(
