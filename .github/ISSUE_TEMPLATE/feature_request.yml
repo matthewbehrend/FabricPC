@@ -1,0 +1,38 @@
+﻿name: Feature Request
+description: Suggest an idea or feature for FabricPC
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for suggesting a feature for FabricPC!
+        Please check [CONTRIBUTING.md](https://github.com/trueagi-io/FabricPC/blob/main/CONTRIBUTING.md) to understand our design-first workflow.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem Statement
+      description: Is your feature request related to a problem or limitation? Please describe clearly.
+    validations:
+      required: true
+  - type: textarea
+    id: proposed_behavior
+    attributes:
+      label: Proposed Behavior / Solution
+      description: Describe the feature, API, or behavior you would like to see added.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives Considered
+      description: Describe any alternative solutions or workarounds you have considered.
+    validations:
+      required: false
+  - type: textarea
+    id: additional_context
+    attributes:
+      label: Additional Context
+      description: Add any other context, diagrams, or references here.
+    validations:
+      required: false
