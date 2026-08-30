@@ -88,7 +88,7 @@ The [`examples`](https://github.com/trueagi-io/FabricPC/tree/main/examples) fold
 
 ## Documentation
 
-User guides, API reference, and tutorials live in [`docs/user_guides`](https://github.com/trueagi-io/FabricPC/blob/main/docs/user_guides/00_index.md). Development plans and technical design documents are in [`docs/dev_plans`](https://github.com/trueagi-io/FabricPC/tree/main/docs/dev_plans).
+User guides, API reference, and tutorials live in [`docs/user_guides`](https://github.com/trueagi-io/FabricPC/blob/main/docs/user_guides/00_index.md). Development plans and technical design documents are in [`docs/dev_plans_archive`](https://github.com/trueagi-io/FabricPC/tree/main/docs/dev_plans_archive).
 
 ## Extending FabricPC
 
@@ -100,13 +100,7 @@ See [`docs/user_guides/06_custom_nodes.md`](https://github.com/trueagi-io/Fabric
 
 ## Contributing
 
-Contributions are welcome! Please open issues or pull requests on the GitHub repository.
-- Develop on a branch using the convention `username/your_feature_name`.
-- Demos must match baseline results, or explain any divergence.
-- The test suite must pass.
-- Write unit tests and docstrings for new code.
-- Use the pre-commit hooks for PEP8 style and code quality.
-- Rebase before opening PR.
+Contributions are welcome! Please open issues or pull requests on the GitHub repository. See [CONTRIBUTING.md](https://github.com/trueagi-io/FabricPC/blob/main/CONTRIBUTING.md) for the development setup, the pull-request expectations, and the design-first workflow.
 
 This is a research-first project.
 - APIs may change frequently until the v1.0 release.
