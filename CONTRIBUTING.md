@@ -37,17 +37,17 @@ agree. The `[tfds]` and `[viz]` extras are optional — tests that need them ski
   be real and reproducible. State the command that produced a measurement.
 - Link the issue the PR resolves.
 
-## Design-first workflow (issues labeled `design`)
+## Design-first workflow
 
-Some issues ask for a design before any code. For these, a design document precedes
-implementation, and both ship in one pull request:
+Design document precedes implementation. Submit the design file at minimum attached to the PR
+description. Substantial changes commit the design file. If in doubt, commit the design file.
+
+If the issue asks for a design review gate, submit a draft PR on the design file before coding.
 
 1. Claim the issue by commenting on it.
-2. Write the design document and open a **draft PR** containing only that document. Author it in
-   `docs/dev_plans/` (this directory exists only on work-in-progress branches) or directly in
-   `docs/dev_plans_archive/` — either is fine.
-3. A maintainer reviews the design in the draft PR. Iterate there until sign-off. Do not start
-   the implementation before sign-off; a rejected design would waste it.
+2. Write the design document in `docs/dev_plans/` (this directory exists only on work-in-progress
+   branches) or directly in `docs/dev_plans_archive/` — either is fine.
+3. Critically review the design (first yourself and then by maintainer if required)
 4. Implement on the same branch.
 5. In the final commit, make sure the document sits in `docs/dev_plans_archive/`, the record of
    completed designs, then mark the PR ready for review.

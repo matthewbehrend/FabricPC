@@ -49,7 +49,11 @@ from fabricpc.training import (
     train,
 )
 
-PARITY_TOL = 1e-12
+# Params are float32 and the hand-rolled reference and train() are two
+# separately jitted programs, so XLA:CPU may differ in the last bits
+# (observed one-ULP diffs up to ~6e-8 on CI). A real composition bug (wrong
+# key derivation, extra/missing step, wrong lr at 1e-2) produces diffs >= 1e-3.
+PARITY_TOL = 1e-5
 
 
 # ---------------------------------------------------------------------------
