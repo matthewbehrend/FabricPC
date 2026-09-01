@@ -33,20 +33,37 @@ included) with end-to-end autodiff instead of iterative PC inference;
 
 Usage:
     python examples/resnet18_cifar10_demo.py                      # 2-epoch smoke test
-    python examples/resnet18_cifar10_demo.py --activation tanh    # with tanh instead of relu
+    python examples/resnet18_cifar10_demo.py --activation gelu    # with gelu instead of relu
     python examples/resnet18_cifar10_demo.py --trainer backprop   # backprop baseline on the same model
-    python examples/resnet18_cifar10_demo.py --num_epochs 100 --activation tanh --eval_every 10 --augment  # full training with tanh and augmentation
+    python examples/resnet18_cifar10_demo.py --num_epochs 100 --eval_every 10 --augment --activation gelu # full training with augmentation and gelu activation
 
 
-python examples/resnet18_cifar10_demo.py  # smoke test
-results (RTX3090, cuda13, jax 0.10.2; can vary a few points in accuracy across
+Results (RTX3090, cuda13, jax 0.10.2; can vary a few points in accuracy across
 jax versions and hardware, from sensitivity to floating point rounding)
 
+python examples/resnet18_cifar10_demo.py  # smoke test
 Model: 31 nodes, 38 edges
 Total parameters: 2,795,210
 Train energy: 0.4792
 Test Accuracy: 33.71%
 Training time: 952.3s (476.2s per epoch)
+
+python examples/resnet18_cifar10_demo.py --num_epochs 100 --eval_every 10 --augment --activation gelu --trainer backprop
+Trainer: backprop  |  Activation: gelu  |  Epochs: 100  |  LR: 0.001  |  Augment: True
+Training for 100 epochs (JIT compilation on first batch)...
+  Epoch 10: accuracy=56.21%
+  Epoch 20: accuracy=63.77%
+  Epoch 30: accuracy=69.02%
+  Epoch 40: accuracy=70.94%
+  Epoch 50: accuracy=73.01%
+  Epoch 60: accuracy=75.41%
+  Epoch 70: accuracy=75.71%
+  Epoch 80: accuracy=76.87%
+  Epoch 90: accuracy=77.07%
+  Epoch 100: accuracy=77.11%
+Training time: 557.0s (5.6s per epoch)
+Final evaluation...
+Test Accuracy: 77.11%
 """
 
 import jax
@@ -426,7 +443,12 @@ def run_single_mupc(args):
             epoch_num % eval_every == 0 or epoch_num == args.num_epochs
         ):
             metrics = evaluate(
-                ctx.params, ctx.structure, test_loader, ctx.config, eval_key
+                ctx.params,
+                ctx.structure,
+                test_loader,
+                ctx.config,
+                eval_key,
+                algorithm=trainer_mode,
             )
             print(f"  Epoch {epoch_num}: accuracy={metrics['accuracy'] * 100:.2f}%")
             return metrics
@@ -458,7 +480,14 @@ def run_single_mupc(args):
 
     # Final evaluation
     print("Final evaluation...")
-    metrics = evaluate(trained_params, structure, test_loader, train_config, eval_key)
+    metrics = evaluate(
+        trained_params,
+        structure,
+        test_loader,
+        train_config,
+        eval_key,
+        algorithm=trainer_mode,
+    )
     print(f"Test Accuracy: {metrics['accuracy'] * 100:.2f}%")
 
 
@@ -499,7 +528,7 @@ def parse_args():
     parser.add_argument(
         "--activation",
         type=str,
-        default="relu",
+        default="gelu",
         choices=["relu", "tanh", "gelu", "leaky_relu"],
         help="Activation function for hidden layers (default: relu)",
     )
