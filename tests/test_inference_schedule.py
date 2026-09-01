@@ -28,7 +28,7 @@ from fabricpc.graph_initialization import initialize_params
 from fabricpc.graph_initialization.state_initializer import initialize_graph_state
 from fabricpc.nodes import Linear
 from fabricpc.nodes.identity import IdentityNode
-from fabricpc.training import train_step
+from fabricpc.training import make_train_step
 from fabricpc.utils.dashboarding.inference_tracking import (
     run_inference_with_full_history,
     run_inference_with_history,
@@ -197,13 +197,11 @@ class TestExecution:
             "y": jax.random.normal(jax.random.PRNGKey(1), (4, 3)),
         }
 
-        step_fn = jax.jit(
-            lambda p, o, b, k: train_step(p, o, b, structure, optimizer, k)
-        )
-        new_params, new_opt_state, energy, final_state = step_fn(
+        step_fn = make_train_step(structure, optimizer)
+        new_params, new_opt_state, metrics, final_state = step_fn(
             params, opt_state, batch, rng_key
         )
-        assert jnp.isfinite(energy)
+        assert jnp.isfinite(metrics["energy"])
         assert not jnp.any(jnp.isnan(final_state.nodes["h"].z_latent))
 
 

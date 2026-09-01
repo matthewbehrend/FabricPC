@@ -98,7 +98,7 @@ from fabricpc.core.inference import InferenceSGDNormClip
 from fabricpc.core.inference_epc import EPCInference
 from fabricpc.experiments import ExperimentArm, PlannedMultiContrastExperiment
 from fabricpc.graph_initialization.state_initializer import initialize_graph_state
-from fabricpc.training import evaluate_pcn, train_pcn, train_step
+from fabricpc.training import evaluate, make_train_step, train
 from fabricpc.utils.data.dataloader import Cifar10Loader
 from fabricpc.utils.dashboarding.inference_tracking import run_inference_with_history
 from fabricpc import setup_jax
@@ -194,8 +194,8 @@ def run_sweep(args):
                 ),
                 args.activation,
             ),
-            train_fn=train_pcn,
-            eval_fn=evaluate_pcn,
+            train_fn=train,
+            eval_fn=evaluate,
             optimizer=optimizer,
             train_config=train_config,
         )
@@ -208,8 +208,8 @@ def run_sweep(args):
                     EPCInference(eta_infer=epc_eta, infer_steps=t1),
                     args.activation,
                 ),
-                train_fn=train_pcn,
-                eval_fn=evaluate_pcn,
+                train_fn=train,
+                eval_fn=evaluate,
                 optimizer=optimizer,
                 train_config=train_config,
             )
@@ -498,9 +498,7 @@ def _train_with_checkpoints(
         args.lr, args.weight_decay, args.num_epochs, steps_per_epoch
     )
     opt_state = optimizer.init(params)
-    step_fn = jax.jit(
-        lambda p, o, b, k: train_step(p, o, b, train_structure, optimizer, k)
-    )
+    step_fn = make_train_step(train_structure, optimizer)
     tracked = jax.jit(
         lambda p, s: run_inference_with_history(p, s, probe_clamps, track_structure)
     )
@@ -528,11 +526,11 @@ def _train_with_checkpoints(
             for pct in triggers.get(update_idx, ()):
                 checkpoints[pct] = log_probe(params)
             batch = {"x": jnp.asarray(images), "y": jnp.asarray(labels)}
-            params, opt_state, energy, _ = step_fn(
+            params, opt_state, train_metrics, _ = step_fn(
                 params, opt_state, batch, batch_keys[batch_idx]
             )
             update_idx += 1
-            progress.set_postfix(energy=f"{float(energy):.4f}")
+            progress.set_postfix(energy=f"{float(train_metrics['energy']):.4f}")
             progress.update(1)
     progress.close()
     for pct in tail_pcts:

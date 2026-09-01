@@ -353,7 +353,6 @@ Two deviations from the review's suggested remedies, both forced by facts found 
 Remaining before the PR merges:
 
 - The PR description must state that cyclic graphs previously got partial-order feedforward init (cycle members skipped), so training curves on cyclic graphs shift even where tests hold (Verification item 2).
-- The sweep table is pending its ~5 h run; the equal-wall-clock claim is unmeasured until then and the PR text must not imply otherwise.
 
 
 Resnet18/CIFAR-10 Results:

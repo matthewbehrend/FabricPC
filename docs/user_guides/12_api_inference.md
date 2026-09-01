@@ -71,7 +71,7 @@ Error-parameterized predictive coding (ePC, Goemaere et al., arXiv 2505.20137). 
 ```python
 from fabricpc.core.inference_epc import EPCInference
 
-inference = EPCInference(eta_infer=1e-2, infer_steps=5, latent_decay=0.0)
+inference = EPCInference(eta_infer=1e-3, infer_steps=1, latent_decay=0.0)
 structure = graph(..., inference=inference)
 ```
 

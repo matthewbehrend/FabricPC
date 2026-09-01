@@ -464,8 +464,9 @@ def test_train_and_evaluate_smoke(rng_key, algorithm, task):
     assert 0.0 <= eval_metrics["accuracy"] <= 1.0
     assert eval_metrics["target_energy"] >= 0.0
     assert eval_metrics["perplexity"] >= 1.0
-    if algorithm == "pc":
-        assert eval_metrics["energy"] >= 0.0
+    # No sign assertion on eval "energy": the free readout relaxes during
+    # eval, and its CE energy -sum(z_latent * log(z_mu)) is linear in
+    # z_latent, so inference drives it below zero.
 
 
 # ---------------------------------------------------------------------------
@@ -661,9 +662,9 @@ def test_custom_metric_weighted_aggregation_uneven_batches(rng_key):
         metrics={"ce": custom, "ppl": metrics_mod.perplexity},
     )
 
-    # Hand-computed: per-sample CE from the feedforward prediction (a free
-    # output settles nowhere: the feedforward state is the zero-error fixed
-    # point), aggregated over ALL 8 samples.
+    # Hand-computed: per-sample CE from the readout's z_mu after the same
+    # init -> run_inference pipeline evaluate runs, aggregated over ALL 8
+    # samples.
     def per_sample_ce(batch):
         clamps = build_clamps(batch, structure, clamp_target=False)
         state = initialize_graph_state(
@@ -686,11 +687,10 @@ def test_custom_metric_weighted_aggregation_uneven_batches(rng_key):
 
 def test_eval_energy_matches_graph_energy(rng_key):
     """evaluate's default 'energy' metric must agree with graph_energy / N
-    (N = B for a rank-2 target) — metrics._internal_energy_fn re-implements
-    graph_energy's node ordering, so a divergence would otherwise be silent.
-    GlobalStateInit
-    keeps the eval energy nonzero (a free feedforward output sits at its
-    zero-error fixed point)."""
+    (N = B for a rank-2 target) — metrics._internal_energy_fn re-implements graph_energy's
+    node ordering, so a divergence would otherwise be silent. The value is
+    signed: the free readout relaxes during eval, and its CE energy
+    -sum(z_latent * log(z_mu)) is linear in z_latent."""
     structure = rng_sensitive_structure()
     params = initialize_params(structure, rng_key)
     batch = next(iter(make_batches(rng_key, n_batches=1)))
@@ -704,7 +704,7 @@ def test_eval_energy_matches_graph_energy(rng_key):
     )
     state = run_inference(params, state, clamps, structure)
     expected = float(graph_energy(state, structure)) / batch["x"].shape[0]
-    assert expected > 0.0
+    assert abs(expected) > 1e-6  # the parity check must not pass at zero
     assert abs(out["energy"] - expected) < 1e-5
 
 
