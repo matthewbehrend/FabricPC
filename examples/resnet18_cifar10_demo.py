@@ -27,13 +27,18 @@ Supports multiple activation functions (--activation):
 Includes cosine LR schedule with warmup and optional data augmentation
 (random horizontal flip + random crop with padding).
 
+--trainer backprop trains the identical graph (muPC init and edge scaling
+included) with end-to-end autodiff instead of iterative PC inference;
+--eta_infer and --infer_steps have no effect in that mode.
+
 Usage:
     python examples/resnet18_cifar10_demo.py                      # 2-epoch smoke test
     python examples/resnet18_cifar10_demo.py --activation tanh    # with tanh instead of relu
+    python examples/resnet18_cifar10_demo.py --trainer backprop   # backprop baseline on the same model
     python examples/resnet18_cifar10_demo.py --num_epochs 100 --activation tanh --eval_every 10 --augment  # full training with tanh and augmentation
 
 
-python examples/resnet18_cifar10_demo.py
+python examples/resnet18_cifar10_demo.py  # smoke test
 results (RTX3090, cuda13, jax 0.10.2; can vary a few points in accuracy across
 jax versions and hardware, from sensitivity to floating point rounding)
 
@@ -362,12 +367,19 @@ def run_single_mupc(args):
     """Default mode: single muPC training run with progress bar."""
     activation = get_activation(args.activation)
 
+    if args.trainer == "backprop":
+        trainer_label = "Backprop"
+        trainer_mode = "backprop"
+    else:
+        trainer_label = "Predictive Coding"
+        trainer_mode = "pc"
+
     print("=" * 60)
-    print("ResNet-18 on CIFAR-10 (Predictive Coding + muPC)")
+    print(f"ResNet-18 on CIFAR-10 ({trainer_label} + muPC)")
     print("=" * 60)
     print(
-        f"Activation: {args.activation}  |  Epochs: {args.num_epochs}  |  "
-        f"LR: {args.lr}  |  Augment: {args.augment}"
+        f"Trainer: {args.trainer}  |  Activation: {args.activation}  |  "
+        f"Epochs: {args.num_epochs}  |  LR: {args.lr}  |  Augment: {args.augment}"
     )
 
     master_rng_key = jax.random.PRNGKey(42)
@@ -433,6 +445,7 @@ def run_single_mupc(args):
         optimizer=optimizer,
         config=train_config,
         rng_key=train_key,
+        algorithm=trainer_mode,
         verbose=False,
         epoch_callback=epoch_callback,
     )
@@ -475,6 +488,13 @@ def parse_args():
     )
     parser.add_argument(
         "--weight_decay", type=float, default=0.01, help="Weight decay (default: 0.01)"
+    )
+    parser.add_argument(
+        "--trainer",
+        type=str,
+        default="pc",
+        choices=["pc", "backprop"],
+        help="Training algorithm: pc (predictive coding, default) or backprop",
     )
     parser.add_argument(
         "--activation",

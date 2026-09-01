@@ -356,65 +356,108 @@ Remaining before the PR merges:
 
 
 Resnet18/CIFAR-10 Results:
+======================================================================
+epochs/arm: 2  |  trials: 5  |  sPC: 120 steps @ eta 0.1
+sweep epc_eta [0.1, 0.03, 0.01, 0.001, 0.0001]
+report accuracy (2 epochs) and train time over trials
+
+python examples/epc_spc_resnet18_compare.py --mode sweep --n_trials 5 --epc_eta 0.1
+--- Per-arm results (mean +/- SE over trials) ---
+arm          accuracy%          train time (s)    
+sPC-120      34.64 +/- 0.65     1008.6
+ePC-1        10.22 +/- 0.07     84.8
+ePC-2        10.57 +/- 0.15     93.3
+ePC-3        10.05 +/- 0.20     99.9
+ePC-4        12.12 +/- 0.66     109.3
+ePC-5        14.28 +/- 0.85     114.0
+ePC-6        15.82 +/- 0.66     121.0
+ePC-7        18.57 +/- 0.36     128.1
+ePC-8        21.51 +/- 0.60     134.8
+ePC-9        25.92 +/- 0.55     142.6
+ePC-10       28.63 +/- 0.34     150.1
+ePC-16       30.72 +/- 0.59     189.6
+ePC-32       31.09 +/- 0.60     301.7
+ePC-64       31.05 +/- 0.64     526.5
+ePC-128      31.03 +/- 0.65     982.8
+ePC-160      31.02 +/- 0.64     1206.8
+
 python examples/epc_spc_resnet18_compare.py --mode sweep --n_trials 5 --epc_eta 0.03
-======================================================================
-ePC step sweep vs sPC baseline — ResNet-18 / CIFAR-10
-======================================================================
-T1 grid: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 16, 32, 64, 128, 160]  |  sPC: 120 steps @ eta 0.1
-ePC eta: 0.03  |  epochs/arm: 2  |  trials: 5
-
 --- Per-arm results (mean +/- SE over trials) ---
 arm          accuracy%          train time (s)    
-sPC-120      34.64 +/- 0.65     938.5
-ePC-1        36.90 +/- 0.29     83.7
-ePC-2        33.87 +/- 0.41     91.6
-ePC-3        32.62 +/- 0.48     98.3
-ePC-4        31.92 +/- 0.51     105.9
-ePC-5        31.45 +/- 0.52     111.7
-ePC-6        31.21 +/- 0.55     118.1
-ePC-7        31.04 +/- 0.57     124.0
-ePC-8        30.92 +/- 0.55     129.9
-ePC-9        30.78 +/- 0.54     136.5
-ePC-10       30.73 +/- 0.57     142.9
-ePC-16       30.73 +/- 0.54     180.3
-ePC-32       30.98 +/- 0.53     282.4
-ePC-64       31.17 +/- 0.60     487.4
-ePC-128      31.17 +/- 0.59     897.0
-ePC-160      31.19 +/- 0.58     1102.2
+sPC-120      34.64 +/- 0.65     1074.6
+ePC-1        36.90 +/- 0.29     85.0
+ePC-2        33.87 +/- 0.41     92.7
+ePC-3        32.62 +/- 0.48     101.1
+ePC-4        31.92 +/- 0.51     110.0
+ePC-5        31.45 +/- 0.52     115.9
+ePC-6        31.21 +/- 0.55     122.1
+ePC-7        31.04 +/- 0.57     127.7
+ePC-8        30.92 +/- 0.55     135.2
+ePC-9        30.78 +/- 0.54     145.0
+ePC-10       30.73 +/- 0.57     151.4
+ePC-16       30.73 +/- 0.54     194.5
+ePC-32       30.98 +/- 0.53     318.6
+ePC-64       31.17 +/- 0.60     565.1
+ePC-128      31.17 +/- 0.59     1053.4
+ePC-160      31.19 +/- 0.58     1312.9
 
---- Accuracy at equal wall-clock (per trial) ---
-trial   sPC acc%   ePC acc% @ sPC time    diff%   
-1       35.54      32.84                  -2.70   
-2       34.65      30.52                  -4.13   
-3       32.40      29.63                  -2.77   
-4       34.36      30.65                  -3.71   
-5       36.24      32.22                  -4.02   
-
---- Wall-clock to equal accuracy (per trial) ---
-trial   sPC time s   ePC time s   T1     ratio   
-1       928.0        82.5         1      0.09    
-2       936.2        83.0         1      0.09    
-3       937.2        84.6         1      0.09    
-4       942.8        83.3         1      0.09    
-5       948.1        84.8         1      0.09    
-
-Reducing the epc_eta to 1e-3 yields greater accuracy over sPC and across a broader window of T1.
-python examples/epc_spc_resnet18_compare.py --mode sweep --n_trials 1 --epc_eta 0.001
+python examples/epc_spc_resnet18_compare.py --mode sweep --n_trials 5 --epc_eta 0.01
+ePC eta: 0.01  |  epochs/arm: 2  |  trials: 5  |  sPC: 120 steps @ eta 0.1
 --- Per-arm results (mean +/- SE over trials) ---
 arm          accuracy%          train time (s)    
-sPC-120      35.54 +/- 0.00     993.6
-ePC-1        39.50 +/- 0.00     83.3
-ePC-2        39.57 +/- 0.00     92.1
-ePC-3        39.58 +/- 0.00     99.0
-ePC-4        39.47 +/- 0.00     111.3
-ePC-5        39.54 +/- 0.00     118.0
-ePC-6        39.42 +/- 0.00     117.8
-ePC-7        39.36 +/- 0.00     124.2
-ePC-8        39.31 +/- 0.00     131.1
-ePC-9        39.31 +/- 0.00     138.3
-ePC-10       39.25 +/- 0.00     145.0
-ePC-16       39.08 +/- 0.00     183.0
-ePC-32       37.36 +/- 0.00     287.1
-ePC-64       35.43 +/- 0.00     496.4
-ePC-128      33.57 +/- 0.00     914.2
-ePC-160      33.13 +/- 0.00     1126.5
+sPC-120      34.64 +/- 0.65     969.9
+ePC-1        38.54 +/- 0.33     84.2
+ePC-2        37.97 +/- 0.36     92.2
+ePC-3        36.91 +/- 0.30     99.2
+ePC-4        35.84 +/- 0.28     107.1
+ePC-5        34.99 +/- 0.36     113.5
+ePC-6        34.35 +/- 0.44     119.2
+ePC-7        33.86 +/- 0.42     126.0
+ePC-8        33.44 +/- 0.38     132.7
+ePC-9        33.02 +/- 0.43     138.9
+ePC-10       32.71 +/- 0.49     146.4
+ePC-16       31.81 +/- 0.54     185.4
+ePC-32       30.93 +/- 0.58     292.0
+ePC-64       30.89 +/- 0.57     505.5
+ePC-128      31.12 +/- 0.59     933.2
+ePC-160      31.15 +/- 0.59     1146.1
+
+python examples/epc_spc_resnet18_compare.py --mode sweep --n_trials 5 --epc_eta 0.001
+--- Per-arm results (mean +/- SE over trials) ---
+arm          accuracy%          train time (s)    
+sPC-120      34.64 +/- 0.65     977.7
+ePC-1        38.84 +/- 0.33     84.8
+ePC-2        38.83 +/- 0.35     93.3
+ePC-3        38.78 +/- 0.34     99.2
+ePC-4        38.74 +/- 0.34     107.1
+ePC-5        38.70 +/- 0.34     113.7
+ePC-6        38.65 +/- 0.34     120.7
+ePC-7        38.65 +/- 0.34     126.3
+ePC-8        38.60 +/- 0.35     132.9
+ePC-9        38.55 +/- 0.35     140.3
+ePC-10       38.49 +/- 0.34     147.2
+ePC-16       38.18 +/- 0.37     185.3
+ePC-32       36.68 +/- 0.29     293.7
+ePC-64       34.25 +/- 0.42     510.5
+ePC-128      32.29 +/- 0.54     940.8
+ePC-160      31.83 +/- 0.52     1154.1
+
+python examples/epc_spc_resnet18_compare.py --mode sweep --n_trials 5 --epc_eta 0.0001
+--- Per-arm results (mean +/- SE over trials) ---
+arm          accuracy%          train time (s)    
+sPC-120      34.64 +/- 0.65     990.2
+ePC-1        38.77 +/- 0.34     84.8
+ePC-2        38.83 +/- 0.32     93.0
+ePC-3        38.84 +/- 0.34     100.5
+ePC-4        38.83 +/- 0.34     107.6
+ePC-5        38.83 +/- 0.34     114.4
+ePC-6        38.84 +/- 0.33     121.0
+ePC-7        38.85 +/- 0.33     127.6
+ePC-8        38.85 +/- 0.33     133.8
+ePC-9        38.82 +/- 0.32     141.9
+ePC-10       38.81 +/- 0.33     148.1
+ePC-16       38.83 +/- 0.35     188.3
+ePC-32       38.78 +/- 0.34     297.8
+ePC-64       38.65 +/- 0.35     518.5
+ePC-128      38.34 +/- 0.33     960.7
+ePC-160      38.16 +/- 0.36     1175.5

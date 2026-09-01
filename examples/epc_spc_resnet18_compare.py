@@ -61,9 +61,9 @@ that checkpoint's E* table.
 
 Usage:
     python examples/epc_spc_resnet18_compare.py --mode convergence \
-        --epc_eta 0.001,0.01,0.03,0.1
+        --epc_eta 0.001,0.01,0.1
     python examples/epc_spc_resnet18_compare.py --mode convergence \
-        --epc_eta 0.01,0.1 --log_train_percent 50,100
+        --epc_eta 0.001,0.01,0.1 --log_train_percent 0,10,50,100
     python examples/epc_spc_resnet18_compare.py --mode sweep --n_trials 5
 
 Convergence results (RTX 3090, cuda13; batch 256, 120 tracked steps,
