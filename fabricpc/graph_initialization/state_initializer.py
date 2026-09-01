@@ -217,6 +217,16 @@ class FeedforwardStateInit(StateInitBase):
     4. Clamps override computed values
 
     Requires params to be provided to compute projections.
+
+    The resulting zero-initial-energy invariant (z_latent = z_mu at every
+    unclamped node) holds exactly only when this initialization and the
+    inference that consumes it run in the same compiled program. On GPU at
+    default matmul precision, separate programs can select different cuDNN
+    conv algorithms (TF32 vs FP32, per conv shape), so a jitted inference
+    step over an eagerly initialized state records the squared difference
+    between the two conv paths (up to ~1e-3) as a node's initial energy.
+    For probes that read per-step energies, use
+    ``fabricpc.utils.dashboarding.inference_tracking.make_tracked_probe``.
     """
 
     def __init__(self):

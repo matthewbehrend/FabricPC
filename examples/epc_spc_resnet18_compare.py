@@ -29,7 +29,10 @@ follow-up run, e.g. ``contrasts=[("ePC-8", "sPC-120")]``.
 
 ``--mode convergence`` — single seed, no training: identical params and
 initial state for all solvers on one test batch, tracked with
-``run_inference_with_history``. Reports **per-node** energy-vs-step (total
+``make_tracked_probe`` (state init and tracked inference compiled into one
+XLA program, so every unclamped node starts at exactly zero energy; split
+programs can select different cuDNN conv algorithms and record a phantom
+step-0 energy). Reports **per-node** energy-vs-step (total
 energy is dominated by output-adjacent nodes — the energy imbalance in
 Pinchetti et al., arXiv 2407.01163 — so a global curve can read as sPC
 near-convergence while deep nodes have received no signal), the E*
@@ -100,7 +103,7 @@ from fabricpc.experiments import ExperimentArm, PlannedMultiContrastExperiment
 from fabricpc.graph_initialization.state_initializer import initialize_graph_state
 from fabricpc.training import evaluate, make_train_step, train
 from fabricpc.utils.data.dataloader import Cifar10Loader
-from fabricpc.utils.dashboarding.inference_tracking import run_inference_with_history
+from fabricpc.utils.dashboarding.inference_tracking import make_tracked_probe
 from fabricpc import setup_jax
 
 # Load the demo module directly (avoids triggering examples/__init__.py).
@@ -499,20 +502,13 @@ def _train_with_checkpoints(
     )
     opt_state = optimizer.init(params)
     step_fn = make_train_step(train_structure, optimizer)
-    tracked = jax.jit(
-        lambda p, s: run_inference_with_history(p, s, probe_clamps, track_structure)
-    )
     probe_batch_size = next(iter(probe_clamps.values())).shape[0]
+    tracked_probe = make_tracked_probe(
+        track_structure, probe_clamps, probe_key, probe_batch_size
+    )
 
     def log_probe(current_params):
-        init_state = initialize_graph_state(
-            track_structure,
-            probe_batch_size,
-            probe_key,
-            clamps=probe_clamps,
-            params=current_params,
-        )
-        _, metrics = tracked(current_params, init_state)
+        _, metrics = tracked_probe(current_params)
         jax.block_until_ready(metrics)
         return jax.tree_util.tree_map(np.asarray, metrics)
 
@@ -581,6 +577,12 @@ def run_convergence(args):
         base_structure.task_map["y"]: jnp.asarray(labels_onehot),
     }
 
+    # Timing-only init state: _time_min measures run_inference wall-clock, so
+    # init stays outside the timed program. The tracked histories come from
+    # make_tracked_probe instead, which compiles init and inference into one
+    # XLA program — split programs can select different cuDNN conv algorithms
+    # (TF32 vs FP32, per conv shape), recording the squared difference between
+    # the two conv paths as a phantom step-0 energy on unclamped nodes.
     init_state = initialize_graph_state(
         base_structure, batch_size, state_key, clamps=clamps, params=params
     )
@@ -596,12 +598,8 @@ def run_convergence(args):
         structure = base_structure._replace(
             config={**base_structure.config, "inference": solver}
         )
-        tracked = jax.jit(
-            lambda p, s, structure=structure: run_inference_with_history(
-                p, s, clamps, structure
-            )
-        )
-        _, metrics = tracked(params, init_state)  # warmup + result
+        tracked_probe = make_tracked_probe(structure, clamps, state_key, batch_size)
+        _, metrics = tracked_probe(params)  # warmup + result
         jax.block_until_ready(metrics)
         histories[label] = jax.tree_util.tree_map(np.asarray, metrics)
 

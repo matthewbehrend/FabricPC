@@ -106,6 +106,36 @@ def run_inference_with_history(
     return state, all_metrics
 
 
+def make_tracked_probe(
+    structure: GraphStructure,
+    clamps: Dict[str, jnp.ndarray],
+    rng_key: jax.Array,
+    batch_size: int,
+) -> Callable[[GraphParams], Tuple[GraphState, Dict[str, Dict[str, jnp.ndarray]]]]:
+    """Jitted ``params -> (final_state, stacked_metrics)`` probe.
+
+    Compiles ``initialize_graph_state`` and ``run_inference_with_history``
+    into one XLA program. Splitting them — eager init, jitted tracking —
+    breaks the feedforward-init invariant on GPU: at default matmul
+    precision the two programs can select different cuDNN conv algorithms
+    (TF32 vs FP32, per conv shape), so an unclamped node records the squared
+    difference between the two conv paths (up to ~1e-3) as its step-0
+    energy instead of 0.
+
+    The returned callable takes only ``params`` and reuses the compiled
+    program across calls; ``clamps`` and ``rng_key`` are fixed at creation.
+    """
+
+    def _probe(params, clamps):
+        init_state = initialize_graph_state(
+            structure, batch_size, rng_key, clamps=clamps, params=params
+        )
+        return run_inference_with_history(params, init_state, clamps, structure)
+
+    probe = jax.jit(_probe)
+    return lambda params: probe(params, clamps)
+
+
 def _unstack_metrics(
     stacked_metrics: Dict[str, Dict[str, jnp.ndarray]],
     collect_every: int = 1,

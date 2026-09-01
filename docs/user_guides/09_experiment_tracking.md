@@ -231,6 +231,29 @@ for epoch in range(num_epochs):
 tracker.close()
 ```
 
+### Standalone inference probes with `make_tracked_probe`
+#### TODO: migrate this to new callback API
+To record per-step energies on a fixed batch without training,
+`make_tracked_probe` returns a jitted `params -> (final_state,
+stacked_metrics)` callable that compiles `initialize_graph_state` and
+`run_inference_with_history` into one XLA program. Keep them together:
+initializing eagerly and tracking under `jax.jit` runs the same convolutions
+in two separately compiled programs, which on GPU at default precision can
+select different cuDNN algorithms (TF32 vs FP32, per conv shape) — unclamped
+nodes then record the squared difference between the two paths (up to ~1e-3)
+as their step-0 energy instead of 0.
+
+```python
+from fabricpc.utils.dashboarding import make_tracked_probe
+
+probe = make_tracked_probe(structure, clamps, rng_key, batch_size)
+final_state, stacked_metrics = probe(params)  # reuse across param sets
+```
+
+`clamps` and `rng_key` are fixed at creation; calling the probe with new
+params (e.g. training checkpoints) reuses the compiled program, so recorded
+histories differ only in params.
+
 ## Metric Extractors
 
 Use extractors to get specific metrics from `GraphState` and `GraphParams`:
