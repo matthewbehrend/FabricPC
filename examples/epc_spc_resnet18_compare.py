@@ -784,7 +784,7 @@ def parse_args():
         "--epc_eta",
         type=str,
         default=None,
-        help="ePC inference rate (default: EPCInference's default, 1e-2; the "
+        help="ePC inference rate (default: EPCInference's default; the "
         "epsilon step descends the full-transfer-function gradient, so tune "
         "it like a weight learning rate). Convergence mode accepts a "
         "comma-separated list and reports one E* row per eta; sweep mode "

@@ -34,9 +34,9 @@ Includes cosine LR schedule with warmup and optional data augmentation
 (random horizontal flip + random crop with padding).
 
 --inference selects the PC solver: epc (EPCInference, error-parameterized,
-default) or spc (state-based InferenceSGDNormClip). --eta_infer and
---infer_steps default to the selected solver's defaults (epc: 1e-2, 5;
-spc: 0.1, 120).
+default) or spc (state-based InferenceSGDNormClip). Unset --eta_infer and
+--infer_steps fall back to EPCInference's defaults for epc and to this
+demo's spc settings (0.1, 120).
 
 --trainer backprop trains the identical graph (muPC init and edge scaling
 included) with end-to-end autodiff instead of iterative PC inference;
@@ -172,10 +172,15 @@ def make_inference(args):
     """PC solver from --inference. Unset --eta_infer/--infer_steps fall back
     to the solver's defaults."""
     if args.inference == "epc":
-        return EPCInference(
-            eta_infer=0.001 if args.eta_infer is None else args.eta_infer,
-            infer_steps=1 if args.infer_steps is None else args.infer_steps,
-        )
+        overrides = {
+            k: v
+            for k, v in [
+                ("eta_infer", args.eta_infer),
+                ("infer_steps", args.infer_steps),
+            ]
+            if v is not None
+        }
+        return EPCInference(**overrides)
     else:
         return InferenceSGDNormClip(
             eta_infer=0.1 if args.eta_infer is None else args.eta_infer,
@@ -591,13 +596,13 @@ def parse_args():
         "--infer_steps",
         type=int,
         default=None,
-        help="Inference steps (default: 120 for spc, 5 for epc)",
+        help="Inference steps (default: 120 for spc, EPCInference's default for epc)",
     )
     parser.add_argument(
         "--eta_infer",
         type=float,
         default=None,
-        help="Inference rate (default: 0.1 for spc, 1e-2 for epc)",
+        help="Inference rate (default: 0.1 for spc, EPCInference's default for epc)",
     )
     parser.add_argument(
         "--lr", type=float, default=0.001, help="Learning rate (default: 0.001)"

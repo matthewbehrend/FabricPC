@@ -258,7 +258,7 @@ conv1 = ConvNode(
 | `shape` | `Tuple[int, ...]` | required | Output shape excluding batch: `(spatial..., C_out)` |
 | `name` | `str` | required | Node name |
 | `kernel_size` | `Tuple[int, ...]` | required | Window extent per spatial axis |
-| `stride` | `Tuple[int, ...]` | all ones | Step per spatial axis |
+| `stride` | `Tuple[int, ...]` | `None` | Step per spatial axis; `None` means 1 on every spatial axis |
 | `padding` | `str` or pairs | `"SAME"` | `"SAME"`, `"VALID"`, or explicit `(low, high)` pairs per spatial axis |
 | `activation` | `ActivationBase` | `ReLUActivation()` | Activation function |
 | `energy` | `EnergyFunctional` | `GaussianEnergy()` | Energy functional |
@@ -300,7 +300,7 @@ pool1 = MaxPool(
 | `shape` | `Tuple[int, ...]` | required | Output shape excluding batch: `(spatial..., C)` |
 | `name` | `str` | required | Node name |
 | `window_shape` | `Tuple[int, ...]` | required | Window extent per spatial axis |
-| `stride` | `Tuple[int, ...]` | `window_shape` | Step per spatial axis; the default gives non-overlapping windows |
+| `stride` | `Tuple[int, ...]` | `None` | Step per spatial axis; `None` uses `window_shape` (non-overlapping windows) |
 | `padding` | `str` or pairs | `"VALID"` | `"SAME"`, `"VALID"`, or explicit `(low, high)` pairs. Note: default differs from ConvNode's `"SAME"` |
 | `activation` | `ActivationBase` | `IdentityActivation()` | Activation function |
 | `energy` | `EnergyFunctional` | `GaussianEnergy()` | Energy functional |
@@ -335,7 +335,7 @@ avgpool = AvgPool(shape=(256,), name="avgpool", global_pool=True)
 | `shape` | `Tuple[int, ...]` | required | Output shape excluding batch. Rank-1 `(C,)` required when `global_pool=True`; construction raises `ValueError` otherwise |
 | `name` | `str` | required | Node name |
 | `window_shape` | `Tuple[int, ...]` | `None` | Window extent per spatial axis (windowed mode) |
-| `stride` | `Tuple[int, ...]` | `window_shape` | Step per spatial axis |
+| `stride` | `Tuple[int, ...]` | `None` | Step per spatial axis; `None` uses `window_shape` (non-overlapping windows) |
 | `padding` | `str` or pairs | `"VALID"` | `"SAME"`, `"VALID"`, or explicit `(low, high)` pairs |
 | `global_pool` | `bool` | `False` | Average over all spatial axes instead of windows |
 | `count_include_pad` | `bool` | `True` | Divide by the full window volume; `False` divides by the count of real (non-padding) elements |
@@ -376,7 +376,7 @@ block = TransformerBlock(
 | `energy` | `EnergyFunctional` | `GaussianEnergy()` | Energy functional |
 | `internal_activation` | `ActivationBase` | `GeluActivation()` | FFN internal activation |
 | `num_heads` | `int` | `8` | Number of attention heads |
-| `ff_dim` | `int` | `4 * embed_dim` | Feedforward hidden dimension |
+| `ff_dim` | `int` | `None` | Feedforward hidden dimension; `None` means `4 * embed_dim` |
 | `dropout_rate` | `float` | `0.0` | Dropout rate (currently unused) |
 | `pre_norm` | `bool` | `True` | Use pre-norm architecture |
 | `use_rope` | `bool` | `True` | Use Rotary Position Embeddings |

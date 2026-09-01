@@ -77,8 +77,8 @@ structure = graph(..., inference=inference)
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `eta_infer` | `float` | `1e-2` | Inference rate on ε — tune like a weight learning rate (see below) |
-| `infer_steps` | `int` | `5` | Number of inference iterations |
+| `eta_infer` | `float` | `1e-3` | Inference rate on ε — tune like a weight learning rate (see below) |
+| `infer_steps` | `int` | `1` | Number of inference iterations |
 | `latent_decay` | `float` | `0.0` | Weight decay on the relaxed errors |
 
 **Update rule (per step):**
@@ -90,7 +90,7 @@ error_new = error * (1 - eta * latent_decay) - eta * latent_grad
 
 A segment starts with `begin_segment` — one forward pass at the carried latents setting ε := z_latent − z_mu, so relaxation continues exactly from the incoming state (the initializer's output or a previous segment's latents) — and ends with `finalize_state`, one detached derive so the returned state satisfies z_latent = z_mu + ε with energies at the final point.
 
-The ε gradient is taken through the full network's transfer function — a change in one node's ε moves every downstream derived latent — so `eta_infer` must be tuned like a weight learning rate, not like sPC's local per-node rate. Measured on the resnet18/CIFAR-10 convergence (`examples/epc_spc_resnet18_compare.py --mode convergence`), reaching sPC's final recorded total energy (120-step run) took 104 ε updates at 1e-3, 11 at 1e-2, 4 at 3e-2, and 1 at 0.1. The default is 1e-2 rather than the fastest measured rate: one batch on one architecture is thin evidence for 0.1's stability across models, and 1e-2 already converges in about a dozen updates.
+The ε gradient is taken through the full network's transfer function — a change in one node's ε moves every downstream derived latent — so `eta_infer` must be tuned like a weight learning rate, not like sPC's local per-node rate.
 
 On cyclic graphs, ePC minimizes the unrolled approximation of the graph energy fixed by `graph(..., unroll=U)`; state-based solvers minimize the exact graph energy as-is. Memory: each ePC step's single reverse pass stores activations for the whole derived forward (depth × unroll), backprop-scale rather than sPC's per-node closures.
 
@@ -118,16 +118,16 @@ Schedules nest, and `segments()` flattens them for per-step consumers (tracking 
 ## Tuning Guidance
 
 | Parameter | Typical Range | Notes |
-|-----------|:------------:|-------|
-| `eta_infer` (state-based) | 0.01–0.2 | A per-node rate; lower for stability, higher for faster convergence |
-| `eta_infer` (EPCInference) | ~1e-2 | A global rate through the whole transfer function; tune like a weight learning rate |
-| `infer_steps` (state-based) | 10–50 | More steps = better convergence, slower training |
-| `infer_steps` (EPCInference) | 3–10 | One reverse pass per step reaches every layer |
-| `latent_decay` | 0.0 | Rarely needed; try 0.001 if latents drift |
-| `max_norm` | 0.5–2.0 | For InferenceSGDNormClip; prevents gradient explosions |
+|-----------|:-------------:|-------|
+| `eta_infer` (state-based) |   0.01–0.2    | A per-node rate; lower for stability, higher for faster convergence |
+| `eta_infer` (EPCInference) |   1e-5–1e-2   | A global rate through the whole transfer function; tune like a weight learning rate |
+| `infer_steps` (state-based) |  ~5 * depth   | More steps = better convergence, slower training |
+| `infer_steps` (EPCInference) |      1–5      | One reverse pass per step reaches every layer |
+| `latent_decay` |      0.0      | Rarely needed; try 0.001 if latents drift |
+| `max_norm` |    0.5–2.0    | For InferenceSGDNormClip; prevents gradient explosions |
 
 For deep networks (>10 layers), consider:
-- Increasing `infer_steps` to `max(20, 4 * num_layers)`
+- Increasing `infer_steps` to `max(20, 5 * num_layers)`
 - Using `InferenceSGDNormClip` for stability
 
 ## Creating Custom Inference Algorithms
