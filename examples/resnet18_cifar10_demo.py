@@ -13,10 +13,16 @@ Architecture (CIFAR-10 variant — no 7x7 conv or maxpool):
     -> Stage 4: 2 residual blocks (4,4,256)
     -> GlobalAvgPool -> Linear(10, softmax+CE)
 
-Each residual block:
-    x -> conv_a(3x3, act) -> conv_b(3x3, act) -> skip(sum)
+Each residual block (3 nodes; +1 when the skip path needs a projection):
 
-Skip connections use SkipConnection (same dims) or 1x1 conv (downsample).
+    x ---> conv_a(3x3, act) ---> conv_b(3x3, act) ---> skip_sum ---> out
+    |                                                     ^
+    +------------[identity or conv_skip(1x1)]-------------+
+
+The skip stream enters the SkipConnection's unscaled "skip" slot as a direct
+edge when shapes match; the first block of stages 2-4 (stride 2, channel
+doubling) inserts a 1x1 projection ConvNode (conv_skip) on that edge, which
+is why the graph has 31 nodes rather than 28.
 
 Supports multiple activation functions (--activation):
     relu      — baseline, fast but dead neurons during PC inference
@@ -27,30 +33,77 @@ Supports multiple activation functions (--activation):
 Includes cosine LR schedule with warmup and optional data augmentation
 (random horizontal flip + random crop with padding).
 
+--inference selects the PC solver: epc (EPCInference, error-parameterized,
+default) or spc (state-based InferenceSGDNormClip). --eta_infer and
+--infer_steps default to the selected solver's defaults (epc: 1e-2, 5;
+spc: 0.1, 120).
+
 --trainer backprop trains the identical graph (muPC init and edge scaling
 included) with end-to-end autodiff instead of iterative PC inference;
---eta_infer and --infer_steps have no effect in that mode.
+--inference, --eta_infer, and --infer_steps have no effect in that mode.
+
+--n_trials N runs N independent trials (trial i uses seed 42 + i*1000 for
+graph init, training, evaluation, and data shuffling) and reports per-trial
+accuracy plus mean +/- SE.
 
 Usage:
-    python examples/resnet18_cifar10_demo.py                      # 2-epoch smoke test
+    python examples/resnet18_cifar10_demo.py                      # 2-epoch ePC smoke test
+    python examples/resnet18_cifar10_demo.py --inference spc      # state-based PC solver
     python examples/resnet18_cifar10_demo.py --activation gelu    # with gelu instead of relu
     python examples/resnet18_cifar10_demo.py --trainer backprop   # backprop baseline on the same model
+    python examples/resnet18_cifar10_demo.py --n_trials 3         # 3 trials, mean +/- SE summary
     python examples/resnet18_cifar10_demo.py --num_epochs 100 --eval_every 10 --augment --activation gelu # full training with augmentation and gelu activation
 
 
 Results (RTX3090, cuda13, jax 0.10.2; can vary a few points in accuracy across
 jax versions and hardware, from sensitivity to floating point rounding)
 
-python examples/resnet18_cifar10_demo.py  # smoke test
+Smoke Test (2 epochs)
+python examples/resnet18_cifar10_demo.py --inference spc
 Model: 31 nodes, 38 edges
 Total parameters: 2,795,210
 Train energy: 0.4792
 Test Accuracy: 33.71%
 Training time: 952.3s (476.2s per epoch)
 
+sPC Results:
+# run in process
+
+
+ePC Results:
+Trainer: pc  |  Inference: epc (eta 0.001, 1 steps)  |  Activation: gelu  |  Epochs: 100  |  LR: 0.001  |  Augment: True
+  Epoch 10: accuracy=55.83%
+  Epoch 20: accuracy=63.59%
+  Epoch 30: accuracy=68.87%
+  Epoch 40: accuracy=70.68%
+  Epoch 50: accuracy=72.59%
+  Epoch 60: accuracy=75.31%
+  Epoch 70: accuracy=75.19%
+  Epoch 80: accuracy=76.47%
+  Epoch 90: accuracy=76.45%
+  Epoch 100: accuracy=76.73%
+Training time: 1102.0s (11.0s per epoch)
+Final evaluation...
+Test Accuracy: 76.73%
+
+
+Run a sweep:
+for eta in 0.001 0.01; do
+for steps in 1 2 5; do
+  python examples/resnet18_cifar10_demo.py \
+    --num_epochs 100 --eval_every 10 \
+    --augment --activation gelu \
+    --eta_infer "$eta" --infer_steps "$steps" \
+    2>&1 | tee "sweep_eta${eta}_steps${steps}.log"
+done
+done
+
+Collect the results afterwards:
+grep -H "Test Accuracy" sweep_eta*_steps*.log
+
+Backprop reference:
 python examples/resnet18_cifar10_demo.py --num_epochs 100 --eval_every 10 --augment --activation gelu --trainer backprop
 Trainer: backprop  |  Activation: gelu  |  Epochs: 100  |  LR: 0.001  |  Augment: True
-Training for 100 epochs (JIT compilation on first batch)...
   Epoch 10: accuracy=56.21%
   Epoch 20: accuracy=63.77%
   Epoch 30: accuracy=69.02%
@@ -74,7 +127,7 @@ import time
 from fabricpc.nodes import ConvNode, Linear, IdentityNode, SkipConnection, AvgPool
 from fabricpc.core.topology import Edge
 from fabricpc.graph_assembly import TaskMap, graph
-from fabricpc.core import InferenceSGDNormClip
+from fabricpc.core import EPCInference, InferenceSGDNormClip
 from fabricpc.graph_initialization import initialize_params
 from fabricpc.core.activations import (
     IdentityActivation,
@@ -113,6 +166,22 @@ def get_activation(name):
     if name not in factories:
         raise ValueError(f"Unknown activation: {name}. Choose from {list(factories)}")
     return factories[name]()
+
+
+def make_inference(args):
+    """PC solver from --inference. Unset --eta_infer/--infer_steps fall back
+    to the solver's defaults."""
+    if args.inference == "epc":
+        return EPCInference(
+            eta_infer=0.001 if args.eta_infer is None else args.eta_infer,
+            infer_steps=1 if args.infer_steps is None else args.infer_steps,
+        )
+    else:
+        return InferenceSGDNormClip(
+            eta_infer=0.1 if args.eta_infer is None else args.eta_infer,
+            infer_steps=120 if args.infer_steps is None else args.infer_steps,
+            max_norm=1.0,
+        )
 
 
 def make_optimizer(lr, weight_decay, num_epochs, steps_per_epoch):
@@ -380,8 +449,8 @@ def _create_mupc_model(rng_key, *, inference, activation=ReLUActivation()):
 # =============================================================================
 
 
-def run_single_mupc(args):
-    """Default mode: single muPC training run with progress bar."""
+def run_trial(args, trial_seed):
+    """One muPC training trial: build, train, evaluate. Returns eval metrics."""
     activation = get_activation(args.activation)
 
     if args.trainer == "backprop":
@@ -391,23 +460,28 @@ def run_single_mupc(args):
         trainer_label = "Predictive Coding"
         trainer_mode = "pc"
 
+    inference = make_inference(args)
+    inference_desc = (
+        f"{args.inference} (eta {inference.config['eta_infer']:g}, "
+        f"{inference.config['infer_steps']} steps)"
+    )
+
     print("=" * 60)
     print(f"ResNet-18 on CIFAR-10 ({trainer_label} + muPC)")
     print("=" * 60)
     print(
-        f"Trainer: {args.trainer}  |  Activation: {args.activation}  |  "
-        f"Epochs: {args.num_epochs}  |  LR: {args.lr}  |  Augment: {args.augment}"
+        f"Trainer: {args.trainer}  |  Inference: {inference_desc}  |  "
+        f"Activation: {args.activation}  |  Epochs: {args.num_epochs}  |  "
+        f"LR: {args.lr}  |  Augment: {args.augment}"
     )
 
-    master_rng_key = jax.random.PRNGKey(42)
+    master_rng_key = jax.random.PRNGKey(trial_seed)
     graph_key, train_key, eval_key = jax.random.split(master_rng_key, 3)
 
     # Build model
     params, structure = _create_mupc_model(
         graph_key,
-        inference=InferenceSGDNormClip(
-            eta_infer=args.eta_infer, infer_steps=args.infer_steps, max_norm=1.0
-        ),
+        inference=inference,
         activation=activation,
     )
 
@@ -419,10 +493,10 @@ def run_single_mupc(args):
 
     # Data
     base_train_loader = Cifar10Loader(
-        "train", batch_size=args.batch_size, shuffle=True, seed=42
+        "train", batch_size=args.batch_size, shuffle=True, seed=trial_seed
     )
     if args.augment:
-        train_loader = AugmentedCifar10Loader(base_train_loader, seed=42)
+        train_loader = AugmentedCifar10Loader(base_train_loader, seed=trial_seed)
     else:
         train_loader = base_train_loader
     test_loader = Cifar10Loader("test", batch_size=args.batch_size, shuffle=False)
@@ -489,6 +563,7 @@ def run_single_mupc(args):
         algorithm=trainer_mode,
     )
     print(f"Test Accuracy: {metrics['accuracy'] * 100:.2f}%")
+    return metrics
 
 
 # =============================================================================
@@ -504,13 +579,25 @@ def parse_args():
         "--num_epochs", type=int, default=2, help="Training epochs (default: 2)"
     )
     parser.add_argument(
+        "--n_trials",
+        type=int,
+        default=1,
+        help="Number of independent training trials (default: 1)",
+    )
+    parser.add_argument(
         "--batch_size", type=int, default=256, help="Batch size (default: 256)"
     )
     parser.add_argument(
-        "--infer_steps", type=int, default=120, help="Inference steps (default: 120)"
+        "--infer_steps",
+        type=int,
+        default=None,
+        help="Inference steps (default: 120 for spc, 5 for epc)",
     )
     parser.add_argument(
-        "--eta_infer", type=float, default=0.1, help="Inference rate (default: 0.1)"
+        "--eta_infer",
+        type=float,
+        default=None,
+        help="Inference rate (default: 0.1 for spc, 1e-2 for epc)",
     )
     parser.add_argument(
         "--lr", type=float, default=0.001, help="Learning rate (default: 0.001)"
@@ -526,11 +613,19 @@ def parse_args():
         help="Training algorithm: pc (predictive coding, default) or backprop",
     )
     parser.add_argument(
+        "--inference",
+        type=str,
+        default="epc",
+        choices=["epc", "spc"],
+        help="PC inference solver: epc (error-parameterized, default) or "
+        "spc (state-based InferenceSGDNormClip); unused with --trainer backprop",
+    )
+    parser.add_argument(
         "--activation",
         type=str,
         default="gelu",
         choices=["relu", "tanh", "gelu", "leaky_relu"],
-        help="Activation function for hidden layers (default: relu)",
+        help="Activation function for hidden layers (default: gelu)",
     )
     parser.add_argument(
         "--augment",
@@ -541,7 +636,7 @@ def parse_args():
         "--eval_every",
         type=int,
         default=0,
-        help="Evaluate on test set every N epochs (0 to disable; default: 10)",
+        help="Evaluate on test set every N epochs (0 to disable; default: 0)",
     )
     parser.add_argument("--verbose", action="store_true", help="Print per-epoch output")
     return parser.parse_args()
@@ -549,7 +644,25 @@ def parse_args():
 
 def main():
     args = parse_args()
-    run_single_mupc(args)
+    accuracies = []
+    for trial_idx in range(args.n_trials):
+        trial_seed = 42 + trial_idx * 1000
+        if args.n_trials > 1:
+            print(
+                f"\n--- Trial {trial_idx + 1}/{args.n_trials} (seed={trial_seed}) ---"
+            )
+        metrics = run_trial(args, trial_seed)
+        accuracies.append(metrics["accuracy"])
+
+    if args.n_trials > 1:
+        acc = np.array(accuracies) * 100
+        se = acc.std(ddof=1) / np.sqrt(args.n_trials)
+        print("\n" + "=" * 60)
+        print(
+            f"Accuracy over {args.n_trials} trials: "
+            + ", ".join(f"{a:.2f}%" for a in acc)
+        )
+        print(f"Mean: {acc.mean():.2f}% +/- {se:.2f}% (SE)")
 
 
 if __name__ == "__main__":
