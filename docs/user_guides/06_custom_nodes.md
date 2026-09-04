@@ -261,7 +261,7 @@ Within that constraint, every `forward()` must perform these five steps in order
 2. **Compute the error**: `error = state.z_latent - z_mu`. The energy functionals assume this sign (latent minus prediction).
 3. **Write the fields back**: `state = state._replace(z_mu=..., error=...)`. `NodeState` is a fixed-schema NamedTuple (`z_latent, z_mu, error, energy, latent_grad`); no other fields exist or may be added.
 4. **Populate energy**: `node_class = node_info.node_class; state = node_class.energy_functional(state, node_info)`. This sets `state.energy` from `energy(z_latent, z_mu)`, so `z_mu` must already be set. Extra energy terms (for example the Hopfield attractor term in `StorkeyHopfield`) are added by replacing `state.energy` after this call.
-5. **Return**: the updated `NodeState`. The `energy` field stays per-sample (shape `(batch,)`); summation over the batch dimension is owned by `forward_and_latent_grads()`/`forward_and_weight_grads()`, which need the resulting scalar for autodiff.
+5. **Return**: the updated `NodeState`. The `energy` field stays per-sample (shape `(batch,)`); summation over the batch dimension is owned by `forward_and_latent_grads()`/`forward_and_weight_grads()`, which need the resulting scalar for autodiff. The weight gradients therefore leave the node batch-summed; the trainer's `pc_weight_gradients` divides them once by the prediction count (`grad_denominator`) before they reach the optimizer.
 
 The steps *between* predicting `z_mu` and writing it back are free: input aggregation, weights and biases, the choice of activation, and any internal sub-structure are all node-specific.
 
@@ -355,7 +355,7 @@ The mixin provides:
 
 1. **In-degree-0 nodes are handled specially**, without calling `forward()`: `z_mu <- z_latent` (cast to `z_mu`'s dtype); error and all gradients are zero; energy is `E(z_latent, z_latent)` from the node's energy functional.
 2. **Every node with in-degree > 0 goes through `forward()`**. For unclamped out-degree-0 nodes the forward's `z_mu` is kept and written into `z_latent` (outputs track predictions in evaluation mode); error, energy, and all gradients are zeroed.
-3. **The per-sample `state.energy` (shape `(batch,)`) is summed over the batch dimension** to a scalar.
+3. **The per-sample `state.energy` (shape `(batch,)`) is summed over the batch dimension** to a scalar. The resulting weight gradients are batch sums; `fabricpc.training.pc_weight_gradients` divides them once by the prediction count so the optimizer sees means per prediction.
 4. **`jax.value_and_grad` differentiates that scalar** w.r.t. the input tensors and `z_latent`.
 
 It returns `(NodeState, input_grads, self_grad)`: the updated state, gradients w.r.t. each input edge (dE/d_input, unscaled), and this node's dE/dz_latent contribution (unscaled). muPC scaling and accumulation into `state.latent_grad` are handled by the callsite (the inference loop).

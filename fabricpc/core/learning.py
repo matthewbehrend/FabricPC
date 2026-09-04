@@ -15,13 +15,22 @@ def compute_local_weight_gradients(
     muPC scaling is applied here (pre-scale inputs, post-scale weight
     gradients), keeping node methods (forward_and_weight_grads) scaling-unaware.
 
+    The returned gradients are batch-summed: each node's
+    ``forward_and_weight_grads`` differentiates the sum of its per-sample
+    energies over the batch. Sums are associative, so they survive data
+    sharding and gradient accumulation unchanged. The trainer's
+    ``fabricpc.training.pc_weight_gradients`` divides them once by the
+    prediction count ``fabricpc.training.grad_denominator``, whose docstring
+    carries the rule for microbatching and padded positions. Optimizer-facing
+    callers use that function; this one serves inspection and composition.
+
     Args:
         params: Current model parameters
         final_state: Converged state after inference
         structure: Graph structure
 
     Returns:
-        GraphParams containing gradients for the parameters
+        GraphParams containing batch-summed gradients for the parameters
     """
     gradients = {}
 

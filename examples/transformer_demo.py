@@ -20,16 +20,16 @@ Usage:
     python examples/transformer_demo.py --mode backprop --lr 1e-3 --num_epochs 3
     python examples/transformer_demo.py --mode pc --num_blocks 2
 
-Results: PC training (cuda13, rtx3090, jax 0.10.2, can vary a few points in perplexity in different jax versions / hardware due to sensitivity to floating point rounding)
-Final train energy: 352.9587
-Test loss: 2.6988, Perplexity: 14.86
+Results: PC training (cuda13, rtx3090, jax 0.10.1, can vary a few points in perplexity in different jax versions / hardware due to sensitivity to floating point rounding)
+Final train energy: 2.2656 (internal energy per token)
+Test loss: 2.6846, Perplexity: 14.65
 Prompt: 'ROMEO: '
 ----------------------------------------
-ROMEO: hooofo!eoooraoathe o
+ROMEO: hirifo!Borerenoooroo
 ----------------------------------------
 
-Backprop Training
-Test loss: 1.8867, Perplexity: 6.60
+Backprop Training (python examples/transformer_demo.py --mode backprop)
+Test loss: 1.8846, Perplexity: 6.58
 Prompt: 'ROMEO: '
 ----------------------------------------
 ROMEO: his.fe!
@@ -133,9 +133,22 @@ def parse_args():
     parser.add_argument(
         "--eta_infer", type=float, default=0.1, help="PC inference step size"
     )
-    parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate")
+    parser.add_argument(
+        "--lr",
+        type=float,
+        default=None,
+        help="Peak learning rate (default: 3e-5 for pc, 1e-4 for backprop)",
+    )
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.lr is None:
+        # Gradients are means per token, so the 0.8 clip no longer normalizes
+        # every PC step as it did on batch-summed gradients; at 1e-4 the PC
+        # run destabilized after ~3500 steps, and 3e-5 holds the full epoch
+        # (perplexity 14.65 vs 14.86 before the normalization). Backprop is
+        # unaffected by the rescale and keeps 1e-4.
+        args.lr = 3e-5 if args.mode == "pc" else 1e-4
+    return args
 
 
 # --- Model Configuration ---
@@ -523,9 +536,10 @@ def main(args=None):
                 params, opt_state, metrics, final_state = train_step(
                     params, opt_state, batch, batch_keys[batch_idx]
                 )
-                # PC tracks the settling objective (per-sample internal
-                # energy); backprop tracks the per-token cross-entropy
-                # (target_energy under CrossEntropyEnergy).
+                # PC tracks the settling objective (internal energy per
+                # token); backprop tracks the per-token cross-entropy
+                # (target_energy under CrossEntropyEnergy). Both are means
+                # over the batch's B * seq_len prediction positions.
                 loss_val = float(
                     metrics["energy"] if use_pc else metrics["target_energy"]
                 )

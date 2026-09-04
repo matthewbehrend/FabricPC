@@ -13,11 +13,18 @@ in exactly three places inside the step:
                       run_inference (settle)               FeedforwardStateInit (single
                                                            forward pass, no inference)
     4 objective       graph_energy over all in_degree>0    graph_energy over target nodes
-                      nodes / batch                        / batch (same function,
+                      nodes / N                            / N (same function,
                                                            different node subset)
-    5 gradients       compute_local_weight_gradients       jax.value_and_grad over steps
-                      (local, per node)                    3-4 (global)
+    5 gradients       pc_weight_gradients (local, per      jax.value_and_grad over steps
+                      node, summed gradients / N)          3-4 (global)
     6 apply update    optax update + apply_updates         (shared)
+
+N is the prediction count from :func:`grad_denominator`: the total number of
+clamped-target prediction positions in the batch (``batch`` for
+classification, ``batch * seq`` for token targets). Both algorithms hand
+optax mean gradients per prediction, so one learning rate, clipping
+threshold, or Adam epsilon means the same under either algorithm and across
+batch sizes and sequence lengths.
 
 The backprop objective is the energy of the clamped target nodes — the
 negative log probability the output node's energy functional assigns to the
@@ -59,7 +66,7 @@ from tqdm.auto import tqdm as _tqdm_cls
 from fabricpc.core.energy import graph_energy
 from fabricpc.core.inference import run_inference
 from fabricpc.core.learning import compute_local_weight_gradients
-from fabricpc.core.types import GraphParams, GraphStructure
+from fabricpc.core.types import GraphParams, GraphState, GraphStructure
 from fabricpc.graph_initialization.state_initializer import (
     FeedforwardStateInit,
     initialize_graph_state,
@@ -281,19 +288,86 @@ def _target_node_names(structure, clamps):
     )
 
 
+def grad_denominator(structure: GraphStructure, clamps: Dict[str, jnp.ndarray]) -> int:
+    """Prediction count N: the single denominator that turns batch-summed
+    energies and weight gradients into means per prediction.
+
+    N is the total number of clamped-target prediction positions in the
+    batch, ``sum(prod(clamps[name].shape[:-1]))`` over the target nodes (the
+    clamped nodes with ``in_degree > 0``). The trailing axis of a target
+    clamp is the class axis: ``build_clamps`` validates every target clamp
+    against ``(batch, *node.shape)``, so rank >= 2 holds. A rank-2
+    classification target ``(B, C)`` gives N = B; a rank-3 token target
+    ``(B, S, V)`` gives N = B * S. With no clamped target (associative-memory
+    graphs) N is the batch size, read from the leading axis of the first
+    clamp. N is the per-batch total of the per-sample weight that
+    ``metrics._internal_energy_fn`` assigns in ``evaluate``, so the train and
+    eval ``energy`` share one scale. Empty ``clamps`` raises ``ValueError``:
+    nothing is clamped, so there is no objective.
+
+    A clamped input node that receives feedback edges has ``in_degree > 0``
+    and counts as a target under this rule. No graph in the repository does
+    this (the cyclic and lateral MNIST demos leave ``pixels`` edge-free on
+    the input side).
+
+    Gradients arrive batch-summed from ``compute_local_weight_gradients``
+    and are divided once by this global count, in ``pc_weight_gradients``.
+    If gradient accumulation over microbatches is added, keep that
+    structure: accumulate the unnormalized sums across microbatches and
+    divide once by the count summed over the whole accumulation window.
+    Dividing per microbatch and averaging overweights predictions in small
+    microbatches when token counts differ. If padded positions gain a
+    validity mask, replace the static shape product with ``jnp.sum(mask)``.
+    Under jit + ``NamedSharding`` (the trainer's data parallelism),
+    trace-time shapes and reductions are global, so this count is already
+    global; a ``shard_map``/``pmap`` port sees per-shard shapes and must
+    ``jax.lax.psum`` the per-shard count over the data axis.
+    """
+    if not clamps:
+        raise ValueError(
+            "grad_denominator: clamps is empty, so nothing is clamped and there "
+            "is no objective to normalize."
+        )
+    target_nodes = _target_node_names(structure, clamps)
+    if target_nodes:
+        return sum(math.prod(clamps[name].shape[:-1]) for name in target_nodes)
+    return next(iter(clamps.values())).shape[0]
+
+
+def pc_weight_gradients(
+    params: GraphParams,
+    state: GraphState,
+    structure: GraphStructure,
+    clamps: Dict[str, jnp.ndarray],
+) -> GraphParams:
+    """Local PC weight gradients as means per prediction: the batch-summed
+    gradients from ``compute_local_weight_gradients`` divided once by
+    ``grad_denominator(structure, clamps)``.
+
+    This is the PC path's optimizer-facing gradient. Custom loops call it in
+    place of ``compute_local_weight_gradients`` so that their learning rate,
+    clipping threshold, and Adam epsilon mean the same as in :func:`train`.
+    """
+    denom = grad_denominator(structure, clamps)
+    grads = compute_local_weight_gradients(params, state, structure)
+    return jax.tree_util.tree_map(lambda g: g / denom, grads)
+
+
 def _batch_grads(params, batch, structure, rng_key, *, algorithm):
     """Gradients and metrics for one batch — the only algorithm branch."""
     batch_size = _batch_size(batch, structure)
     clamps = build_clamps(batch, structure, clamp_target=True)
     target_nodes = _target_node_names(structure, clamps)
+    # Static at trace time; global under jit + NamedSharding.
+    denom = grad_denominator(structure, clamps)
 
     if algorithm == "pc":
         state = initialize_graph_state(
             structure, batch_size, rng_key, clamps=clamps, params=params
         )
         state = run_inference(params, state, clamps, structure)
-        energy = graph_energy(state, structure) / batch_size
-        grads = compute_local_weight_gradients(params, state, structure)
+        energy = graph_energy(state, structure) / denom
+        grads = pc_weight_gradients(params, state, structure, clamps)
     else:  # backprop
         if not target_nodes:
             raise ValueError(
@@ -306,28 +380,21 @@ def _batch_grads(params, batch, structure, rng_key, *, algorithm):
                 structure, batch_size, rng_key, clamps=clamps, params=p
             )
             return (
-                graph_energy(state, structure, node_names=target_nodes) / batch_size,
+                graph_energy(state, structure, node_names=target_nodes) / denom,
                 state,
             )
 
         (energy, state), grads = jax.value_and_grad(objective, has_aux=True)(params)
 
-    # Total prediction positions across target clamps: batch*seq for
-    # sequences, batch for classification. Shapes are static at trace time.
-    # The trailing axis is the class axis: build_clamps validates every
-    # target clamp against (batch, *node.shape), so rank >= 2 holds and this
-    # agrees with metrics._predictions_per_sample's per-sample weight.
-    n_predictions = sum(math.prod(clamps[name].shape[:-1]) for name in target_nodes)
     if target_nodes:
-        target_e = (
-            graph_energy(state, structure, node_names=target_nodes) / n_predictions
-        )
+        target_e = graph_energy(state, structure, node_names=target_nodes) / denom
     else:
         target_e = jnp.zeros(())
-    # Note the two keys use different normalizations: "energy" is per-sample
-    # (/ batch), "target_energy" per-prediction (/ batch*seq for sequences).
-    # "energy" is algorithm-dependent (all internal nodes for PC, target
-    # nodes only for backprop) — cross-algorithm comparison of it is invalid.
+    # Both keys are means per prediction over the same denominator. "energy"
+    # is the optimized objective; its node set is algorithm-dependent (all
+    # internal nodes for PC, target nodes only for backprop), so comparing it
+    # across algorithms compares different node sets. "target_energy" is the
+    # same quantity under both algorithms.
     metrics = {"energy": energy, "target_energy": target_e}
     return grads, metrics, state
 
@@ -366,8 +433,8 @@ def make_train_step(
 
     Returns ``step(params, opt_state, batch, rng_key) -> (params, opt_state,
     metrics, final_state)``. ``metrics`` is a dict of device scalars
-    (``"energy"``: the per-sample objective; ``"target_energy"``: target-node
-    energy per prediction). ``final_state`` is the settled (PC) or
+    (``"energy"``: the objective per prediction; ``"target_energy"``:
+    target-node energy per prediction). ``final_state`` is the settled (PC) or
     feedforward (backprop) GraphState — the escape hatch for dashboards.
     Inputs are NOT donated: callers may reuse the initial params.
 

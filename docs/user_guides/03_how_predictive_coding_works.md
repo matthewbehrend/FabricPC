@@ -66,7 +66,7 @@ The **learning loop** updates weights using gradients computed from the converge
 dE/dW ~ error * input_activity
 ```
 
-In FabricPC, local gradients are computed by `compute_local_weight_gradients`, then an Optax optimizer (e.g., Adam, SGD) applies the updates:
+In FabricPC, local gradients are computed by `compute_local_weight_gradients` (batch-summed), divided once by the batch's prediction count in the trainer's `pc_weight_gradients`, and then an Optax optimizer (e.g., Adam, SGD) applies the updates:
 
 ```python
 import optax

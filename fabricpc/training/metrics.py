@@ -16,7 +16,10 @@ A metric separates three concerns:
 
 ``default_metrics(structure, algorithm)`` derives the default metric set
 from the graph: the target node's own energy functional selects the loss and
-therefore the default eval metrics.
+therefore the default eval metrics. Every built-in metric weights a sample by
+its prediction positions (sequence length for token targets, 1 for
+classification), the same count the trainer divides by, so eval and training
+values share one per-prediction scale.
 """
 
 from typing import Any, Callable, Dict, List, NamedTuple, Tuple
@@ -61,20 +64,29 @@ def as_eval_metric(metric: Any) -> EvalMetric:
 # ---------------------------------------------------------------------------
 
 
-def _target_items(
+def _iter_target_items(
     structure: GraphStructure, batch: Dict[str, jnp.ndarray]
 ) -> List[Tuple[str, str]]:
-    """``(task_key, node_name)`` pairs for batch keys mapped to target nodes.
+    """``(task_key, node_name)`` pairs for batch keys mapped to target nodes;
+    empty when the batch carries no target key.
 
     A task key is a target iff its mapped node has ``in_degree > 0`` (source
     nodes carry inputs, not predictions).
     """
-    items = [
+    return [
         (key, structure.task_map[key])
         for key in batch
         if key in structure.task_map
         and structure.nodes[structure.task_map[key]].node_info.in_degree > 0
     ]
+
+
+def _target_items(
+    structure: GraphStructure, batch: Dict[str, jnp.ndarray]
+) -> List[Tuple[str, str]]:
+    """:func:`_iter_target_items`, raising when the batch has no target key:
+    the target metrics are undefined without one."""
+    items = _iter_target_items(structure, batch)
     if not items:
         raise ValueError(
             "No target task key: no batch key maps to an in_degree>0 node, so "
@@ -182,7 +194,10 @@ def _accuracy_fn(state, batch, structure):
 
 def _internal_energy_fn(state, batch, structure):
     """Per-sample energy summed over internal (``in_degree > 0``) nodes — the
-    same node set as the PC training objective; weight = 1 per sample.
+    same node set as the PC training objective; weight = prediction positions
+    per sample, summed over the batch's target keys (1 when the batch carries
+    no target key). The weights total the trainer's ``grad_denominator``, so
+    the eval ``energy`` is per prediction on the training objective's scale.
 
     Summation order matches :func:`fabricpc.core.energy.graph_energy`:
     ``structure.node_order`` first, then nodes the topological sort omitted
@@ -198,7 +213,12 @@ def _internal_energy_fn(state, batch, structure):
     value = jnp.zeros((state.batch_size,))
     for name in ordered:
         value = value + state.nodes[name].energy
-    return value, jnp.ones_like(value)
+    predictions = 0.0
+    for key, node_name in _iter_target_items(structure, batch):
+        y = _as_one_hot(batch[key], structure.nodes[node_name].node_info.shape[-1])
+        predictions += _predictions_per_sample(y)
+    weight = jnp.full_like(value, predictions if predictions > 0 else 1.0)
+    return value, weight
 
 
 # ---------------------------------------------------------------------------
@@ -217,7 +237,8 @@ def default_metrics(structure: GraphStructure, algorithm: str) -> Dict[str, Eval
 
     ``target_energy`` and ``accuracy`` always; ``cross_entropy`` and
     ``perplexity`` when a target node's energy functional is
-    ``CrossEntropyEnergy``; ``energy`` (per-sample internal energy) for PC.
+    ``CrossEntropyEnergy``; ``energy`` (internal energy per prediction, the
+    PC training objective's scale) for PC.
     Raises ``ValueError`` on a graph with no target task key — pass an
     explicit metrics dict to evaluate such a graph.
     """

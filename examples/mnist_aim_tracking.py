@@ -206,9 +206,9 @@ for epoch in range(num_epochs):
             stacked_history, collect_every=INFERENCE_COLLECT_EVERY
         )
 
-        # train_step_with_history returns the per-sample internal energy
-        # (graph_energy over in_degree>0 nodes / batch_size) — no further
-        # normalization needed.
+        # train_step_with_history returns the training objective per
+        # prediction (graph_energy over in_degree>0 nodes / prediction count,
+        # = batch_size for MNIST) — no further normalization needed.
         normalized_energy = float(energy)
         epoch_energies.append(normalized_energy)
 

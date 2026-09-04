@@ -190,8 +190,8 @@ for epoch in range(num_epochs):
             stacked_history, collect_every=collect_every
         )
 
-        # energy is already the per-sample objective (graph_energy over
-        # internal nodes / batch size) — no further normalization.
+        # energy is the objective per prediction (graph_energy over
+        # internal nodes / prediction count) — no further normalization.
         tracker.track_batch_energy(float(energy), epoch, batch_idx)
         tracker.track_batch_energy_per_node(final_state, structure, epoch, batch_idx)
 

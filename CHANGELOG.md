@@ -1,5 +1,56 @@
 # Changelog
 
+## [Unreleased]
+
+Gradients reaching optax are now means per prediction under both algorithms.
+The trainer divides the batch-summed PC weight gradients and the backprop
+objective once by one global prediction count N: the total number of
+clamped-target prediction positions in the batch (`batch` for classification,
+`batch * seq_len` for token targets, `batch` when the graph has no clamped
+target). One learning rate, clipping threshold, or Adam epsilon now means the
+same under `algorithm="pc"` and `"backprop"` and across batch sizes and
+sequence lengths. For rank-2 (classification) targets every reported number is
+unchanged; for sequence targets the PC `energy` metric moves from per sample
+to per token.
+
+### Migration table
+
+| Changed | Replacement |
+|---|---|
+| `compute_local_weight_gradients` fed directly to an optimizer in a custom loop (batch-summed gradients) | `pc_weight_gradients(params, state, structure, clamps)` — the same gradients divided by `grad_denominator(structure, clamps)` |
+| SGD-family learning rates tuned on summed PC gradients | multiply `lr` by N and divide a coupled `add_decayed_weights` rate by N (Adam/AdamW rates are unchanged) |
+| `scale_by_natural_gradient_diag(..., damping=1e-3)` / `scale_by_natural_gradient_layerwise(..., damping=1e-3)` | `relative_damping=0.1` (new, default) — damping as a fraction of the mean Fisher entry. `damping` stays as an absolute term but defaults to 0; an old value tuned on summed gradients becomes `damping / N**2`, and where it dominates the transform is SGD with rate `scale / damping` |
+| Training `energy` metric read as "per sample" | per prediction, on the same scale as `target_energy`; the node set is still algorithm-dependent |
+
+### New
+
+- `fabricpc.training.grad_denominator(structure, clamps) -> int` and
+  `fabricpc.training.pc_weight_gradients(params, state, structure, clamps)`.
+  The `grad_denominator` docstring carries the rule for future microbatch
+  accumulation and padding masks (accumulate sums, divide once by the global
+  count).
+- Natural-gradient transforms: bias-corrected Fisher EMA (the states gain a
+  `count` field), scale-free damping `g / (F + relative_damping * trace(F)/dim)`,
+  and a zero-denominator guard in place of an absolute floor. With
+  `damping = 0` the update is exactly covariant: scaling the gradients by c
+  scales the update by 1/c. Documented limitation: F is the squared mean
+  gradient, so `g / F` is about `1 / g`; with relative damping alone neither
+  transform trains the MNIST demo (48 settings tried); the demo presets keep
+  the parent's behavior through `relative_damping=0` and an absolute `damping`
+  that lies above 96.5% of the Fisher entries from the first step, so those
+  entries are updated as SGD and only the few large-gradient entries receive
+  the natural-gradient step.
+- `evaluate`'s default PC `energy` metric weights each sample by its
+  prediction count, so it reports internal energy per prediction and agrees
+  with the training `energy`.
+- `train_step_with_history` (dashboarding) reads the batch size from the
+  task-mapped keys and normalizes like the trainer; a parity test pins it to
+  `make_train_step`.
+- `examples/mnist_advanced.py` gains `--num_epochs`; its `sgd` preset is
+  rescaled exactly (`lr` 0.01 -> 2.0, weight decay 0.1 -> 5e-4 at N = 200)
+  and the two natural-gradient presets rescale exactly (`damping / N**2`,
+  `scale / N`, `relative_damping=0`).
+
 ## [0.5.0] - 2026-08-30
 One trainer replaces the four training harnesses. `train`/`evaluate` serve both
 learning algorithms, selected by `algorithm="pc"|"backprop"`; backprop is framed
