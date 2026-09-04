@@ -18,7 +18,8 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from fabricpc.core import EPCInference
+from conftest import inject_biases, with_inference
+from fabricpc.core import EPCInference, InferenceSGD
 from fabricpc.core.activations import IdentityActivation, TanhActivation
 from fabricpc.core.energy import CrossEntropyEnergy, GaussianEnergy
 from fabricpc.core.initializers import MuPCInitializer, NormalInitializer
@@ -31,6 +32,7 @@ from fabricpc.graph_initialization.state_initializer import initialize_graph_sta
 from fabricpc.nodes import Linear, StorkeyHopfield
 from fabricpc.nodes.identity import IdentityNode
 from fabricpc.utils import linear_pc_oracle as oracle
+from fabricpc.utils.dashboarding.inference_tracking import run_inference_with_history
 
 PLACEHOLDER = EPCInference(eta_infer=1e-3, infer_steps=1)
 
@@ -155,20 +157,6 @@ def _identity_cycle(unroll):
     )
 
 
-def _inject_biases(params, key, std=0.5):
-    """Linear.initialize_params zero-fills biases (nodes/linear.py:191), so
-    use_bias=True alone exercises nothing. Draw them here."""
-    nodes = {}
-    for i, (name, node_params) in enumerate(params.nodes.items()):
-        biases = dict(node_params.biases)
-        if "b" in biases and biases["b"].size > 0:
-            biases["b"] = std * jax.random.normal(
-                jax.random.fold_in(key, i), biases["b"].shape
-            )
-        nodes[name] = NodeParams(weights=node_params.weights, biases=biases)
-    return GraphParams(nodes=nodes)
-
-
 BATCH = 3
 
 
@@ -197,7 +185,7 @@ class Bunch:
         structure = self.build()
         params = initialize_params(structure, key)
         if self.biases:
-            params = _inject_biases(params, jax.random.fold_in(key, 7))
+            params = inject_biases(params, jax.random.fold_in(key, 7))
         clamps = _clamps(
             structure, jax.random.fold_in(key, 1), self.clamp_output, self.extra_clamps
         )
@@ -413,3 +401,202 @@ class TestOracleSelfChecks:
         assert 0.9**T <= 1e-6 < 0.9 ** (T - 1)
         with pytest.raises(ValueError):
             oracle.steps_to_contract(0.3, eigs, 1e-6)
+
+
+# =============================================================================
+# Solvers against the oracle
+# =============================================================================
+
+
+def _oracle_case(bunch, key):
+    """Structure, params, clamps, the feedforward-initialized state, and the
+    oracle equilibrium with every unclamped source's z_mu read from that
+    state (the constant ePC holds it at)."""
+    structure, params, clamps = BUNCH[bunch].make(key)
+    state = initialize_graph_state(structure, BATCH, key, clamps, params=params)
+    eq = oracle.linear_equilibrium(
+        params, structure, clamps, source_means=_source_means(structure, state)
+    )
+    return structure, params, clamps, state, eq
+
+
+def _assert_matches_oracle(structure, final, eq, clamps, *, source_errors=True):
+    """z_latent on every node; energy and error on every in_degree > 0 node;
+    error on unclamped sources when ``source_errors`` (the state-based
+    solvers re-sync a source's z_mu, so their source error is 0 by
+    construction); the in_degree > 0 total against the oracle total."""
+    tol = dict(rtol=1e-4, atol=1e-4)
+    total = np.zeros(BATCH)
+    for name in structure.nodes:
+        info = structure.nodes[name].node_info
+        node = final.nodes[name]
+        np.testing.assert_allclose(
+            np.asarray(node.z_latent),
+            eq.z_star[name],
+            err_msg=f"{name}: z_latent",
+            **tol,
+        )
+        if info.in_degree > 0:
+            np.testing.assert_allclose(
+                np.asarray(node.energy),
+                eq.node_energy[name],
+                err_msg=f"{name}: energy",
+                **tol,
+            )
+            np.testing.assert_allclose(
+                np.asarray(node.error),
+                eq.error_star[name],
+                err_msg=f"{name}: error",
+                **tol,
+            )
+            total = total + np.asarray(node.energy)
+        elif source_errors and name not in clamps:
+            np.testing.assert_allclose(
+                np.asarray(node.error),
+                eq.error_star[name],
+                err_msg=f"{name}: source error",
+                **tol,
+            )
+    np.testing.assert_allclose(total, eq.total_energy, err_msg="total energy", **tol)
+
+
+def _epc_schedule(eq, eta_scale=1.0, atol=1e-4):
+    """(eta, T) for ePC: eta = eta_scale / λ_max(H_ε); T contracts the excited
+    modes (the floor modes are never excited from ε = 0) until the latent
+    error is below atol / 10, using ‖M‖₂ to convert ε error to z error."""
+    quad = eq.quad
+    H = oracle.epsilon_hessian(quad)
+    eta = eta_scale / float(np.linalg.eigvalsh(H)[-1])
+    dist = np.linalg.norm(oracle.flatten_free(quad, eq.error_star))
+    if dist == 0.0:
+        return eta, 1
+    ratio = atol / (10.0 * np.linalg.norm(quad.M, 2) * dist)
+    excited = oracle.excited_eigenvalues(H, oracle.epsilon_gradient_at_zero(quad))
+    return eta, max(1, oracle.steps_to_contract(eta, excited, ratio))
+
+
+def _spc_schedule(eq, eta_scale=1.0, atol=1e-4):
+    """(eta, T) for the state-based solver: eta = eta_scale / λ_max(H_z); T
+    from the full spectrum (every mode can be excited from the feedforward
+    point)."""
+    quad = eq.quad
+    H = oracle.latent_hessian(quad)
+    eta = eta_scale / float(np.linalg.eigvalsh(H)[-1])
+    dist = np.linalg.norm(
+        oracle.flatten_free(quad, quad.z_ff) - oracle.flatten_free(quad, eq.z_star)
+    )
+    if dist == 0.0:
+        return eta, 1
+    ratio = atol / (10.0 * dist)
+    return eta, max(1, oracle.steps_to_contract(eta, np.linalg.eigvalsh(H), ratio))
+
+
+def _run(structure, inference, params, state, clamps):
+    structure = with_inference(structure, inference=inference)
+    return structure, inference.run_inference(params, state, clamps, structure)
+
+
+class TestEPCReachesOracle:
+    @pytest.mark.parametrize("bunch", list(BUNCH))
+    def test_equilibrium(self, rng_key, bunch):
+        structure, params, clamps, state, eq = _oracle_case(bunch, rng_key)
+        eta, steps = _epc_schedule(eq)
+        structure, final = _run(
+            structure,
+            EPCInference(eta_infer=eta, infer_steps=steps),
+            params,
+            state,
+            clamps,
+        )
+        _assert_matches_oracle(structure, final, eq, clamps)
+
+
+class TestSPCReachesOracle:
+    @pytest.mark.parametrize("bunch", list(BUNCH))
+    def test_equilibrium(self, rng_key, bunch):
+        """Includes the muPC chain: with identity activations the top-down
+        scale a·jacobian_gain is the exact chain-rule factor (jacobian_gain
+        = 1) and self_grad_scale = 1, so sPC+muPC is plain gradient descent
+        on the input-scaled energy the oracle assembles."""
+        structure, params, clamps, state, eq = _oracle_case(bunch, rng_key)
+        eta, steps = _spc_schedule(eq)
+        structure, final = _run(
+            structure,
+            InferenceSGD(eta_infer=eta, infer_steps=steps),
+            params,
+            state,
+            clamps,
+        )
+        _assert_matches_oracle(structure, final, eq, clamps, source_errors=False)
+
+
+class TestStabilityBracket:
+    """The exact bound 2/λ_max pins the scale of each solver's gradient, not
+    only its direction: 0.95× converges to the oracle, 1.05× diverges."""
+
+    @pytest.mark.parametrize("solver", ["epc", "spc"])
+    def test_bracket(self, rng_key, solver):
+        structure, params, clamps, state, eq = _oracle_case("chain-h3", rng_key)
+        if solver == "epc":
+            H, schedule, make = (
+                oracle.epsilon_hessian(eq.quad),
+                _epc_schedule,
+                EPCInference,
+            )
+        else:
+            H, schedule, make = (
+                oracle.latent_hessian(eq.quad),
+                _spc_schedule,
+                InferenceSGD,
+            )
+        bound = oracle.stability_bound(H)
+
+        eta, steps = schedule(eq, eta_scale=0.95 * 2.0)
+        assert abs(eta - 0.95 * bound) < 1e-12
+        structure_c, final = _run(
+            structure, make(eta_infer=eta, infer_steps=steps), params, state, clamps
+        )
+        _assert_matches_oracle(structure_c, final, eq, clamps, source_errors=False)
+
+        structure_d = with_inference(
+            structure, inference=make(eta_infer=1.05 * bound, infer_steps=150)
+        )
+        _, history = run_inference_with_history(params, state, clamps, structure_d)
+        total = sum(
+            np.asarray(history[name]["energy"])
+            for name in structure.nodes
+            if structure.nodes[name].node_info.in_degree > 0
+        )
+        assert np.all(np.isfinite(total))
+        # Once the divergent mode dominates, the energy grows every step.
+        assert np.all(np.diff(total[-50:]) > 0), total[-50:]
+
+
+class TestEpsilonHVPMatchesOracle:
+    @pytest.mark.parametrize("bunch", ["fork-merge", "prior-source"])
+    def test_hvp(self, rng_key, bunch):
+        """The Hessian-vector product through EPCInference.error_energy equals
+        H_ε v column-wise per sample (float32 against float64)."""
+        structure, params, clamps, state, eq = _oracle_case(bunch, rng_key)
+        synced = EPCInference.begin_segment(params, state, clamps, structure)
+        energy_of, errors = EPCInference.error_energy(params, synced, clamps, structure)
+        v = {
+            name: jax.random.normal(jax.random.fold_in(rng_key, i), e.shape)
+            for i, (name, e) in enumerate(errors.items())
+        }
+        hv = jax.jvp(jax.grad(lambda e: energy_of(e)[0]), (errors,), (v,))[1]
+        expected = oracle.unflatten_free(
+            eq.quad, oracle.epsilon_hessian(eq.quad) @ oracle.flatten_free(eq.quad, v)
+        )
+        assert set(hv) == set(eq.quad.free)
+        for name in hv:
+            np.testing.assert_allclose(np.asarray(hv[name]), expected[name], atol=1e-4)
+
+    @pytest.mark.parametrize("bunch", ["fork-merge", "prior-source"])
+    def test_power_iteration_matches_oracle(self, rng_key, bunch):
+        structure, params, clamps, state, eq = _oracle_case(bunch, rng_key)
+        lam = oracle.top_epsilon_eigenvalue(
+            params, state, clamps, structure, iters=300, key=rng_key
+        )
+        expected = np.linalg.eigvalsh(oracle.epsilon_hessian(eq.quad))[-1]
+        np.testing.assert_allclose(lam, expected, rtol=1e-4)

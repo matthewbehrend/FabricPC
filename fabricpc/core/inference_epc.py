@@ -52,18 +52,80 @@ class EPCInference(InferenceBase):
             taken through the full network's transfer function — a change in
             one node's ε moves every downstream derived latent — so tune it
             like a weight learning rate, not like sPC's local per-node rate.
-            This rate for ePC tunes lower than sPC's per-node rate.
+            Gradient descent on the error-coordinate energy is stable only
+            for eta_infer < 2/λ_max(H_ε), the top eigenvalue of that energy's
+            Hessian; ``fabricpc.utils.linear_pc_oracle.top_epsilon_eigenvalue``
+            measures it on any graph.
         infer_steps: Number of inference iterations (default: 5). One
             reverse pass per step reaches every layer, so a few steps replace
-            sPC's hundreds on deep DAGs. Use infer_steps > 1; a single step is
-            equivalent to backprop but multiple steps settle to predictive
-            coding's energy minimization solution.
+            sPC's hundreds on deep DAGs.
         latent_decay: Decay factor on ε in the update (default: 0.0).
+
+    Backprop regime. One step from ε = 0 leaves ε_t = −eta_infer·∂L/∂z_t
+    exactly, the backprop activation gradient at the feedforward point. The
+    local weight gradients are then taken at the re-derived latents
+    (``finalize_state``), so they match backprop's to first order in
+    eta_infer·λ_max(H_ε): hidden layers scaled by eta_infer, the output
+    layer unscaled (Goemaere et al., Theorem C.9, Case 1). The remainder
+    comes from a node's input latent being re-derived at the perturbed
+    upstream state, so a layer fed only by clamped nodes matches exactly.
+    After T steps
+    each excited error mode with Hessian eigenvalue λ has relaxed toward
+    equilibrium by 1 − (1 − eta_infer·λ)^T, so the regime parameter is
+    eta_infer·T·λ_max: ≪ 1 is backprop-like (Case 2), ≳ 3/λ_min,excited
+    reaches the PC equilibrium, and eta_infer·λ_max < 2 is required for
+    stability at every T, T = 1 included, since one step lands each mode at
+    eta_infer·λ times its equilibrium value. ``regime_label`` names the
+    regime for a measured λ_max. Under Adam the eta_infer scaling of the
+    hidden-layer gradients is normalized away, so 1-step ePC with Adam
+    trains as backprop with Adam.
+
+    Measured on the muPC resnet18 demo (``examples/resnet18_cifar10_demo.py``):
+    the 2-epoch sweep implies an effective excited eigenvalue of order
+    10¹–10² at init, and the defaults (eta_infer·T = 0.005) train as backprop
+    for tens of epochs but collapsed at epoch 20 of a 100-epoch run while
+    infer_steps ∈ {1, 2} survived, consistent with λ_max growing past
+    2/eta_infer as the weights grow. The defaults are kept pending a
+    stability-aware rate; ``scripts/epc_analysis.py`` measures λ_max and
+    tracks it during training.
     """
 
     def __init__(self, eta_infer=1e-3, infer_steps=5, latent_decay=0.0):
         super().__init__(
             eta_infer=eta_infer, infer_steps=infer_steps, latent_decay=latent_decay
+        )
+
+    def regime_label(self, lambda_max: float) -> str:
+        """Name the regime of this solver's (eta_infer, infer_steps) on a
+        graph whose error-coordinate Hessian has top eigenvalue
+        ``lambda_max`` (``top_epsilon_eigenvalue`` or the linear oracle).
+
+        The fastest excited mode has relaxed by f_max = 1 − |1 − η·λ_max|^T
+        and the slowest possible mode, at the unit-precision floor λ = 1, by
+        f_min = 1 − (1 − η)^T. Bands on f_max: below 0.1 "backprop-like",
+        0.1 to 0.9 "partially relaxed", above 0.9 "near PC equilibrium".
+        η·λ_max > 2 is "unstable" (the mode diverges, T = 1 included) and
+        1 < η·λ_max ≤ 2 overshoots. λ_max grows with the weights during
+        training, so a label computed at init describes init.
+        """
+        eta = float(self.config["eta_infer"])
+        steps = int(self.config["infer_steps"])
+        x = eta * float(lambda_max)
+        if x > 2.0:
+            return f"unstable: eta*lambda_max = {x:.3g} > 2"
+        f_max = 1.0 - abs(1.0 - x) ** steps
+        f_min = 1.0 - abs(1.0 - eta) ** steps
+        if f_max < 0.1:
+            band = "backprop-like"
+        elif f_max <= 0.9:
+            band = "partially relaxed"
+        else:
+            band = "near PC equilibrium"
+        if x > 1.0:
+            band += ", overshooting"
+        return (
+            f"eta*T*lambda_max = {x * steps:.3g} (fastest error mode relaxed "
+            f"{100 * f_max:.0f}%, slowest {100 * f_min:.2g}%): {band}"
         )
 
     @staticmethod
@@ -120,22 +182,25 @@ class EPCInference(InferenceBase):
         return state
 
     @classmethod
-    def forward_value_and_grad(
+    def error_energy(
         cls,
         params: GraphParams,
         state: GraphState,
         clamps: Dict[str, jnp.ndarray],
         structure: GraphStructure,
-    ) -> GraphState:
+    ):
         """
-        One global energy gradient with respect to the relaxed errors.
+        The total energy as a function of the relaxed errors.
 
-        Builds the relaxed pytree {node name: ε}, derives all states from it
-        along the schedule, sums the per-sample energies of every
-        ``in_degree > 0`` node (the same set the training loop sums, so
-        equilibria match sPC — a source's ε gradient arrives purely through
-        downstream z_mu), and differentiates that scalar. Gradients
-        accumulate into ``latent_grad`` (never replace it).
+        Returns ``(energy_of, errors)``: ``errors`` is the relaxed pytree
+        {node name: ε} read from ``state``, and ``energy_of(errors)`` writes
+        those ε into the state, derives all latents along the schedule, and
+        returns ``(total, derived_state)`` with ``total`` the sum of the
+        per-sample energies of every ``in_degree > 0`` node (the same set
+        the training loop sums, so equilibria match sPC — a source's ε
+        gradient arrives purely through downstream z_mu). One owner of the
+        ε-energy for the solver's gradient, Hessian-vector products
+        (``jax.jvp(jax.grad(...))``), and power iteration.
         """
         relaxed = cls._relaxed_errors(structure, clamps)
 
@@ -151,6 +216,24 @@ class EPCInference(InferenceBase):
             return total, inner
 
         errors = {name: state.nodes[name].error for name in relaxed}
+        return energy_of, errors
+
+    @classmethod
+    def forward_value_and_grad(
+        cls,
+        params: GraphParams,
+        state: GraphState,
+        clamps: Dict[str, jnp.ndarray],
+        structure: GraphStructure,
+    ) -> GraphState:
+        """
+        One global energy gradient with respect to the relaxed errors.
+
+        Differentiates ``error_energy``'s scalar with respect to the relaxed
+        pytree; gradients accumulate into ``latent_grad`` (never replace it).
+        """
+        relaxed = cls._relaxed_errors(structure, clamps)
+        energy_of, errors = cls.error_energy(params, state, clamps, structure)
         (_, new_state), grads = jax.value_and_grad(energy_of, has_aux=True)(errors)
 
         for name in relaxed:

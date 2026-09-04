@@ -23,8 +23,9 @@ W_eff[s→t] is the muPC ``forward_scale`` for the edge (1.0 when absent)
 times the Linear weight for that edge key, or times the IdentityNode
 ``scale`` times the identity. An unclamped source (in_degree 0) has a
 column block but no row block: it carries no energy term, and under
-``EPCInference`` its ``z_mu`` stays at the constant ``begin_segment``
-assigned (``source_means``), which affects its error ε* but not z* or E*.
+``EPCInference`` its ``z_mu`` stays at the constant initialization assigned
+(its initial latent; ``source_means``), which affects its error ε* but not
+z* or E*.
 
 Part 2 — spectral diagnostics. The Hessian in latent coordinates is
 H_z = AᵀA. Error coordinates are z_free = M(ε + const) with
@@ -51,8 +52,10 @@ so a mode with η·λ > 2 ends farther from equilibrium than it started.
 from __future__ import annotations
 
 import math
-from typing import Dict, Mapping, NamedTuple, Optional, Tuple
+from typing import Callable, Dict, Mapping, NamedTuple, Optional, Tuple
 
+import jax
+import jax.numpy as jnp
 import numpy as np
 
 from fabricpc.core.activations import IdentityActivation
@@ -241,8 +244,9 @@ def assemble_linear_quadratic(
     """Build A, c, B_lower, M, and the feedforward point for the graph.
 
     ``clamps`` maps node names to (batch, d) arrays. ``source_means`` maps
-    each unclamped source to its constant z_mu (the state's ``z_mu`` after
-    ``EPCInference.begin_segment``); missing entries default to zeros.
+    each unclamped source to its constant z_mu (the initialized state's
+    ``z_mu``, which ``initialize_graph_state`` sets to the source's initial
+    latent); missing entries default to zeros.
     """
     validate_linear_gaussian(structure)
     clamped = set(clamps)
@@ -519,11 +523,92 @@ def steps_to_contract(eta: float, eigs, ratio: float) -> int:
     has shrunk by at least ``ratio``. Raises if some mode does not contract
     (eta·λ ≤ 0 or ≥ 2)."""
     factors = np.abs(1.0 - eta * np.asarray(eigs, dtype=np.float64))
+    if factors.size == 0:
+        return 1
     worst = float(factors.max())
     if worst >= 1.0:
         raise ValueError(
             f"a mode does not contract at eta={eta}: max |1 - eta*lambda| = {worst}"
         )
-    if worst == 0.0:
+    if worst == 0.0 or ratio >= 1.0:
         return 1
     return int(math.ceil(math.log(ratio) / math.log(worst)))
+
+
+# =============================================================================
+# Part 2b — the same diagnostic on any graph, through the solver's ε-energy
+# =============================================================================
+
+
+def _tree_dot(a, b) -> jnp.ndarray:
+    return sum(
+        jnp.sum(x * y)
+        for x, y in zip(jax.tree_util.tree_leaves(a), jax.tree_util.tree_leaves(b))
+    )
+
+
+def make_top_epsilon_eigenvalue(
+    structure: GraphStructure, iters: int = 30
+) -> Callable[[GraphParams, object, Mapping[str, object], jax.Array], jnp.ndarray]:
+    """Compile ``(params, state, clamps, key) -> λ_max(H_ε)`` for one graph.
+
+    Power iteration on the Hessian-vector product of the total energy in
+    error coordinates, through ``EPCInference.error_energy`` (so it works on
+    any graph the solver accepts, nonlinear included, and needs no explicit
+    Hessian). The state is first passed through ``begin_segment`` so the
+    Hessian is evaluated at the state's latents. Returns the Rayleigh
+    quotient after ``iters`` iterations, which converges to the eigenvalue
+    of largest magnitude; the compiled callable is reused across calls, so
+    a training loop can probe λ_max repeatedly at one compile.
+    """
+    from fabricpc.core.inference_epc import EPCInference
+
+    def run(params, state, clamps, key):
+        synced = EPCInference.begin_segment(params, state, clamps, structure)
+        energy_of, errors = EPCInference.error_energy(params, synced, clamps, structure)
+        grad_fn = jax.grad(lambda e: energy_of(e)[0])
+
+        def hvp(v):
+            return jax.jvp(grad_fn, (errors,), (v,))[1]
+
+        leaves, treedef = jax.tree_util.tree_flatten(errors)
+        keys = jax.random.split(key, len(leaves))
+        v = treedef.unflatten(
+            [
+                jax.random.normal(k, leaf.shape, leaf.dtype)
+                for k, leaf in zip(keys, leaves)
+            ]
+        )
+
+        def normalize(t):
+            norm = jnp.sqrt(_tree_dot(t, t))
+            return jax.tree_util.tree_map(lambda x: x / norm, t)
+
+        def body(_, carry):
+            vec, _lam = carry
+            hv = hvp(vec)
+            return normalize(hv), _tree_dot(vec, hv)
+
+        _, lam = jax.lax.fori_loop(
+            0, iters, body, (normalize(v), jnp.zeros((), leaves[0].dtype))
+        )
+        return lam
+
+    return jax.jit(run)
+
+
+def top_epsilon_eigenvalue(
+    params: GraphParams,
+    state,
+    clamps: Mapping[str, object],
+    structure: GraphStructure,
+    iters: int = 30,
+    key: Optional[jax.Array] = None,
+) -> float:
+    """λ_max(H_ε) at the state's latents by power iteration (one compile per
+    call; use ``make_top_epsilon_eigenvalue`` for repeated probes). The
+    stability bound of ``EPCInference`` on this graph is 2 / the result."""
+    key = jax.random.PRNGKey(0) if key is None else key
+    return float(
+        make_top_epsilon_eigenvalue(structure, iters)(params, state, clamps, key)
+    )

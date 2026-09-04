@@ -21,14 +21,14 @@ import jax
 import jax.numpy as jnp
 import pytest
 
-from conftest import total_energy
+from conftest import inject_biases, total_energy, with_inference
 from fabricpc.core import EPCInference, InferenceSGD, run_inference
 from fabricpc.core.activations import (
     IdentityActivation,
     SoftmaxActivation,
     TanhActivation,
 )
-from fabricpc.core.energy import CrossEntropyEnergy
+from fabricpc.core.energy import CrossEntropyEnergy, graph_energy
 from fabricpc.core.initializers import NormalInitializer
 from fabricpc.core.learning import compute_local_weight_gradients
 from fabricpc.core.mupc import MuPCConfig
@@ -915,3 +915,178 @@ class TestFinalStateInvariant:
                 node_state.z_mu + node_state.error,
                 atol=1e-6,
             ), f"{name}: z_latent != z_mu + error after run_inference"
+
+
+class TestBackpropCorrespondence:
+    """1-step ePC against backprop (Goemaere et al., Theorem C.9, Case 1).
+
+    x(4) -> h1(3, tanh) -> h2(3, tanh) -> y(2), biases drawn, Gaussian or
+    softmax + cross-entropy output. In FabricPC the activation sits in the
+    receiving node's prediction (μ_h2 = tanh(z_h1 W + b)), so the tanh'
+    factor attaches to the downstream node's pre-activation in the hand
+    recursion below.
+    """
+
+    @staticmethod
+    def _mlp(output, eta, steps):
+        x = IdentityNode(shape=(4,), name="x")
+        h1 = Linear(
+            shape=(3,), name="h1", activation=TanhActivation(), weight_init=W_INIT
+        )
+        h2 = Linear(
+            shape=(3,), name="h2", activation=TanhActivation(), weight_init=W_INIT
+        )
+        if output == "gaussian":
+            y = Linear(
+                shape=(2,),
+                name="y",
+                activation=IdentityActivation(),
+                weight_init=W_INIT,
+            )
+        else:
+            y = Linear(
+                shape=(2,),
+                name="y",
+                activation=SoftmaxActivation(),
+                energy=CrossEntropyEnergy(),
+                weight_init=W_INIT,
+            )
+        return graph(
+            nodes=[x, h1, h2, y],
+            edges=[
+                Edge(source=x, target=h1.slot("in")),
+                Edge(source=h1, target=h2.slot("in")),
+                Edge(source=h2, target=y.slot("in")),
+            ],
+            task_map=TaskMap(x=x, y=y),
+            inference=EPCInference(eta_infer=eta, infer_steps=steps),
+        )
+
+    def _setup(self, rng_key, output, eta=0.05, steps=1, batch=3):
+        structure = self._mlp(output, eta, steps)
+        params = inject_biases(
+            initialize_params(structure, rng_key), jax.random.fold_in(rng_key, 7)
+        )
+        x = jax.random.normal(rng_key, (batch, 4))
+        if output == "gaussian":
+            y = jax.random.normal(jax.random.PRNGKey(1), (batch, 2))
+        else:
+            labels = jax.random.randint(jax.random.PRNGKey(1), (batch,), 0, 2)
+            y = jax.nn.one_hot(labels, 2)
+        clamps = {"x": x, "y": y}
+        state = initialize_graph_state(structure, batch, rng_key, clamps, params=params)
+        return structure, params, clamps, state
+
+    @staticmethod
+    def _backprop_activation_grads(params, x, y, output):
+        """dL/dz_h1, dL/dz_h2 at the feedforward point, and a1 = μ_h1."""
+        W1, b1 = params.nodes["h1"].weights["x->h1:in"], params.nodes["h1"].biases["b"]
+        W2, b2 = params.nodes["h2"].weights["h1->h2:in"], params.nodes["h2"].biases["b"]
+        Wy, by = params.nodes["y"].weights["h2->y:in"], params.nodes["y"].biases["b"]
+        a1 = jnp.tanh(x @ W1 + b1)
+        a2 = jnp.tanh(a1 @ W2 + b2)
+        pre_y = a2 @ Wy + by
+        if output == "gaussian":
+            delta_y = pre_y - y  # precision 1: d(½‖y − μ‖²)/dμ
+        else:
+            delta_y = jax.nn.softmax(pre_y, axis=-1) - y
+        g_h2 = delta_y @ Wy.T
+        g_h1 = (g_h2 * (1.0 - a2**2)) @ W2.T
+        return {"h1": g_h1, "h2": g_h2}, a1
+
+    @pytest.mark.parametrize("output", ["gaussian", "ce"])
+    def test_epsilon_grad_at_zero_is_backprop_activation_grad(self, rng_key, output):
+        """∇_ε E at ε = 0 is the backprop activation gradient, exactly."""
+        structure, params, clamps, state = self._setup(rng_key, output)
+        state = EPCInference.begin_segment(params, state, clamps, structure)
+        state = EPCInference.zero_grads(params, state, clamps, structure)
+        with_grads = EPCInference.forward_value_and_grad(
+            params, state, clamps, structure
+        )
+        g, _ = self._backprop_activation_grads(params, clamps["x"], clamps["y"], output)
+        for name in ("h1", "h2"):
+            assert jnp.allclose(
+                with_grads.nodes[name].latent_grad, g[name], atol=1e-6
+            ), name
+
+    @pytest.mark.parametrize("output", ["gaussian", "ce"])
+    def test_one_step_error_is_minus_eta_backprop_grad(self, rng_key, output):
+        """After one step, ε = −η·g on every hidden node and z_h1 = a1 − η·g_h1
+        (h2's latent is re-derived at the perturbed h1, so only h1's is the
+        literal backprop step)."""
+        structure, params, clamps, state = self._setup(
+            rng_key, output, eta=0.05, steps=1
+        )
+        final = structure.config["inference"].run_inference(
+            params, state, clamps, structure
+        )
+        g, a1 = self._backprop_activation_grads(
+            params, clamps["x"], clamps["y"], output
+        )
+        for name in ("h1", "h2"):
+            assert jnp.allclose(
+                final.nodes[name].error, -0.05 * g[name], atol=1e-6
+            ), name
+        assert jnp.allclose(final.nodes["h1"].z_latent, a1 - 0.05 * g["h1"], atol=1e-6)
+
+    @pytest.mark.parametrize("output", ["gaussian", "ce"])
+    def test_one_step_weight_grads_are_eta_backprop_first_order(self, rng_key, output):
+        """Local weight gradients after one ePC step equal η × backprop's on
+        the hidden layers and backprop's on the output layer, to first order
+        in η. The O(η²) remainder comes from the node's input latent being
+        re-derived at the perturbed upstream state, so a layer whose input is
+        the clamp (h1) matches exactly, up to float32, at every η, while h2
+        and y show a relative deviation d(η) below 1e-2 at η = 1e-3 that
+        grows linearly in η (within a factor of 3 of 10× per decade). Batch
+        1, so batch-summed and batch-mean gradients coincide and the
+        reference needs no normalization."""
+        structure, params, clamps, _ = self._setup(rng_key, output, batch=1)
+
+        def loss(p):
+            state = initialize_graph_state(structure, 1, rng_key, clamps, params=p)
+            return graph_energy(state, structure, node_names=["y"])
+
+        g_bp = jax.grad(loss)(params)
+
+        def deviation(eta):
+            s = with_inference(
+                structure, inference=EPCInference(eta_infer=eta, infer_steps=1)
+            )
+            state = initialize_graph_state(s, 1, rng_key, clamps, params=params)
+            final = s.config["inference"].run_inference(params, state, clamps, s)
+            g_pc = compute_local_weight_gradients(params, final, s)
+            out = {}
+            for name in ("h1", "h2", "y"):
+                scale = 1.0 if name == "y" else eta
+                for kind in ("weights", "biases"):
+                    for key, ref in getattr(g_bp.nodes[name], kind).items():
+                        got = getattr(g_pc.nodes[name], kind)[key] / scale
+                        out[(name, key)] = float(
+                            jnp.linalg.norm(got - ref) / jnp.linalg.norm(ref)
+                        )
+            return out
+
+        d = {eta: deviation(eta) for eta in (1e-3, 1e-2, 1e-1)}
+        for key in d[1e-3]:
+            if key[0] == "h1":
+                for eta in d:
+                    assert d[eta][key] < 1e-3, (key, eta, d[eta][key])
+                continue
+            assert d[1e-3][key] < 1e-2, (key, d[1e-3][key])
+            r1 = d[1e-2][key] / d[1e-3][key]
+            r2 = d[1e-1][key] / d[1e-2][key]
+            assert 3.0 <= r1 <= 30.0 and 3.0 <= r2 <= 30.0, (key, d[1e-3][key], r1, r2)
+
+
+class TestRegimeLabel:
+    def test_bands(self):
+        default = EPCInference()
+        assert "backprop-like" in default.regime_label(1.0)
+        assert "partially relaxed" in default.regime_label(75.0)
+        assert "near PC equilibrium" in EPCInference(
+            eta_infer=0.05, infer_steps=100
+        ).regime_label(10.0)
+        assert default.regime_label(3000.0).startswith("unstable")
+        assert "overshooting" in EPCInference(
+            eta_infer=0.15, infer_steps=1
+        ).regime_label(10.0)
