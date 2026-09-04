@@ -36,7 +36,7 @@ Includes cosine LR schedule with warmup and optional data augmentation
 --inference selects the PC solver: epc (EPCInference, error-parameterized,
 default) or spc (state-based InferenceSGDNormClip). Unset --eta_infer and
 --infer_steps fall back to EPCInference's defaults for epc and to this
-demo's spc settings (0.1, 120).
+demo's spc settings.
 
 --trainer backprop trains the identical graph (muPC init and edge scaling
 included) with end-to-end autodiff instead of iterative PC inference;
@@ -55,22 +55,21 @@ Usage:
     python examples/resnet18_cifar10_demo.py --num_epochs 100 --eval_every 10 --augment --activation gelu # full training with augmentation and gelu activation
 
 
-Results (RTX3090, cuda13, jax 0.10.2; can vary a few points in accuracy across
-jax versions and hardware, from sensitivity to floating point rounding)
+Results (RTX3090, cuda13, jax 0.10.2):
+ePC training is more stable than sPC on this model, with less sensitivity to
+eta_infer and fewer training collapses. ePC trains >40X faster. ePC achieves
+higher accuracy because deper layers learn weights, whereas the sPC error
+signal decays with depth.
 
 Smoke Test (2 epochs)
+python examples/resnet18_cifar10_demo.py --inference epc
+Test Accuracy: 39.26%
+
 python examples/resnet18_cifar10_demo.py --inference spc
-Model: 31 nodes, 38 edges
-Total parameters: 2,795,210
-Train energy: 0.4792
-Test Accuracy: 33.71%
-Training time: 952.3s (476.2s per epoch)
-
-sPC Results:
-# run in process
-
+Test Accuracy: 33.89%
 
 ePC Results:
+python examples/resnet18_cifar10_demo.py --num_epochs 100 --eval_every 10 --augment --activation gelu --inference epc --eta_infer 0.001 --infer_steps 1
 Trainer: pc  |  Inference: epc (eta 0.001, 1 steps)  |  Activation: gelu  |  Epochs: 100  |  LR: 0.001  |  Augment: True
   Epoch 10: accuracy=55.83%
   Epoch 20: accuracy=63.59%
@@ -85,6 +84,23 @@ Trainer: pc  |  Inference: epc (eta 0.001, 1 steps)  |  Activation: gelu  |  Epo
 Training time: 1102.0s (11.0s per epoch)
 Final evaluation...
 Test Accuracy: 76.73%
+
+
+Best sPC trial at 100 epochs:
+python examples/resnet18_cifar10_demo.py --num_epochs 100 --eval_every 10 --augment --activation gelu --inference spc --eta_infer 0.2
+  Epoch 10: accuracy=42.13%
+  Epoch 20: accuracy=44.92%
+  Epoch 30: accuracy=46.32%
+  Epoch 40: accuracy=47.67%
+  Epoch 50: accuracy=48.85%
+  Epoch 60: accuracy=48.53%
+  Epoch 70: accuracy=48.83%
+  Epoch 80: accuracy=49.14%
+  Epoch 90: accuracy=49.81%
+  Epoch 100: accuracy=50.17%
+Training time: 48688.7s (486.9s per epoch)
+Final evaluation...
+Test Accuracy: 50.17%
 
 
 Run a sweep:
@@ -183,7 +199,7 @@ def make_inference(args):
         return EPCInference(**overrides)
     else:
         return InferenceSGDNormClip(
-            eta_infer=0.1 if args.eta_infer is None else args.eta_infer,
+            eta_infer=0.2 if args.eta_infer is None else args.eta_infer,
             infer_steps=120 if args.infer_steps is None else args.infer_steps,
             max_norm=1.0,
         )
@@ -602,7 +618,7 @@ def parse_args():
         "--eta_infer",
         type=float,
         default=None,
-        help="Inference rate (default: 0.1 for spc, EPCInference's default for epc)",
+        help="Inference rate (default: 0.2 for spc, EPCInference's default for epc)",
     )
     parser.add_argument(
         "--lr", type=float, default=0.001, help="Learning rate (default: 0.001)"

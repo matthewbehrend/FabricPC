@@ -53,13 +53,15 @@ class EPCInference(InferenceBase):
             one node's ε moves every downstream derived latent — so tune it
             like a weight learning rate, not like sPC's local per-node rate.
             This rate for ePC tunes lower than sPC's per-node rate.
-        infer_steps: Number of inference iterations (default: 1). One
+        infer_steps: Number of inference iterations (default: 5). One
             reverse pass per step reaches every layer, so a few steps replace
-            sPC's hundreds on deep DAGs.
+            sPC's hundreds on deep DAGs. Use infer_steps > 1; a single step is
+            equivalent to backprop but multiple steps settle to predictive
+            coding's energy minimization solution.
         latent_decay: Decay factor on ε in the update (default: 0.0).
     """
 
-    def __init__(self, eta_infer=1e-3, infer_steps=1, latent_decay=0.0):
+    def __init__(self, eta_infer=1e-3, infer_steps=5, latent_decay=0.0):
         super().__init__(
             eta_infer=eta_infer, infer_steps=infer_steps, latent_decay=latent_decay
         )

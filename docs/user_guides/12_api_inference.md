@@ -68,18 +68,20 @@ z_new = z * (1 - eta * latent_decay) - eta * clipped_grad
 
 Error-parameterized predictive coding (ePC, Goemaere et al., arXiv 2505.20137). The prediction error ε is the first-class relaxed variable; each latent is derived by a forward pass along `structure.schedule` as `z_latent = z_mu + ε`. Because every node's `z_mu` depends on all upstream latents, one `jax.value_and_grad` over the ε pytree per step delivers the output-loss signal to every layer unattenuated — a few steps replace sPC's hundreds on deep DAGs. The ε ↔ z_latent map is a volume-preserving bijection: identical energies, identical equilibria, and the final derived state feeds the local weight-gradient path unchanged. (The equivalence relies on the node contract's rule that `predict` never reads `state.z_latent` values — see the custom-nodes guide.)
 
+Use infer_steps > 1; a single step is equivalent to backprop but multiple steps settle to predictive coding's energy minimization solution.
+
 ```python
 from fabricpc.core.inference_epc import EPCInference
 
-inference = EPCInference(eta_infer=1e-3, infer_steps=1, latent_decay=0.0)
+inference = EPCInference(eta_infer=1e-3, infer_steps=5, latent_decay=0.0)
 structure = graph(..., inference=inference)
 ```
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `eta_infer` | `float` | `1e-3` | Inference rate on ε — tune like a weight learning rate (see below) |
-| `infer_steps` | `int` | `1` | Number of inference iterations |
-| `latent_decay` | `float` | `0.0` | Weight decay on the relaxed errors |
+| `eta_infer` | `float` | `1e-3`  | Inference rate on ε — tune like a weight learning rate (see below) |
+| `infer_steps` | `int` | `5`     | Number of inference iterations |
+| `latent_decay` | `float` | `0.0`   | Weight decay on the relaxed errors |
 
 **Update rule (per step):**
 ```
