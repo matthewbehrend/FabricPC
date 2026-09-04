@@ -786,8 +786,11 @@ def cifar_probe_batch(structure, batch_size):
 def section_resnet18(args):
     header("--resnet18: lambda_max(H_eps) at init on the muPC resnet18 (GPU)")
     demo = load_demo()
-    key = jax.random.PRNGKey(42)
-    graph_key, state_key = jax.random.split(key)
+    # The demo's key split for trial seed --seed (its default trial seed is
+    # 42), so the graph is the one the demo trains.
+    graph_key, _train_key, state_key = jax.random.split(
+        jax.random.PRNGKey(args.seed), 3
+    )
     params, structure = demo._create_mupc_model(
         graph_key,
         inference=EPCInference(),
@@ -844,8 +847,12 @@ def section_track_lambda_max(args):
         print(f"\n--- cell eta={eta:g}, T={steps}  ({args.num_epochs} epochs of a {schedule_len}-epoch "
               f"schedule, lr {args.lr}, weight decay {args.weight_decay}, batch {args.batch_size}, "
               f"augment {args.augment}) ---")  # fmt: skip
-        master = jax.random.PRNGKey(args.seed)
-        graph_key, train_key, eval_key, probe_key = jax.random.split(master, 4)
+        # The demo's key split (run_trial): with --seed 42 and --augment this
+        # reproduces the 100-epoch run's init and batch order, probes aside.
+        graph_key, train_key, eval_key = jax.random.split(
+            jax.random.PRNGKey(args.seed), 3
+        )
+        probe_key = jax.random.fold_in(eval_key, 1)
         inference = EPCInference(eta_infer=eta, infer_steps=steps)
         params, structure = demo._create_mupc_model(
             graph_key,
@@ -1119,7 +1126,12 @@ def parse_args():
         help="CIFAR batch for the lambda_max probe",
     )
     p.add_argument("--power_iters", type=int, default=30)
-    p.add_argument("--seed", type=int, default=0)
+    p.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="trial seed, the demo's key split (default: 42, the demo's first trial)",
+    )
     return p.parse_args()
 
 
