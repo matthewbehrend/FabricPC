@@ -942,6 +942,8 @@ def section_track_lambda_max(args):
             for r in rows:
                 w.writerow(list(r) + [""] * (6 - len(r)))
         print(f"  wrote {csv_path}")
+        if args.plot:
+            plot_lambda_track(csv_path)
         if first_chance is None:
             print("  outcome: no collapse to chance within the run")
         elif first_cross is None:
@@ -1064,6 +1066,93 @@ def plot_spectra(spectra):
     write_chart(fig, "epc_analysis_spectra")
 
 
+def plot_lambda_track(csv_path):
+    """Two stacked panels from a --track_lambda_max CSV: lambda_max on the
+    probe batch (log scale) against the stability bound 2/eta, and test
+    accuracy per epoch. eta and T are read from the file name
+    (``epc_lambda_track__eta{eta}_T{T}.csv``)."""
+    import re
+
+    import plotly.graph_objects as go
+    from plotly.subplots import make_subplots
+
+    csv_path = Path(csv_path)
+    m = re.search(r"eta([0-9.e+-]+)_T(\d+)", csv_path.stem)
+    eta, steps = float(m.group(1)), int(m.group(2))
+    with csv_path.open() as fh:
+        rows = list(csv.DictReader(fh))
+    probes = [
+        (int(r["update"]), float(r["lambda_max"]))
+        for r in rows
+        if r["lambda_max"] not in ("", "nan")
+    ]
+    evals = [
+        (int(r["update"]), 100.0 * float(r["test_accuracy"]))
+        for r in rows
+        if r["test_accuracy"] not in ("",)
+    ]
+    fig = make_subplots(
+        rows=2,
+        cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.1,
+        subplot_titles=(
+            "lambda_max of the error Hessian on the probe batch (log scale)",
+            "test accuracy after each epoch",
+        ),
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=[u for u, _ in probes],
+            y=[lam for _, lam in probes],
+            mode="lines+markers",
+            name="lambda_max",
+            line=dict(color=PALETTE[0], width=2),
+            marker=dict(size=6, line=dict(color="#fcfcfb", width=2)),
+            hovertemplate="update %{x}: lambda_max %{y:.3g}<extra></extra>",
+        ),
+        row=1,
+        col=1,
+    )
+    fig.add_hline(
+        y=2.0 / eta,
+        line=dict(color="#52514e", width=2),
+        annotation_text=f"2/eta = {2.0 / eta:g}: eta*lambda_max = 2",
+        annotation_position="top left",
+        row=1,
+        col=1,
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=[u for u, _ in evals],
+            y=[a for _, a in evals],
+            mode="lines+markers",
+            name="test accuracy",
+            line=dict(color=PALETTE[1], width=2),
+            marker=dict(size=8, line=dict(color="#fcfcfb", width=2)),
+            hovertemplate="update %{x}: %{y:.2f}%<extra></extra>",
+        ),
+        row=2,
+        col=1,
+    )
+    fig.update_yaxes(type="log", title_text="lambda_max", row=1, col=1)
+    fig.update_yaxes(title_text="accuracy (%)", row=2, col=1)
+    fig.update_xaxes(title_text="weight updates", row=2, col=1)
+    fig.update_layout(
+        title=f"ePC eta_infer={eta:g}, infer_steps={steps}: lambda_max during training",
+        template="plotly_white",
+        paper_bgcolor="#fcfcfb",
+        plot_bgcolor="#fcfcfb",
+        font=dict(color="#0b0b0b"),
+        legend=dict(orientation="h", y=-0.15),
+        margin=dict(l=60, r=30, t=70, b=70),
+        height=700,
+    )
+    fig.update_xaxes(gridcolor="#e6e5e1", zeroline=False)
+    fig.update_yaxes(gridcolor="#e6e5e1", zeroline=False)
+    write_chart(fig, str(csv_path.with_suffix("")))
+
+
 # =============================================================================
 # CLI
 # =============================================================================
@@ -1125,6 +1214,13 @@ def parse_args():
         default=64,
         help="CIFAR batch for the lambda_max probe",
     )
+    p.add_argument(
+        "--plot_track",
+        nargs="+",
+        default=None,
+        metavar="CSV",
+        help="render charts from existing --track_lambda_max CSVs and exit",
+    )
     p.add_argument("--power_iters", type=int, default=30)
     p.add_argument(
         "--seed",
@@ -1137,6 +1233,10 @@ def parse_args():
 
 def main():
     args = parse_args()
+    if args.plot_track:
+        for path in args.plot_track:
+            plot_lambda_track(path)
+        return
     gpu = args.resnet18 or args.track_lambda_max is not None
     if gpu:
         setup_jax()

@@ -86,6 +86,28 @@ docs/dev_plans_archive/epc_inference_solver.md). The settings block prints
 EPCInference.regime_label at init; scripts/epc_analysis.py --track_lambda_max N
 logs eta_infer*lambda_max during training beside accuracy.
 
+lambda_max tracked during training (scripts/epc_analysis.py
+--track_lambda_max 50 --num_epochs 30 --schedule_epochs 100 --augment, seed
+42: the first 30 epochs of the 100-epoch runs above, probes on a fixed
+64-sample test batch every 50 updates; epc_lambda_track__eta*_T*.csv/.html):
+
+    eta_infer 0.001, infer_steps 5: 54.76% at epoch 10 (the 100-epoch log's
+    number), 56.36% at epoch 12. lambda_max 16 at init, 51 at epoch 10, 130
+    at epoch 12, 470 at epoch 13, 3500 at epoch 14 (eta*lambda_max first
+    above 2 at update 2700), 12500 early in epoch 15, then a dead network
+    (lambda_max = 1, chance). Accuracy began falling at epoch 13 (53.4%),
+    when eta*lambda_max of 0.2-0.5 had taken the run out of the backprop
+    regime, and collapsed once the bound was crossed.
+    eta_infer 0.01, infer_steps 1: lambda_max 15 -> 40 by epoch 5, 220 in
+    epoch 6 (eta*lambda_max first above 2 at update 1150), chance at epoch
+    7. One step cannot iterate, but with eta*lambda_max > 2 that step lands
+    each error mode farther from equilibrium than it started.
+
+Both collapses were preceded by eta*lambda_max crossing 2. lambda_max grew
+about threefold per epoch once training was under way, so a bound measured
+at init is a starting point, not a guarantee; a rate set from lambda_max
+during training is the follow-up.
+
 Smoke Test (2 epochs)
 python examples/resnet18_cifar10_demo.py --inference epc
 Test Accuracy: 39.26%
