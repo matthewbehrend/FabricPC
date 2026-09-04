@@ -62,7 +62,7 @@ sPC relaxes z_latent with ε derived (`error = pair_error(z_latent, z_mu) = z_la
 
 Mechanically this is the same pattern `train_backprop` (`fabricpc/training/train_backprop.py:118`) already uses — one feedforward pass, one `jax.value_and_grad` — with the differentiated variable swapped. The backprop trainer differentiates the output loss with respect to the weights; `EPCInference` walks the DAG representation of the network at the chosen unroll degree `U` (`structure.schedule`), injects the carried ε at every visit (`z_latent := z_mu + ε`), and differentiates the total energy E with respect to ε.
 
-Because the ε gradient is taken through the full network's transfer function — a change in one node's ε moves every downstream derived latent — η must be tuned like a weight learning rate, not like sPC's local per-node rate. Measured on the resnet18/CIFAR-10 convergence benchmark (Component 6), the ε updates to reach sPC's final 120-step energy: 104 at η = 1e-3, 11 at 1e-2, 4 at 3e-2, 1 at 0.1. The default is 1e-2 as a robustness margin, not the fastest measured rate: one batch on one architecture is thin evidence for 0.1's stability across models, and 1e-2 already converges in about a dozen updates.
+Because the ε gradient is taken through the full network's transfer function — a change in one node's ε moves every downstream derived latent — η must be tuned like a weight learning rate, not like sPC's local per-node rate. Measured on the resnet18/CIFAR-10 convergence benchmark (Component 6), the ε updates to reach sPC's final 120-step energy: 104 at η = 1e-3, 11 at 1e-2, 4 at 3e-2, 1 at 0.1. The default is 1e-2 as a robustness margin, not the fastest measured rate: one batch on one architecture is thin evidence for 0.1's stability across models, and 1e-2 already converges in about a dozen updates. (Superseded: the default returned to 1e-3 in commit 0d7c4c2 after the 100-epoch resnet18 runs collapsed at 1e-2 for every step count; see the interpretation under the results tables.)
 
 One derive rule for every node — z_latent = `pair_latent(z_mu, ε)` = z_mu + ε, the inverse of `pair_error` — with the clamp deciding which side is free (computed at trace time from static structure + clamp keys):
 
@@ -250,7 +250,7 @@ class EPCInference(InferenceBase):
     def __init__(self, eta_infer=1e-2, infer_steps=5, latent_decay=0.0): ...
 ```
 
-`eta_infer` defaults to 1e-2; the constructor docstring directs tuning it like a weight learning rate (the ε step descends the full-transfer-function gradient), quotes the measured convergence table (104/11/4/1 ε updates at η = 1e-3/1e-2/3e-2/0.1), and states the robustness-margin rationale for not defaulting to the fastest measured rate (Formulation).
+`eta_infer` defaults to 1e-2 (superseded: 1e-3 since commit 0d7c4c2, see the interpretation under the results tables); the constructor docstring directs tuning it like a weight learning rate (the ε step descends the full-transfer-function gradient), quotes the measured convergence table (104/11/4/1 ε updates at η = 1e-3/1e-2/3e-2/0.1), and states the robustness-margin rationale for not defaulting to the fastest measured rate (Formulation).
 
 Inherits `inference_step` (template correct after Component 2), `zero_grads`, `run_inference`, `segments`. Overrides:
 
@@ -463,3 +463,5 @@ ePC-32       38.78 +/- 0.34     297.8
 ePC-64       38.65 +/- 0.35     518.5
 ePC-128      38.34 +/- 0.33     960.7
 ePC-160      38.16 +/- 0.36     1175.5
+
+Interpretation (2026-09-04, `docs/dev_plans/epc_reviewer_response_oracle_and_analysis.md`): across the five tables accuracy declines monotonically with η·T·λ from ePC's small-η·T limit (38.8%; no backprop arm was run, and the 100-epoch demo holds the only measured backprop number, 77.11%) toward the PC equilibrium (31.0% at every η for T ≥ 32), with sPC-120 at 34.6% between them because 120 state-based steps do not reach equilibrium. The regime parameter is η·T·λ_max(H_ε), λ_max the top eigenvalue of the energy's Hessian in error coordinates: each excited mode relaxes by 1 − (1 − ηλ)^T per T steps. A one-eigenvalue fit of the η ≤ 0.01 cells gives λ_eff = 12.0 (rms residual 0.05 in normalized accuracy); power iteration on the resnet18 graph at init gives λ_max = 16.4 (`scripts/epc_analysis.py --resnet18`), so the two agree within a factor of 1.4. The η = 0.1 cells that collapsed at T ≤ 3 sit at η·λ_max = 1.6 at init, overshooting each mode's equilibrium, and cross the stability bound 2/λ_max as soon as the weights grow. The 100-epoch runs (project-root `sweep_eta*_steps*.log`) show the same bound reached late: only η·T ≤ 0.002 survived, the library default (1e-3, 5) collapsed at epoch 20, and 1e-2 collapsed by epoch 10 at every step count.

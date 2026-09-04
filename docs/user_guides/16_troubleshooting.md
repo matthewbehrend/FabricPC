@@ -201,6 +201,8 @@ If a slot has `is_multi_input=False` (e.g., StorkeyHopfield's `"in"`), it accept
 
 Under certain conditions (infinite inference steps, specific energy functionals), PC converges to the same gradients as backprop. In practice, PC with finite inference steps and Hebbian learning produces similar but not identical results. FabricPC provides both modes for comparison.
 
+`EPCInference` has a second route to backprop: a single step, or a small `eta_infer × infer_steps × λ_max` (λ_max the top eigenvalue of the energy's Hessian in error coordinates), leaves the errors at the backprop activation gradient, so the weight gradients are backprop's with rescaled magnitude. `EPCInference.regime_label(lambda_max)` names the regime for a measured λ_max (`fabricpc.utils.linear_pc_oracle.top_epsilon_eigenvalue`); see the backprop-regime paragraph in the [Inference Algorithms API](12_api_inference.md).
+
 **Why is PC slower than backprop?**
 
 PC requires iterative inference (typically 3 to 5 steps per layer of depth per batch) before weight updates. Each inference step is a forward pass through the network. This overhead is inherent to the algorithm. Potential speedups include neuromorphic hardware that runs inference in parallel, or incremental PC methods that amortize inference across batches.

@@ -52,7 +52,7 @@ Assembly, for each node t with in_degree > 0 (one residual row block, precision 
 - block(t, t) = √p_t·I if t is unclamped; otherwise the clamp moves to c.
 - block(t, s) = −√p_t·W_eff[s→t]ᵀ for each unclamped source s; clamped sources move to c.
 - c_t = √p_t·(b_t + Σ_{clamped s} W_eff[s→t]ᵀ z_s − [t clamped]·z_t).
-- Unclamped sources (in_degree 0) get columns but no row: they have no energy term. Under ePC their `z_mu` is fixed for the segment at the value `begin_segment` assigns (the initializer's latent draw; the raw initial state holds zeros), which affects ε* but not z* or E*.
+- Unclamped sources (in_degree 0) get columns but no row: they have no energy term. Under ePC their `z_mu` is fixed for the segment at the source's initial latent (`initialize_graph_state`'s shared post-pass sets z_mu ← z_latent for every source, and `begin_segment` preserves it), which affects ε* but not z* or E*.
 - W_eff for a `Linear` target: `forward_scale[edge_key]` (1.0 when the key is absent) times `params.nodes[t].weights[edge_key]`. For an `IdentityNode` target with in_degree > 0: `forward_scale` times `node_config["scale"]` times I. A source `IdentityNode` never runs `predict`, so its scale is inert and the oracle ignores it.
 
 API:
@@ -128,6 +128,13 @@ CPU by default (`setup_jax(platform="cpu")` at module top as in `scripts/diagnos
 2. `python scripts/epc_analysis.py` completes on CPU in under two minutes and prints: O(η) approach of 1-step gradients to η·backprop (hidden) and backprop (output); the fitted λ_eff from the sweep with its residual and the per-cell predicted regime; per-layer equilibrium spreads; the H_z/H_ε spectra table; `top_epsilon_eigenvalue` agreeing with the oracle to 1e-4; λ_max versus weight scale; the 0.9/1.1 bracket on the gelu MLP.
 3. `python examples/resnet18_cifar10_demo.py --num_epochs 1` prints the regime label with the measured λ_max in the settings line; `python examples/epc_spc_resnet18_compare.py --mode convergence --track_steps 5` still runs (smoke).
 4. On the 3090: `python scripts/epc_analysis.py --section stability --resnet18` prints η_max at init for the muPC resnet18 graph, the predicted regime per sweep cell, and the comparison of the measured λ_max with the fitted λ_eff; `python scripts/epc_analysis.py --track_lambda_max 20 --num_epochs 30` for (1e-3, 5) and (1e-2, 1) reports whether η·λ_max crossing 2 precedes the collapse.
+
+## Measured (2026-09-04, this branch)
+
+- `scripts/epc_analysis.py --resnet18`: λ_max(H_ε) = 16.4 at init on a 64-sample batch (η_max = 0.12); the one-eigenvalue fit of the 2-epoch sweep gives λ_eff = 12.0 (rms residual 0.05 in normalized accuracy), a ratio of 1.4. The defaults read backprop-like at init (fastest excited mode relaxed 8%). The (1e-1, T ≤ 3) cells that collapsed at 2 epochs sit at η·λ_max = 1.6 at init.
+- The relaxed-fraction formula matches the solver to four decimals on a linear chain; power iteration matches the oracle's λ_max to 6e-8; sPC needs 30k steps at depth 20 where ePC needs 75 (`--section convergence_spectra`).
+- The parity test found the first hidden layer's weight gradient exactly η × backprop at every η: its input is the clamp, so no re-derived latent enters. The O(η²) remainder appears only downstream (h2, y), scaling 10× per decade of η as predicted.
+- `--track_lambda_max 50 --num_epochs 30 --schedule_epochs 100 --augment` on (1e-3, 5) and (1e-2, 1): running at the time of writing; the outcome is recorded in the demo docstring when complete.
 
 ## Sequencing (one commit each, suite green at each gate)
 

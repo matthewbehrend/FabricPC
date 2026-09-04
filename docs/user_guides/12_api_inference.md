@@ -68,7 +68,9 @@ z_new = z * (1 - eta * latent_decay) - eta * clipped_grad
 
 Error-parameterized predictive coding (ePC, Goemaere et al., arXiv 2505.20137). The prediction error ε is the first-class relaxed variable; each latent is derived by a forward pass along `structure.schedule` as `z_latent = z_mu + ε`. Because every node's `z_mu` depends on all upstream latents, one `jax.value_and_grad` over the ε pytree per step delivers the output-loss signal to every layer unattenuated — a few steps replace sPC's hundreds on deep DAGs. The ε ↔ z_latent map is a volume-preserving bijection: identical energies, identical equilibria, and the final derived state feeds the local weight-gradient path unchanged. (The equivalence relies on the node contract's rule that `predict` never reads `state.z_latent` values — see the custom-nodes guide.)
 
-Use infer_steps > 1; a single step is equivalent to backprop but multiple steps settle to predictive coding's energy minimization solution.
+**Backprop regime.** One ePC step from ε = 0 leaves ε_t = −eta_infer·∂L/∂z_t exactly, the backprop activation gradient at the feedforward point, so the local weight gradients match backprop's to first order in eta_infer·λ_max(H_ε): hidden layers scaled by eta_infer, the output layer unscaled (Goemaere et al., Theorem C.9; exact for a layer fed only by clamped nodes). H_ε is the Hessian of the total energy in error coordinates and λ_max its top eigenvalue, measured on any graph by `fabricpc.utils.linear_pc_oracle.top_epsilon_eigenvalue` (power iteration through `EPCInference.error_energy`) or exactly on linear graphs by that module's oracle. After T steps each excited error mode with eigenvalue λ has relaxed toward equilibrium by 1 − (1 − eta_infer·λ)^T, so the regime parameter is eta_infer·T·λ_max: ≪ 1 is backprop-like; ≳ 3/λ_min,excited reaches the PC equilibrium; and eta_infer·λ_max < 2 is required for stability at every T, T = 1 included (one step lands each mode at eta_infer·λ times its equilibrium value, so a mode with eta_infer·λ > 2 ends farther from equilibrium than it started). `EPCInference.regime_label(lambda_max)` names the regime; the demos print it at init. Under Adam the eta_infer scaling of the hidden-layer gradients is normalized away, so 1-step ePC with Adam trains as backprop with Adam.
+
+Measured on the muPC ResNet-18 demo (`examples/resnet18_cifar10_demo.py`): λ_max(H_ε) = 16.4 at init on a 64-sample batch, and a one-eigenvalue fit of the 2-epoch sweep gives λ_eff ≈ 12, so the defaults (eta_infer·T = 0.005) sit at eta_infer·T·λ_max ≈ 0.08, backprop-like at init. λ_max grows with the weights: in the 100-epoch runs the defaults trained as backprop for tens of epochs and collapsed to chance at epoch 20, while `infer_steps` 1 and 2 at the same rate reached 76.7% and 75.8%, and eta_infer = 1e-2 collapsed by epoch 10 at every step count. Pick eta_infer below 2/λ_max with margin for growth, or track λ_max during training with `scripts/epc_analysis.py --track_lambda_max N`; the same script reproduces the regime analysis on linear graphs.
 
 ```python
 from fabricpc.core.inference_epc import EPCInference
@@ -105,7 +107,7 @@ from fabricpc.core.inference import InferenceSGD, InferenceSchedule
 from fabricpc.core.inference_epc import EPCInference
 
 inference = InferenceSchedule(
-    EPCInference(eta_infer=1e-2, infer_steps=5),
+    EPCInference(eta_infer=1e-3, infer_steps=2),
     InferenceSGD(eta_infer=0.05, infer_steps=20),
 )
 ```
@@ -122,9 +124,9 @@ Schedules nest, and `segments()` flattens them for per-step consumers (tracking 
 | Parameter | Typical Range | Notes |
 |-----------|:-------------:|-------|
 | `eta_infer` (state-based) |   0.01–0.2    | A per-node rate; lower for stability, higher for faster convergence |
-| `eta_infer` (EPCInference) |   1e-5–1e-2   | A global rate through the whole transfer function; tune like a weight learning rate |
+| `eta_infer` (EPCInference) | below 2/λ_max(H_ε) | A global rate through the whole transfer function; the bound is `top_epsilon_eigenvalue` at init and shrinks as the weights grow (1e-2 collapsed the resnet18 demo at every step count) |
 | `infer_steps` (state-based) |  ~5 * depth   | More steps = better convergence, slower training |
-| `infer_steps` (EPCInference) |      1–5      | One reverse pass per step reaches every layer |
+| `infer_steps` (EPCInference) | set by eta_infer·T·λ_max | ≪ 1 is backprop-like (the defaults on resnet18); ≳ 3/λ_min,excited reaches the PC equilibrium; one reverse pass per step reaches every layer |
 | `latent_decay` |      0.0      | Rarely needed; try 0.001 if latents drift |
 | `max_norm` |    0.5–2.0    | For InferenceSGDNormClip; prevents gradient explosions |
 

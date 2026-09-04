@@ -56,10 +56,35 @@ Usage:
 
 
 Results (RTX3090, cuda13, jax 0.10.2):
-ePC training is more stable than sPC on this model, with less sensitivity to
-eta_infer and fewer training collapses. ePC trains >40X faster. ePC achieves
-higher accuracy because deper layers learn weights, whereas the sPC error
-signal decays with depth.
+ePC trains >40X faster per epoch than sPC (11 s vs 487 s) and reaches higher
+accuracy at 100 epochs. At these settings ePC is in its backprop regime: one
+step from zero error leaves each error at -eta_infer times the backprop
+activation gradient, so the local weight gradients are backprop's scaled by
+eta_infer on hidden layers and unscaled on the output, and AdamW normalizes
+the scaling away; the --infer_steps 1 run below matches the backprop trainer
+on the same graph (76.73% vs 77.11%). sPC's error signal decays with depth,
+so its deep layers learn slowly within 120 steps.
+
+Stability: ePC is gradient descent on the energy in error coordinates and is
+stable only for eta_infer < 2/lambda_max, lambda_max the top eigenvalue of
+that energy's Hessian: 16.4 at init on this graph (eta_max = 0.12; a
+one-eigenvalue fit of the 2-epoch sweep gives lambda_eff = 12). lambda_max
+grows with the weights, so a fixed eta_infer can cross the bound late in
+training. The 100-epoch sweep (sweep_eta*_steps*.log):
+
+    eta_infer  infer_steps  eta*T   final accuracy
+    0.001      1            0.001   76.73%
+    0.001      2            0.002   75.76%
+    0.001      5 (default)  0.005   9.75%   (54.76% at epoch 10, 9.68% at epoch 20)
+    0.01       1            0.01    9.92%   (at chance by epoch 10)
+    0.01       2            0.02    9.88%
+    0.01       5            0.05    10.13%
+
+Only eta*T <= 0.002 survived 100 epochs; at 2 epochs even eta*T = 0.16 still
+trains (examples/epc_spc_resnet18_compare.py sweep tables in
+docs/dev_plans_archive/epc_inference_solver.md). The settings block prints
+EPCInference.regime_label at init; scripts/epc_analysis.py --track_lambda_max N
+logs eta_infer*lambda_max during training beside accuracy.
 
 Smoke Test (2 epochs)
 python examples/resnet18_cifar10_demo.py --inference epc
@@ -68,7 +93,8 @@ Test Accuracy: 39.26%
 python examples/resnet18_cifar10_demo.py --inference spc
 Test Accuracy: 33.89%
 
-ePC Results:
+ePC at --infer_steps 1 (the backprop-equivalent regime; compare the backprop
+reference below):
 python examples/resnet18_cifar10_demo.py --num_epochs 100 --eval_every 10 --augment --activation gelu --inference epc --eta_infer 0.001 --infer_steps 1
 Trainer: pc  |  Inference: epc (eta 0.001, 1 steps)  |  Activation: gelu  |  Epochs: 100  |  LR: 0.001  |  Augment: True
   Epoch 10: accuracy=55.83%
@@ -136,6 +162,7 @@ Test Accuracy: 77.11%
 """
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 import optax
 import argparse
@@ -160,7 +187,9 @@ from fabricpc.core.initializers import (
 )
 from fabricpc.core.mupc import MuPCConfig
 from fabricpc.training import EpochContext, evaluate, train
+from fabricpc.graph_initialization.state_initializer import initialize_graph_state
 from fabricpc.utils.data.dataloader import Cifar10Loader
+from fabricpc.utils.linear_pc_oracle import top_epsilon_eigenvalue
 from fabricpc import setup_jax
 
 setup_jax()
@@ -203,6 +232,27 @@ def make_inference(args):
             infer_steps=120 if args.infer_steps is None else args.infer_steps,
             max_norm=1.0,
         )
+
+
+def lambda_max_at_init(params, structure, rng_key, batch_size=64, iters=30):
+    """Top eigenvalue of the energy's Hessian in error coordinates at init,
+    by power iteration through ``EPCInference.error_energy`` on one CIFAR-10
+    test batch. ePC's stability bound is 2/lambda_max and
+    ``EPCInference.regime_label(lambda_max)`` names the regime."""
+    # Slice the split to exactly one batch and read it fully (a half-read tfds
+    # iterator warns on teardown).
+    loader = Cifar10Loader(f"test[:{batch_size}]", batch_size=batch_size, shuffle=False)
+    [(images, labels)] = list(loader)  # labels arrive one-hot
+    clamps = {
+        structure.task_map["x"]: jnp.asarray(images),
+        structure.task_map["y"]: jnp.asarray(labels),
+    }
+    state = initialize_graph_state(
+        structure, batch_size, rng_key, clamps=clamps, params=params
+    )
+    return top_epsilon_eigenvalue(
+        params, state, clamps, structure, iters=iters, key=rng_key
+    )
 
 
 def make_optimizer(lr, weight_decay, num_epochs, steps_per_epoch):
@@ -511,6 +561,13 @@ def run_trial(args, trial_seed):
 
     total_params = sum(p.size for p in jax.tree_util.tree_leaves(params))
     print(f"Total parameters: {total_params:,}")
+    if trainer_mode == "pc" and isinstance(inference, EPCInference):
+        lam = lambda_max_at_init(params, structure, graph_key)
+        print(
+            f"ePC regime at init: {inference.regime_label(lam)}  "
+            f"(lambda_max {lam:.3g} on a 64-sample test batch, "
+            f"eta_max = 2/lambda_max = {2.0 / lam:.3g})"
+        )
 
     # Data
     base_train_loader = Cifar10Loader(
