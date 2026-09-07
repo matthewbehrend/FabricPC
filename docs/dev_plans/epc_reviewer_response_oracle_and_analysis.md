@@ -4,7 +4,7 @@
 
 The reviewer replied to the eight observation bullets that accompanied the resnet18 ePC-vs-sPC convergence figure (`examples/epc_spc_resnet18_compare.py --mode convergence`). Their requests split three ways:
 
-- **Test-suite invariants.** A linear oracle that returns the exact equilibrium state and energy for a range of linear networks, with both `EPCInference` and the state-based solvers checked against it, plus a test of the oracle itself (hard-coded numbers on tiny models, or code readable enough to be obviously right via Innocenti et al. 2024, Theorem 1). A warning that 1-step ePC is backprop with gradients scaled by `eta_infer`.
+- **Test-suite invariants.** A linear oracle that returns the exact equilibrium state and energy for a range of linear networks, with both `EPCInference` and the state-based solvers checked against it, plus a test of the oracle itself (hard-coded numbers on tiny models, or code readable enough to be obviously right via Innocenti et al. 2024, Theorem 1, https://arxiv.org/abs/2408.11979). A warning that 1-step ePC is backprop with gradients scaled by `eta_infer`.
 - **Analytical questions.** Why sPC struggles with deep layers (bullet 1); what sets the equilibrium energy spacing across layers (bullets 2, 3); ePC stability in deep networks and how to pick the largest stable `eta_infer` (bullet 4); the training collapses and whether they occur under muPC (bullet 6, confirmed by the user: the resnet18 demo is a muPC model); how many steps sPC needs to reach equilibrium and why oracle checks should stay at 5 layers or fewer (bullet 7).
 - **Warning adequacy.** The user asked whether the existing caution against `infer_steps=1` says the right thing and appears where users will see it.
 
