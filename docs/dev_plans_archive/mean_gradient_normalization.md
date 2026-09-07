@@ -317,7 +317,8 @@ updated.
   regimes with the measured MNIST accuracies, and the issue 68 link. The
   Practical Guidance learning-rate bullet gives the per-prediction SGD
   constants and the lr·N, wd/N rule.
-- `CHANGELOG.md`: an `[Unreleased]` entry with a four-row migration table
+- `CHANGELOG.md`: a `[0.5.1] - 2026-09-07` entry (the version bump is in
+  `pyproject.toml`) with a four-row migration table
   (custom loops, SGD-family rates, the `energy` semantics, and saved
   natural-gradient optimizer states, which gain `count` and do not restore
   from 0.5.0) and a "New" list (the three exported functions, the
@@ -421,7 +422,11 @@ Then:
    diagonal transform (ρ = 1, scale 1e-5): over 250 steps the per-prediction
    gradient norm fell from 1.29 to 0.05 while the update norm stayed between
    0.04 and 0.28, so the step grew relative to the gradient as the fit
-   improved.
+   improved. The review reproduced this on a 20-dimensional convex quadratic
+   (300 steps, `fisher_decay = 0.95`, ρ = 0.1), loss at its minimum over the
+   run against loss at step 300: diag at scale 0.1, 0.037 then 0.556;
+   layerwise at scale 0.1, 2.5e-9 then 0.418; layerwise at scale 0.01,
+   2.1e-7 then 0.026; SGD at 0.1 fell monotonically to 3.0e-5.
 
    Exact rescale of the parent presets (`damping = 1e-3 / N²`, `scale / N`,
    N = 200, with the bias correction), energy / accuracy at epoch 5 and 10:
@@ -532,6 +537,23 @@ in the training guide, the eval-metric table row to be corrected, the
 batch-size import in the dashboarding step to be replaced by an export, and
 the CHANGELOG to record the NGD state field. The revision implemented the
 reduced route described under "Natural-gradient transforms: reduced route"
-together with those items. GitHub issue 68
-(https://github.com/trueagi-io/FabricPC/issues/68) was updated with the
-learnings from the NGD tests and the new requirements for the estimator.
+together with those items. Two decisions from the review discussion are
+recorded here because they are not derivable from the code: the multi-head
+prediction count stays the sum over heads (the alternative is listed above),
+and the CHANGELOG carries no text translating pre-normalization `damping`
+values, because no user depends on them and the default changes. GitHub
+issue 68 (https://github.com/trueagi-io/FabricPC/issues/68) was updated with
+the learnings from the NGD tests and the new requirements for the estimator
+(a per-sample Monte-Carlo diagonal Fisher, generic through `NodeBase`); the
+per-sample Fisher design lives there, not in this repository.
+
+Checks the review made that no test covers:
+
+- muPC scaling is multiplicative per edge, so uniform division by N is
+  orthogonal to it.
+- `grad_denominator` on a target-free graph with an injected causal mask
+  reads B from the first clamp, which `build_clamps` inserts before the mask.
+- `optax.safe_int32_increment` exists at the declared optax floor (0.1.7).
+- `scripts/diagnose_deep_mupc.py` and the tests that call
+  `compute_local_weight_gradients` directly only inspect gradients, so no
+  caller is left on the summed scale.
