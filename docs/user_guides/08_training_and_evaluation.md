@@ -38,7 +38,10 @@ output node's energy functional in the graph definition selects the loss.**
 "Per prediction" means divided by N, the prediction count: the total number
 of clamped-target prediction positions in the batch (`batch` for
 classification, `batch * seq_len` for token targets; `batch` when the graph
-has no clamped target). Both algorithms divide their objective and their
+has no clamped target). With several clamped target heads N is the sum of
+their prediction positions (two same-shape heads give N = 2 * batch), so
+adding a head halves the step every shared parameter takes at a fixed
+learning rate. Both algorithms divide their objective and their
 gradients by the same N, so a learning rate, clipping threshold, or Adam
 epsilon means the same under either algorithm and across batch sizes and
 sequence lengths. `fabricpc.training.grad_denominator(structure, clamps)`
@@ -184,7 +187,7 @@ energy framing:
 | `accuracy` | always | `argmax(z_mu, -1)` compared to `argmax(y, -1)` for one-hot targets (same rank as `z_mu`), or directly to integer class labels of lower rank; per prediction (argmax-based: meaningful for class-like targets, not continuous ones) |
 | `cross_entropy` | target functional is `CrossEntropyEnergy` | identical to `target_energy` in that case; the conventional name |
 | `perplexity` | target functional is `CrossEntropyEnergy` | `exp(cross_entropy)` |
-| `energy` | `algorithm="pc"` | per-sample energy over internal nodes — the PC training objective's definition |
+| `energy` | `algorithm="pc"` | internal energy per prediction, the PC training objective's scale |
 
 A graph with no target task key raises under the defaults; pass an explicit
 metrics dict to evaluate such a graph.

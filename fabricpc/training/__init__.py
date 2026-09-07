@@ -29,6 +29,7 @@ __all__ = [
     "evaluate",
     "make_train_step",
     "generate",
+    "batch_size_of",
     "build_clamps",
     "convert_batch",
     "create_causal_mask",

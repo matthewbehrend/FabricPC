@@ -105,34 +105,24 @@ OPTIMIZER_PRESETS = {
     "sgd": lambda: optax.chain(
         optax.add_decayed_weights(5e-4), optax.sgd(2.0, momentum=0.9)
     ),
-    # Natural-gradient presets: the exact per-prediction analog of the former
-    # summed-gradient constants (damping 1e-3, scale 3e-4 and 1e-3). F shrinks
-    # by N**2 and g by N, so damping / N**2 and scale / N give the same
-    # trajectory up to the Fisher EMA's new bias correction in the first steps
-    # (10 epochs, RTX 3090: ngd_diag 23.78% vs 25.25% on the parent commit,
-    # ngd_layerwise 9.74% on both). relative_damping is 0 here because the
-    # default 0.1 adds a term about 30x this absolute damping and changes the
-    # regime (both presets then stay at chance). Measured regime for ngd_diag:
-    # from the first step 96.5% of Fisher entries lie below the damping and are
-    # updated as SGD with rate scale / damping = 60; the remaining entries
-    # (0.3% by step 300) hold essentially all of trace(F) and get the 1 / g
-    # natural-gradient step. With relative damping alone neither transform
-    # left chance accuracy on this demo in 10 epochs at any of 48 settings.
-    # See fabricpc.training.natural_gradients and
-    # docs/dev_plans_archive/mean_gradient_normalization.md.
+    # Natural-gradient presets. The transforms' Fisher is the squared mean
+    # gradient (see fabricpc.training.natural_gradients): where the damping
+    # dominates it the update is SGD with rate scale / damping, elsewhere about
+    # 1 / g. At the default damping (1e-8) 95% of the Fisher entries sit below
+    # it at step 1 and 99.7% after one epoch, so these presets run as SGD with
+    # rate 60 (diag) and 200 (layerwise) on almost every weight. Swept on this
+    # graph over damping 1e-8..1e-4 and scale / damping 20..2000 at 10 epochs:
+    # ngd_diag 16.27%, ngd_layerwise 10.28% (chance) (adamw 97%);
+    # no setting did better. Issue 68 tracks the estimator fix.
     "ngd_diag": lambda: optax.chain(
         optax.add_decayed_weights(5e-4),
-        scale_by_natural_gradient_diag(
-            fisher_decay=0.95, relative_damping=0.0, damping=1e-3 / batch_size**2
-        ),
-        optax.scale(-0.0003 / batch_size),
+        scale_by_natural_gradient_diag(),
+        optax.scale(-6e-7),
     ),
     "ngd_layerwise": lambda: optax.chain(
         optax.add_decayed_weights(5e-4),
-        scale_by_natural_gradient_layerwise(
-            fisher_decay=0.95, relative_damping=0.0, damping=1e-3 / batch_size**2
-        ),
-        optax.scale(-0.001 / batch_size),
+        scale_by_natural_gradient_layerwise(),
+        optax.scale(-2e-6),
     ),
 }
 

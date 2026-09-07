@@ -19,7 +19,7 @@ from the graph: the target node's own energy functional selects the loss and
 therefore the default eval metrics. Every built-in metric weights a sample by
 its prediction positions (sequence length for token targets, 1 for
 classification), the same count the trainer divides by, so eval and training
-values share one per-prediction scale.
+values share the same per-prediction scale.
 """
 
 from typing import Any, Callable, Dict, List, NamedTuple, Tuple

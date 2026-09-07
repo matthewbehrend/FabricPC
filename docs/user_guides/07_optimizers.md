@@ -78,13 +78,13 @@ optimizer = optax.adam(schedule)
 
 ## Natural Gradient Transforms
 
-FabricPC provides two natural gradient transforms in `fabricpc.training.natural_gradients`.
-Both divide the gradient by an online diagonal Fisher estimate F, an
-exponential moving average (EMA) of the squared gradient, bias-corrected for
-the EMA's zero start (`F / (1 - fisher_decay**t)` after `t` steps, as Adam
-corrects its second moment). Follow them with `optax.scale(-lr)` to apply a
-step size; the presets in `examples/mnist_advanced.py` show calibrated
-constants.
+FabricPC provides two natural-gradient-style transforms in
+`fabricpc.training.natural_gradients`. Both divide the gradient by an online
+diagonal Fisher estimate F, an exponential moving average (EMA) of the squared
+gradient, bias-corrected for the EMA's zero start (`F / (1 - fisher_decay**t)`
+after `t` steps, as Adam corrects its second moment). Follow them with
+`optax.scale(-lr)` to apply a step size; the presets in
+`examples/mnist_advanced.py` carry constants swept on the MNIST demo.
 
 **Diagonal Fisher preconditioning**:
 
@@ -92,7 +92,7 @@ constants.
 from fabricpc.training.natural_gradients import scale_by_natural_gradient_diag
 
 optimizer = optax.chain(
-    scale_by_natural_gradient_diag(fisher_decay=0.95, relative_damping=0.1),
+    scale_by_natural_gradient_diag(fisher_decay=0.95, damping=1e-8),
     optax.scale(-1e-3),
 )
 ```
@@ -105,50 +105,36 @@ One Fisher entry per parameter. More expressive but higher memory.
 from fabricpc.training.natural_gradients import scale_by_natural_gradient_layerwise
 
 optimizer = optax.chain(
-    scale_by_natural_gradient_layerwise(fisher_decay=0.95, relative_damping=0.1),
+    scale_by_natural_gradient_layerwise(fisher_decay=0.95, damping=1e-8),
     optax.scale(-1e-3),
 )
 ```
 
 One scalar Fisher estimate per parameter tensor (the EMA of the tensor's mean
-squared gradient). Cheaper and more stable for large tensors.
+squared gradient). Cheaper for large tensors.
 
 Parameters for both:
 - `fisher_decay` — EMA decay for the Fisher estimate, in [0, 1). Default: 0.95
-- `relative_damping` — damping as a fraction of the mean Fisher entry, >= 0.
-  Default: 0.1
-- `damping` — absolute damping added to the denominator, >= 0. Default: 0
-  (off). At least one of the two damping terms must be positive.
+- `damping` — positive constant added to the Fisher. Default: 1e-8,
+  chosen on the MNIST demo at the per-prediction gradient scale, where
+  gradients of about 1e-3 per weight give Fisher entries of about 1e-6.
 
-**Why the damping is relative.** The update `g / F` is covariant: scaling
-every gradient by a constant c scales F by c² and the update by 1/c. The
-damping reference is r = trace(F) / dim, the mean bias-corrected Fisher entry
-over the whole parameter pytree (for the layer-wise transform each tensor's
-scalar counts with weight equal to the tensor's size, so both transforms use
-the same r), and the update is `g / (F + relative_damping * r)`. Both
-denominator terms scale by c², so the update still scales by exactly 1/c and
-the set of parameters where damping dominates the Fisher does not depend on
-the gradient scale. An absolute damping constant would pin that regime to one
-gradient scale: with gradients N times smaller, F shrinks N² times and the
-constant silently takes over, turning the transform into plain SGD. With
-`damping = 0` no constant is added to the denominator; if every gradient seen
-so far is zero the update is zero.
-
-**Limitations of the present implementations.** F is the squared *mean*
-gradient of the batch, not a per-sample Fisher, so `g / F` is about `1 / g`:
-the entries with the largest gradients get the smallest steps, and the step
-grows relative to the gradient as training shrinks it. On the MNIST demo
-(`examples/mnist_advanced.py`, a four-layer sigmoid MLP) neither transform left
-chance accuracy in 10 epochs with relative damping alone, at any of 48 tried
-combinations of `optax.scale`, `relative_damping`, and a global-norm clip,
-while `optax.adamw` reaches 97% on the same graph. The demo's `ngd_diag` and
-`ngd_layerwise` presets use `relative_damping=0` with an absolute `damping`
-that, measured, lies above 96.5% of the Fisher entries from the first step:
-those entries are updated as SGD with rate `scale / damping`, and only the few
-large-gradient entries receive the natural-gradient step. Even so `ngd_diag`
-reaches 24% at 10 epochs and `ngd_layerwise` stays at chance. Use these
-transforms as research baselines, not as tuned optimizers. The measurements
-are recorded in `docs/dev_plans_archive/mean_gradient_normalization.md`.
+**What the update is.** With `f` the bias-corrected Fisher entry, the update is
+`g / (f + damping)`. Where `damping` dominates `f`, the update is
+`g / damping`: SGD with learning rate `scale / damping`. Where `f` dominates, `f` is
+about `g²`, because it is built from the squared mean gradient of the batch
+rather than from per-sample gradients, so the update is about `1 / g`: the
+entries with the largest gradients move least, and the step grows relative to
+the gradient as training shrinks it. Neither regime is a natural-gradient step,
+and no damping value produces one: a smaller value moves more entries into the
+`1 / g` regime, a larger value into SGD. At the default the damping exceeds 95%
+of the Fisher entries from the first step of the MNIST demo, so both transforms
+act as SGD on almost every parameter; `ngd_diag` reaches 16% and
+`ngd_layerwise` stays at chance (10%) at 10 epochs, against 97% for
+`optax.adamw`. Treat them as research baselines. The estimator redesign, a
+Fisher from per-sample gradients at latents sampled from each node's predictive
+distribution, is tracked in [issue 68](https://github.com/trueagi-
+io/FabricPC/issues/68).
 
 ## Practical Guidance
 

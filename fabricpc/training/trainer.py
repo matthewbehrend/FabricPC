@@ -147,7 +147,7 @@ def create_causal_mask(seq_len: int) -> jnp.ndarray:
     return jnp.tril(jnp.ones((seq_len, seq_len)))
 
 
-def _batch_size(batch: Dict[str, jnp.ndarray], structure: GraphStructure) -> int:
+def batch_size_of(batch: Dict[str, jnp.ndarray], structure: GraphStructure) -> int:
     """Leading-axis size of the first batch key the ``task_map`` names.
 
     Reading an arbitrary batch value would trust extra keys whose leading
@@ -215,7 +215,7 @@ def build_clamps(
         # The mask node declares (..., seq, seq); read seq from the graph, not
         # from a hard-coded batch key.
         seq_len = structure.nodes[mask_node].node_info.shape[-1]
-        batch_size = _batch_size(batch, structure)
+        batch_size = batch_size_of(batch, structure)
         mask = create_causal_mask(seq_len)[None, None, :, :]
         clamps[mask_node] = jnp.broadcast_to(mask, (batch_size, 1, seq_len, seq_len))
     return clamps
@@ -298,30 +298,23 @@ def grad_denominator(structure: GraphStructure, clamps: Dict[str, jnp.ndarray]) 
     clamp is the class axis: ``build_clamps`` validates every target clamp
     against ``(batch, *node.shape)``, so rank >= 2 holds. A rank-2
     classification target ``(B, C)`` gives N = B; a rank-3 token target
-    ``(B, S, V)`` gives N = B * S. With no clamped target (associative-memory
-    graphs) N is the batch size, read from the leading axis of the first
-    clamp. N is the per-batch total of the per-sample weight that
-    ``metrics._internal_energy_fn`` assigns in ``evaluate``, so the train and
-    eval ``energy`` share one scale. Empty ``clamps`` raises ``ValueError``:
-    nothing is clamped, so there is no objective.
+    ``(B, S, V)`` gives N = B * S. With several target heads N is the sum of
+    their positions (two same-shape heads give N = 2 * B), so adding a head
+    halves the step every shared parameter takes at a fixed learning rate.
+    With no clamped target (associative-memory graphs) N is the batch size,
+    read from the leading axis of the first clamp. Empty ``clamps`` raises
+    ``ValueError``: nothing is clamped, so there is no objective.
 
-    A clamped input node that receives feedback edges has ``in_degree > 0``
-    and counts as a target under this rule. No graph in the repository does
-    this (the cyclic and lateral MNIST demos leave ``pixels`` edge-free on
-    the input side).
+    N is the per-batch total of the per-sample weight that
+    ``metrics._internal_energy_fn`` assigns in ``evaluate``, so the train and
+    eval ``energy`` share one scale. A clamped input node with feedback edges
+    has ``in_degree > 0`` and counts as a target; no graph in the repository
+    does this.
 
     Gradients arrive batch-summed from ``compute_local_weight_gradients``
-    and are divided once by this global count, in ``pc_weight_gradients``.
-    If gradient accumulation over microbatches is added, keep that
-    structure: accumulate the unnormalized sums across microbatches and
-    divide once by the count summed over the whole accumulation window.
-    Dividing per microbatch and averaging overweights predictions in small
-    microbatches when token counts differ. If padded positions gain a
-    validity mask, replace the static shape product with ``jnp.sum(mask)``.
-    Under jit + ``NamedSharding`` (the trainer's data parallelism),
-    trace-time shapes and reductions are global, so this count is already
-    global; a ``shard_map``/``pmap`` port sees per-shard shapes and must
-    ``jax.lax.psum`` the per-shard count over the data axis.
+    and are divided once by this count in ``pc_weight_gradients``.
+    Accumulation over microbatches or a padding mask must keep that shape:
+    sum first, divide once by the window's total count.
     """
     if not clamps:
         raise ValueError(
@@ -355,7 +348,7 @@ def pc_weight_gradients(
 
 def _batch_grads(params, batch, structure, rng_key, *, algorithm):
     """Gradients and metrics for one batch — the only algorithm branch."""
-    batch_size = _batch_size(batch, structure)
+    batch_size = batch_size_of(batch, structure)
     clamps = build_clamps(batch, structure, clamp_target=True)
     target_nodes = _target_node_names(structure, clamps)
     # Static at trace time; global under jit + NamedSharding.
@@ -598,7 +591,7 @@ def train(
                 break
             batch = convert_batch(batch_data)
             if mesh is not None:
-                bsz = _batch_size(batch, structure)
+                bsz = batch_size_of(batch, structure)
                 if bsz % data_axis_size != 0:
                     if not shard_warned:
                         warnings.warn(
@@ -723,7 +716,7 @@ def evaluate(
     metric_names = tuple(metric_map)
 
     def eval_step(p, batch, key, sample_mask):
-        batch_size = _batch_size(batch, structure)
+        batch_size = batch_size_of(batch, structure)
         clamps = build_clamps(batch, structure, clamp_target=False)
         state = initialize_graph_state(
             structure, batch_size, key, clamps=clamps, params=p
@@ -753,7 +746,7 @@ def evaluate(
     totals = {name: (jnp.zeros(()), jnp.zeros(())) for name in metric_names}
     for batch_idx, batch_data in enumerate(test_loader):
         batch = convert_batch(batch_data)
-        bsz = _batch_size(batch, structure)
+        bsz = batch_size_of(batch, structure)
         sample_mask = jnp.ones((bsz,))
         if mesh is not None:
             if bsz % data_axis_size != 0:

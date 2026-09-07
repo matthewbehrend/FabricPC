@@ -17,7 +17,7 @@ from fabricpc.core.types import (
 from fabricpc.core.energy import graph_energy
 from fabricpc.graph_initialization.state_initializer import initialize_graph_state
 from fabricpc.training.trainer import (
-    _batch_size,
+    batch_size_of,
     build_clamps,
     grad_denominator,
     pc_weight_gradients,
@@ -205,7 +205,7 @@ def train_step_with_history(
         (``fabricpc.training.grad_denominator``).
         Call unstack_inference_history() on stacked_inference_history outside JIT.
     """
-    batch_size = _batch_size(batch, structure)
+    batch_size = batch_size_of(batch, structure)
 
     clamps = build_clamps(batch, structure, clamp_target=True)
     denom = grad_denominator(structure, clamps)
