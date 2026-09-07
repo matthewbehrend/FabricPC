@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.5.1] - 2026-09-07
 
 Gradients reaching optax are now means per prediction under both algorithms.
 The trainer divides the batch-summed PC weight gradients and the backprop
