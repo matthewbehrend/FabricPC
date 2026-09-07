@@ -14,6 +14,7 @@ from fabricpc.training.metrics import EvalMetric
 from fabricpc.training.trainer import (
     EpochContext,
     TrainResult,
+    batch_size_of,
     build_clamps,
     convert_batch,
     create_causal_mask,
