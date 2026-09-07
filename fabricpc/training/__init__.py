@@ -14,11 +14,14 @@ from fabricpc.training.metrics import EvalMetric
 from fabricpc.training.trainer import (
     EpochContext,
     TrainResult,
+    batch_size_of,
     build_clamps,
     convert_batch,
     create_causal_mask,
     evaluate,
+    grad_denominator,
     make_train_step,
+    pc_weight_gradients,
     train,
 )
 
@@ -27,9 +30,12 @@ __all__ = [
     "evaluate",
     "make_train_step",
     "generate",
+    "batch_size_of",
     "build_clamps",
     "convert_batch",
     "create_causal_mask",
+    "grad_denominator",
+    "pc_weight_gradients",
     "TrainResult",
     "EpochContext",
     "EvalMetric",

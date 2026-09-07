@@ -19,7 +19,12 @@ import jax.numpy as jnp
 import optax
 import pytest
 
-from conftest import ListLoader, make_classification_structure, max_param_diff
+from conftest import (
+    ListLoader,
+    make_classification_structure,
+    max_param_diff,
+    with_inference,
+)
 from fabricpc.core.activations import (
     IdentityActivation,
     SigmoidActivation,
@@ -44,8 +49,10 @@ from fabricpc.training import (
     build_clamps,
     evaluate,
     generate,
+    grad_denominator,
     make_train_step,
     metrics as metrics_mod,
+    pc_weight_gradients,
     train,
 )
 
@@ -164,7 +171,7 @@ def test_pc_parity_hand_rolled_reference(rng_key, graph_kind):
             structure, batch["x"].shape[0], key, clamps=clamps, params=p
         )
         state = run_inference(p, state, clamps, structure)
-        grads = compute_local_weight_gradients(p, state, structure)
+        grads = pc_weight_gradients(p, state, structure, clamps)
         updates, opt_state = optimizer.update(grads, opt_state, p)
         return optax.apply_updates(p, updates), opt_state
 
@@ -210,7 +217,8 @@ def test_backprop_gradient_matches_reference_ce(rng_key):
         b2 = p.nodes["y"].biases["b"]
         hidden = jax.nn.sigmoid(x @ w1 + b1)
         probs = jax.nn.softmax(hidden @ w2 + b2, axis=-1)
-        # CrossEntropyEnergy: -sum y*log(clip(mu, 1e-7, 1)), summed then /batch
+        # CrossEntropyEnergy: -sum y*log(clip(mu, 1e-7, 1)), summed then
+        # / prediction count (= batch for a rank-2 target)
         return -jnp.sum(y * jnp.log(jnp.clip(probs, 1e-7, 1.0))) / x.shape[0]
 
     ref_grads = jax.grad(reference_loss)(params)
@@ -228,8 +236,9 @@ def test_backprop_gradient_matches_reference_ce(rng_key):
 
 
 def test_backprop_gaussian_objective_is_precision_sse(rng_key):
-    """A GaussianEnergy output's backprop objective is 0.5*precision*SSE/batch,
-    not an element-mean MSE."""
+    """A GaussianEnergy output's backprop objective is 0.5*precision*SSE
+    / prediction count (= batch for a rank-2 target), not an element-mean
+    MSE."""
     precision = 2.0
     structure = classification_structure(
         output_energy=GaussianEnergy(precision=precision),
@@ -674,9 +683,10 @@ def test_custom_metric_weighted_aggregation_uneven_batches(rng_key):
 
 
 def test_eval_energy_matches_graph_energy(rng_key):
-    """evaluate's default 'energy' metric must agree with graph_energy /
-    batch_size — metrics._internal_energy_fn re-implements graph_energy's
-    node ordering, so a divergence would otherwise be silent. GlobalStateInit
+    """evaluate's default 'energy' metric must agree with graph_energy / N
+    (N = B for a rank-2 target) — metrics._internal_energy_fn re-implements
+    graph_energy's node ordering, so a divergence would otherwise be silent.
+    GlobalStateInit
     keeps the eval energy nonzero (a free feedforward output sits at its
     zero-error fixed point)."""
     structure = rng_sensitive_structure()
@@ -696,11 +706,9 @@ def test_eval_energy_matches_graph_energy(rng_key):
     assert abs(out["energy"] - expected) < 1e-5
 
 
-def test_multi_target_metric_accumulation(rng_key):
-    """Two target nodes: each default metric sums values AND weights across
-    targets, so the mean is per prediction over both heads — pins the
-    accumulation loops in metrics.py, which single-target tests never
-    iterate twice."""
+def two_target_structure():
+    """x(4) feeding two softmax + CE heads y1(3) and y2(5); task keys
+    ``y`` -> y1 and ``y2`` -> y2."""
     x_node = Linear(shape=(4,), name="x")
     y1 = Linear(
         shape=(3,),
@@ -714,7 +722,7 @@ def test_multi_target_metric_accumulation(rng_key):
         energy=CrossEntropyEnergy(),
         name="y2",
     )
-    structure = graph(
+    return graph(
         nodes=[x_node, y1, y2],
         edges=[
             Edge(source=x_node, target=y1.slot("in")),
@@ -723,6 +731,14 @@ def test_multi_target_metric_accumulation(rng_key):
         task_map=TaskMap(x=x_node, y=y1, y2=y2),
         inference=InferenceSGD(eta_infer=0.05, infer_steps=5),
     )
+
+
+def test_multi_target_metric_accumulation(rng_key):
+    """Two target nodes: each default metric sums values AND weights across
+    targets, so the mean is per prediction over both heads — pins the
+    accumulation loops in metrics.py, which single-target tests never
+    iterate twice."""
+    structure = two_target_structure()
     params = initialize_params(structure, rng_key)
     kx, k1, k2 = jax.random.split(rng_key, 3)
     batch = {
@@ -749,6 +765,205 @@ def test_multi_target_metric_accumulation(rng_key):
     assert abs(out["accuracy"] - correct / 8.0) < 1e-5
     assert abs(out["cross_entropy"] - ce_total / 8.0) < 1e-4
     assert abs(out["perplexity"] - math.exp(ce_total / 8.0)) < 1e-3
+
+
+# ---------------------------------------------------------------------------
+# Gradient normalization: one global prediction count N
+# ---------------------------------------------------------------------------
+
+
+def make_v1_token_batch(rng_key, *, batch_size=3, seq_len=5, vocab=7):
+    """Float (B, S, V) input and int (B, S) targets for v1_masked_structure."""
+    kx, ky = jax.random.split(rng_key)
+    return {
+        "x": jax.random.normal(kx, (batch_size, seq_len, vocab)),
+        "y": jax.random.randint(ky, (batch_size, seq_len), 0, vocab),
+    }
+
+
+def _relative_deviation(node_grads, reference) -> float:
+    """||a - b|| / ||b|| over all leaves of one node's parameters."""
+    diff = jax.tree_util.tree_map(
+        lambda a, b: jnp.sum((a - b) ** 2), node_grads, reference
+    )
+    norm = jax.tree_util.tree_map(lambda b: jnp.sum(b**2), reference)
+    num = jax.tree_util.tree_reduce(lambda x, y: x + y, diff, jnp.zeros(()))
+    den = jax.tree_util.tree_reduce(lambda x, y: x + y, norm, jnp.zeros(()))
+    return float(jnp.sqrt(num) / jnp.sqrt(den))
+
+
+def test_backprop_rank3_objective_divides_by_batch_times_seq(rng_key):
+    """A (B, S, V) token target has N = B*S prediction positions: the
+    backprop objective, both metrics, and the applied gradient are the target
+    energy / (B*S), not / B."""
+    seq_len, vocab, batch_size = 5, 7, 3
+    structure = v1_masked_structure(seq_len, vocab)
+    params = initialize_params(structure, rng_key)
+    batch = make_v1_token_batch(rng_key, batch_size=batch_size)
+    clamps = build_clamps(batch, structure, clamp_target=True)
+    n_predictions = batch_size * seq_len
+    assert grad_denominator(structure, clamps) == n_predictions
+
+    optimizer = optax.sgd(1.0)
+    step = make_train_step(structure, optimizer, algorithm="backprop")
+    new_params, _, metrics, state = step(params, optimizer.init(params), batch, rng_key)
+    expected = float(graph_energy(state, structure, node_names=("out",)))
+    expected /= n_predictions
+    assert expected > 0.0
+    assert abs(float(metrics["energy"]) - expected) < 1e-5
+    assert abs(float(metrics["target_energy"]) - expected) < 1e-5
+
+    def objective(p):
+        st = initialize_graph_state(
+            structure, batch_size, rng_key, clamps=clamps, params=p
+        )
+        return graph_energy(st, structure, node_names=("out",)) / n_predictions
+
+    ref_grads = jax.grad(objective)(params)
+    applied = jax.tree_util.tree_map(lambda o, n: o - n, params, new_params)
+    assert max_param_diff(ref_grads, applied) < 1e-5
+
+
+def test_pc_energy_rank3_target_is_per_prediction(rng_key):
+    """PC 'energy' on a (B, S, V) target is graph_energy / (B*S), the same
+    scale as 'target_energy'."""
+    seq_len, vocab, batch_size = 5, 7, 3
+    structure = v1_masked_structure(seq_len, vocab)
+    params = initialize_params(structure, rng_key)
+    batch = make_v1_token_batch(rng_key, batch_size=batch_size)
+    optimizer = optax.sgd(0.1)
+    step = make_train_step(structure, optimizer)
+    _, _, metrics, state = step(params, optimizer.init(params), batch, rng_key)
+    expected = float(graph_energy(state, structure)) / (batch_size * seq_len)
+    assert expected > 0.0
+    assert abs(float(metrics["energy"]) - expected) < 1e-5
+
+
+def test_target_free_pc_graph_normalizes_by_batch(rng_key):
+    """With no clamped target N = B: the optimizer-facing gradients are the raw
+    sums / B and 'energy' is graph_energy / B. The energy comes from the
+    internal node h (x -> h -> g): a free terminal node such as g is held at
+    its projection with zero energy, and GlobalStateInit keeps h's error
+    nonzero (a feedforward-initialized free node sits at its zero-error fixed
+    point)."""
+    x_node = Linear(shape=(4,), name="x")
+    h = Linear(shape=(5,), activation=SigmoidActivation(), name="h")
+    g = Linear(shape=(3,), activation=SigmoidActivation(), name="g")
+    structure = graph(
+        nodes=[x_node, h, g],
+        edges=[
+            Edge(source=x_node, target=h.slot("in")),
+            Edge(source=h, target=g.slot("in")),
+        ],
+        task_map=TaskMap(x=x_node),
+        inference=InferenceSGD(eta_infer=0.05, infer_steps=3),
+        graph_state_initializer=GlobalStateInit(),
+    )
+    params = initialize_params(structure, rng_key)
+    batch_size = 6
+    batch = {"x": jax.random.normal(rng_key, (batch_size, 4))}
+    clamps = build_clamps(batch, structure, clamp_target=True)
+    assert grad_denominator(structure, clamps) == batch_size
+
+    state = initialize_graph_state(
+        structure, batch_size, rng_key, clamps=clamps, params=params
+    )
+    state = run_inference(params, state, clamps, structure)
+    raw = compute_local_weight_gradients(params, state, structure)
+    normalized = pc_weight_gradients(params, state, structure, clamps)
+    assert max_param_diff(raw, normalized) > 0.0
+    scaled = jax.tree_util.tree_map(lambda g: g / batch_size, raw)
+    assert max_param_diff(scaled, normalized) == 0.0
+
+    optimizer = optax.sgd(0.1)
+    step = make_train_step(structure, optimizer)
+    _, _, metrics, final_state = step(params, optimizer.init(params), batch, rng_key)
+    expected = float(graph_energy(final_state, structure)) / batch_size
+    assert expected > 0.0
+    assert abs(float(metrics["energy"]) - expected) < 1e-5
+    assert float(metrics["target_energy"]) == 0.0
+
+
+def test_grad_denominator_raises_on_empty_clamps():
+    structure = classification_structure()
+    with pytest.raises(ValueError, match="clamps"):
+        grad_denominator(structure, {})
+
+
+def test_grad_denominator_matches_eval_energy_weights(rng_key):
+    """grad_denominator equals the batch total of _internal_energy_fn's
+    per-sample weight, for a sequence batch (N = B*S) and a two-target batch
+    (N = B * 2): the train and eval 'energy' divide by the same count."""
+    cases = [
+        (v1_masked_structure(5, 7), make_v1_token_batch(rng_key), 3 * 5),
+    ]
+    kx, k1, k2 = jax.random.split(rng_key, 3)
+    two_target_batch = {
+        "x": jax.random.normal(kx, (4, 4)),
+        "y": jax.random.randint(k1, (4,), 0, 3),
+        "y2": jax.random.randint(k2, (4,), 0, 5),
+    }
+    cases.append((two_target_structure(), two_target_batch, 4 * 2))
+    for structure, batch, expected in cases:
+        clamps = build_clamps(batch, structure, clamp_target=True)
+        params = initialize_params(structure, rng_key)
+        batch_size = batch["x"].shape[0]
+        state = initialize_graph_state(
+            structure, batch_size, rng_key, clamps=clamps, params=params
+        )
+        _, weight = metrics_mod._internal_energy_fn(state, batch, structure)
+        assert weight.shape == (batch_size,)
+        assert grad_denominator(structure, clamps) == expected
+        assert float(jnp.sum(weight)) == expected
+
+
+def test_one_step_pc_gradients_vs_backprop(rng_key):
+    """One InferenceSGD step from the feedforward state moves only the hidden
+    latent, by -eta * dE/dz_h (its own error is zero there), so the hidden
+    node's local weight gradient is exactly eta times the backprop gradient
+    of the target energy, for any eta. The output node's local gradient is
+    re-evaluated at the moved hidden latent and differs from backprop by
+    O(eta); the deviation shrinks with eta. Both sides divide by N = B.
+
+    The hidden identity is checked at eta = 0.1: the hidden error is formed
+    as (mu_h - eta * grad) - mu_h in float32, whose rounding error is
+    ulp(mu_h) / (eta * |grad|), about 1e-6 at eta = 0.1 and 1e-3 at
+    eta = 1e-4, so smaller eta would measure rounding, not the identity.
+    """
+    base = classification_structure()
+    params = initialize_params(base, rng_key)
+    kx, ky = jax.random.split(rng_key)
+    batch_size = 4
+    batch = {
+        "x": jax.random.normal(kx, (batch_size, 6)),
+        "y": jax.nn.one_hot(jax.random.randint(ky, (batch_size,), 0, 3), 3),
+    }
+    clamps = build_clamps(batch, base, clamp_target=True)
+
+    optimizer = optax.sgd(1.0)
+    bp_step = make_train_step(base, optimizer, algorithm="backprop")
+    new_params, *_ = bp_step(params, optimizer.init(params), batch, rng_key)
+    bp_grads = jax.tree_util.tree_map(lambda o, n: o - n, params, new_params)
+
+    def pc_grads(eta):
+        structure = with_inference(base, eta_infer=eta, infer_steps=1)
+        state = initialize_graph_state(
+            structure, batch_size, rng_key, clamps=clamps, params=params
+        )
+        state = run_inference(params, state, clamps, structure)
+        return pc_weight_gradients(params, state, structure, clamps)
+
+    eta = 0.1
+    hidden_ref = jax.tree_util.tree_map(lambda g: eta * g, bp_grads.nodes["h"])
+    assert _relative_deviation(pc_grads(eta).nodes["h"], hidden_ref) < 1e-5
+
+    deviations = [
+        _relative_deviation(pc_grads(eta).nodes["y"], bp_grads.nodes["y"])
+        for eta in (1e-1, 1e-2, 1e-3)
+    ]
+    for eta, dev in zip((1e-1, 1e-2, 1e-3), deviations):
+        assert 0.0 < dev < 10.0 * eta
+    assert deviations[0] > deviations[1] > deviations[2]
 
 
 # ---------------------------------------------------------------------------

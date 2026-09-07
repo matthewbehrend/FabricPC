@@ -25,7 +25,7 @@ inside the step:
 | sub-step | PC | backprop |
 |---|---|---|
 | produce state | initialize, then settle the latents via `run_inference` | single feedforward pass (`FeedforwardStateInit`), no inference |
-| objective | energy summed over all internal (`in_degree > 0`) nodes, per sample | energy of the clamped target nodes, per sample |
+| objective | energy summed over all internal (`in_degree > 0`) nodes, per prediction | energy of the clamped target nodes, per prediction |
 | gradients | local per-node Hebbian gradients | `jax.value_and_grad` through the forward pass |
 
 The backprop objective is the clamped target node's energy — the negative log
@@ -33,7 +33,20 @@ probability the output node's energy functional assigns to the clamped target
 given the feedforward prediction. There is no `loss_type` option: **the
 output node's energy functional in the graph definition selects the loss.**
 `CrossEntropyEnergy()` on the output gives cross-entropy training;
-`GaussianEnergy(precision=p)` gives `0.5 * p * ||y - mu||^2` per sample.
+`GaussianEnergy(precision=p)` gives `0.5 * p * ||y - mu||^2` per prediction.
+
+"Per prediction" means divided by N, the prediction count: the total number
+of clamped-target prediction positions in the batch (`batch` for
+classification, `batch * seq_len` for token targets; `batch` when the graph
+has no clamped target). With several clamped target heads N is the sum of
+their prediction positions (two same-shape heads give N = 2 * batch), so
+adding a head halves the step every shared parameter takes at a fixed
+learning rate. Both algorithms divide their objective and their
+gradients by the same N, so a learning rate, clipping threshold, or Adam
+epsilon means the same under either algorithm and across batch sizes and
+sequence lengths. `fabricpc.training.grad_denominator(structure, clamps)`
+returns N, and `fabricpc.training.pc_weight_gradients` is the PC gradient
+already divided by it, for custom loops.
 
 Integer or bool targets are one-hot encoded automatically from their dtype
 (with the class count taken from the target node's last shape axis), so token
@@ -104,16 +117,14 @@ Each step produces two device scalars, materialized to floats at epoch
 boundaries (or per batch when `verbose=True` or an `iter_callback` is
 supplied — both force a per-batch device sync):
 
-- `energy` — the per-sample objective the gradients descend. This is
-  **algorithm-dependent** (all internal nodes for PC, target nodes only for
-  backprop), so comparing it across algorithms is invalid.
+- `energy` — the objective the gradients descend, per prediction. Its node
+  set is **algorithm-dependent** (all internal nodes for PC, target nodes
+  only for backprop), so comparing it across algorithms compares different
+  node sets; under backprop it equals `target_energy`.
 - `target_energy` — the target-node energy divided by the number of
   predictions (`batch * seq_len` for sequences, `batch` for classification).
   Under `CrossEntropyEnergy` this is the teacher-forced per-token
   cross-entropy, so `exp(target_energy)` is the training perplexity.
-
-Note the two keys use different normalizations (per sample vs per
-prediction).
 
 ## Callbacks
 
@@ -176,7 +187,7 @@ energy framing:
 | `accuracy` | always | `argmax(z_mu, -1)` compared to `argmax(y, -1)` for one-hot targets (same rank as `z_mu`), or directly to integer class labels of lower rank; per prediction (argmax-based: meaningful for class-like targets, not continuous ones) |
 | `cross_entropy` | target functional is `CrossEntropyEnergy` | identical to `target_energy` in that case; the conventional name |
 | `perplexity` | target functional is `CrossEntropyEnergy` | `exp(cross_entropy)` |
-| `energy` | `algorithm="pc"` | per-sample energy over internal nodes — the PC training objective's definition |
+| `energy` | `algorithm="pc"` | internal energy per prediction, the PC training objective's scale |
 
 A graph with no target task key raises under the defaults; pass an explicit
 metrics dict to evaluate such a graph.

@@ -24,27 +24,23 @@ Usage:
     PYTHONPATH=. python examples/transformer_v2_demo.py --mode pc --depth 6 --num_epochs 10
 
 
-Results (pre-0.5 trainer, default call, cuda12, rtx3090, jax 0.8.1, can vary
+Results (default call, cuda12, rtx3090, jax 0.10.1, can vary
 a few points in perplexity in different jax versions / hardware due to
-sensitivity to floating point rounding). The 0.5 unified trainer prints
-`Epoch i/N — energy: ..., target_energy: ...` per epoch, changes the
-per-epoch energy normalization, and fixes the transformer eval numerics
-(double softmax, external SSE term — see the 0.5.0 CHANGELOG), so these
-numbers are a historical baseline until re-measured under 0.5:
+sensitivity to floating point rounding).
 Model parameters: 108,353
 Vocab Size: 65
-Train Epoch 1/5, Energy: 274.3637, Loss: 2.1401, Perplexity: 8.50
-Train Epoch 2/5, Energy: 260.0219, Loss: 2.0280, Perplexity: 7.60
-Train Epoch 3/5, Energy: 250.6280, Loss: 1.9546, Perplexity: 7.06
-Train Epoch 4/5, Energy: 244.7030, Loss: 1.9089, Perplexity: 6.75
-Train Epoch 5/5, Energy: 242.0046, Loss: 1.8878, Perplexity: 6.61
-Training completed in 8772.4s
-Evaluation completed in 55.2s
-Test Accuracy:   35.92%
-Test CE Loss:    2.2108
-Test Perplexity: 9.12
+Epoch 1/5 — energy: 2.1198, target_energy: 2.1165
+Epoch 2/5 — energy: 1.9861, target_energy: 1.9826
+Epoch 3/5 — energy: 2.0056, target_energy: 2.0024
+Epoch 4/5 — energy: 1.9770, target_energy: 1.9741
+Epoch 5/5 — energy: 1.9691, target_energy: 1.9663
+Training completed in 8730.8s
+Evaluation completed in 43.7s
+Test Accuracy:   33.43%
+Test CE Loss:    2.3383
+Test Perplexity: 10.36
 --- Generating ---
-ROMEO: whou sarone the bro beariers thas tray sucas a st my lo the to ate.
+ROMEO: marencan net s ieat aceaimes thall dathak: Tha blag an wince'd ate.
 """
 
 import argparse
