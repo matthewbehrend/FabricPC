@@ -1,0 +1,91 @@
+﻿name: Bug Report
+description: Report a reproducible bug or unexpected behavior in FabricPC
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report an issue!
+        Please review the [Troubleshooting Guide](https://github.com/trueagi-io/FabricPC/blob/main/docs/user_guides/16_troubleshooting.md) first to check for common environment and setup issues.
+  - type: input
+    id: version
+    attributes:
+      label: FabricPC Version
+      description: What version of FabricPC are you using? (e.g. `0.5.0`, or git commit SHA)
+      placeholder: e.g. 0.5.0
+    validations:
+      required: true
+  - type: checkboxes
+    id: install_extras
+    attributes:
+      label: Install Extras Used
+      description: Select all installation extras present in your environment.
+      options:
+        - label: cpu
+        - label: cuda12
+        - label: cuda13
+        - label: tfds
+        - label: viz
+        - label: all
+        - label: dev
+  - type: textarea
+    id: env_info
+    attributes:
+      label: JAX Environment Info
+      description: |
+        Please paste the output of:
+        ```python
+        import jax
+        jax.print_environment_info()
+        print("default_backend:", jax.default_backend())
+        print("devices:", jax.devices())
+        ```
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: env_vars
+    attributes:
+      label: Environment Variables & JAX Setup
+      description: |
+        Please provide the values of relevant environment variables and whether `setup_jax()` was called before the first JAX computation.
+        - `XLA_FLAGS`:
+        - `JAX_PLATFORMS`:
+        - `FABRICPC_SKIP_XLA_FLAGS`:
+        - `FABRICPC_DISABLE_TRITON_GEMM`:
+        - Did `setup_jax()` run before the first JAX computation? Did its post-init warning fire?
+        - XLA flag profile (if applicable):
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: packages
+    attributes:
+      label: Key Package Versions
+      description: Paste the output of `pip list | grep -Ei "jax|nvidia|tensorflow|fabricpc"` (or PowerShell equivalent `pip list | Select-String -Pattern "jax|nvidia|tensorflow|fabricpc"`).
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: gpu_info
+    attributes:
+      label: NVIDIA GPU & Driver Info (if GPU is used)
+      description: Paste the driver line or summary output from `nvidia-smi`.
+      render: shell
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Minimal Reproduction Script
+      description: |
+        Please provide a self-contained, minimal code snippet that reproduces the issue, including the exact import order.
+      render: python
+    validations:
+      required: true
+  - type: textarea
+    id: expected_vs_observed
+    attributes:
+      label: Expected vs Observed Behavior
+      description: What did you expect to happen, and what happened instead? Include full traceback if an error occurred.
+    validations:
+      required: true
