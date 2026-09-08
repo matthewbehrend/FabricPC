@@ -40,6 +40,8 @@ from fabricpc.graph_initialization import initialize_params
 from fabricpc.graph_initialization.state_initializer import initialize_graph_state
 from fabricpc.nodes import Linear, StorkeyHopfield
 from fabricpc.nodes.identity import IdentityNode
+from fabricpc.training import grad_denominator, pc_weight_gradients
+from fabricpc.utils.linear_pc_oracle import top_epsilon_eigenvalue
 
 W_INIT = NormalInitializer(std=0.3)
 
@@ -928,20 +930,21 @@ class TestBackpropCorrespondence:
     """
 
     @staticmethod
-    def _mlp(output, eta, steps):
+    def _mlp(output, eta, steps, std=0.3):
+        w_init = NormalInitializer(std=std)
         x = IdentityNode(shape=(4,), name="x")
         h1 = Linear(
-            shape=(3,), name="h1", activation=TanhActivation(), weight_init=W_INIT
+            shape=(3,), name="h1", activation=TanhActivation(), weight_init=w_init
         )
         h2 = Linear(
-            shape=(3,), name="h2", activation=TanhActivation(), weight_init=W_INIT
+            shape=(3,), name="h2", activation=TanhActivation(), weight_init=w_init
         )
         if output == "gaussian":
             y = Linear(
                 shape=(2,),
                 name="y",
                 activation=IdentityActivation(),
-                weight_init=W_INIT,
+                weight_init=w_init,
             )
         else:
             y = Linear(
@@ -949,7 +952,7 @@ class TestBackpropCorrespondence:
                 name="y",
                 activation=SoftmaxActivation(),
                 energy=CrossEntropyEnergy(),
-                weight_init=W_INIT,
+                weight_init=w_init,
             )
         return graph(
             nodes=[x, h1, h2, y],
@@ -962,8 +965,8 @@ class TestBackpropCorrespondence:
             inference=EPCInference(eta_infer=eta, infer_steps=steps),
         )
 
-    def _setup(self, rng_key, output, eta=0.05, steps=1, batch=3):
-        structure = self._mlp(output, eta, steps)
+    def _setup(self, rng_key, output, eta=0.05, steps=1, batch=3, std=0.3):
+        structure = self._mlp(output, eta, steps, std)
         params = inject_biases(
             initialize_params(structure, rng_key), jax.random.fold_in(rng_key, 7)
         )
@@ -1030,21 +1033,38 @@ class TestBackpropCorrespondence:
         assert jnp.allclose(final.nodes["h1"].z_latent, a1 - 0.05 * g["h1"], atol=1e-6)
 
     @pytest.mark.parametrize("output", ["gaussian", "ce"])
-    def test_one_step_weight_grads_are_eta_backprop_first_order(self, rng_key, output):
+    @pytest.mark.parametrize("std", [0.3, 1.5])
+    def test_one_step_weight_grads_are_eta_backprop_first_order(
+        self, rng_key, output, std
+    ):
         """Local weight gradients after one ePC step equal η × backprop's on
         the hidden layers and backprop's on the output layer, to first order
-        in η. The O(η²) remainder comes from the node's input latent being
-        re-derived at the perturbed upstream state, so a layer whose input is
-        the clamp (h1) matches exactly, up to float32, at every η, while h2
-        and y show a relative deviation d(η) below 1e-2 at η = 1e-3 that
-        grows linearly in η (within a factor of 3 of 10× per decade). Batch
-        1, so batch-summed and batch-mean gradients coincide and the
-        reference needs no normalization."""
-        structure, params, clamps, _ = self._setup(rng_key, output, batch=1)
+        in η·λ_max, λ_max the top eigenvalue of the energy's Hessian in error
+        coordinates measured on the fixture. Both sides go through the
+        shipped normalization: ``pc_weight_gradients`` against ``jax.grad`` of
+        the output energy divided by the same ``grad_denominator`` (N = 3).
+
+        The remainder comes from a node's input latent being re-derived at
+        the perturbed upstream state. h1's input is the clamp, so its
+        identity is exact and its d(η) is float32 rounding of (μ − η·g) − μ,
+        which shrinks as η grows. h2 and y have d(η) ≤ C·η·λ_max with C = 10
+        (the worst measured value is 6.7 across weight std 0.3 to 2.5, λ_max
+        1.1 to 229) and, in the first-order regime η·λ_max ≤ 0.1 the grid
+        stays in, d grows linearly in η within a factor of 3 of 10× per
+        decade. The two weight scales give λ_max near 1.2 and near 30, so C
+        is pinned against a varying λ_max rather than one fixture."""
+        batch = 3
+        structure, params, clamps, state = self._setup(
+            rng_key, output, batch=batch, std=std
+        )
+        denom = grad_denominator(structure, clamps)
+        lam = top_epsilon_eigenvalue(
+            params, state, clamps, structure, iters=200, key=rng_key
+        )
 
         def loss(p):
-            state = initialize_graph_state(structure, 1, rng_key, clamps, params=p)
-            return graph_energy(state, structure, node_names=["y"])
+            st = initialize_graph_state(structure, batch, rng_key, clamps, params=p)
+            return graph_energy(st, structure, node_names=["y"]) / denom
 
         g_bp = jax.grad(loss)(params)
 
@@ -1052,9 +1072,9 @@ class TestBackpropCorrespondence:
             s = with_inference(
                 structure, inference=EPCInference(eta_infer=eta, infer_steps=1)
             )
-            state = initialize_graph_state(s, 1, rng_key, clamps, params=params)
-            final = s.config["inference"].run_inference(params, state, clamps, s)
-            g_pc = compute_local_weight_gradients(params, final, s)
+            st = initialize_graph_state(s, batch, rng_key, clamps, params=params)
+            final = s.config["inference"].run_inference(params, st, clamps, s)
+            g_pc = pc_weight_gradients(params, final, s, clamps)
             out = {}
             for name in ("h1", "h2", "y"):
                 scale = 1.0 if name == "y" else eta
@@ -1066,16 +1086,19 @@ class TestBackpropCorrespondence:
                         )
             return out
 
-        d = {eta: deviation(eta) for eta in (1e-3, 1e-2, 1e-1)}
-        for key in d[1e-3]:
+        etas = [x / lam for x in (1e-3, 1e-2, 1e-1)]  # eta*lambda_max grid
+        d = {eta: deviation(eta) for eta in etas}
+        C = 10.0
+        for key in d[etas[0]]:
             if key[0] == "h1":
-                for eta in d:
-                    assert d[eta][key] < 1e-3, (key, eta, d[eta][key])
+                assert d[etas[-1]][key] < 1e-3, (key, lam, d[etas[-1]][key])
+                assert d[etas[-1]][key] < d[etas[0]][key], (key, lam, d)
                 continue
-            assert d[1e-3][key] < 1e-2, (key, d[1e-3][key])
-            r1 = d[1e-2][key] / d[1e-3][key]
-            r2 = d[1e-1][key] / d[1e-2][key]
-            assert 3.0 <= r1 <= 30.0 and 3.0 <= r2 <= 30.0, (key, d[1e-3][key], r1, r2)
+            for eta in etas:
+                assert d[eta][key] <= C * eta * lam, (key, lam, eta, d[eta][key])
+            r1 = d[etas[1]][key] / d[etas[0]][key]
+            r2 = d[etas[2]][key] / d[etas[1]][key]
+            assert 3.0 <= r1 <= 30.0 and 3.0 <= r2 <= 30.0, (key, lam, r1, r2)
 
 
 class TestRegimeLabel:
