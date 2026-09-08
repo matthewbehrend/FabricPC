@@ -2,36 +2,99 @@
 
 ``create_iter_callback``/``create_epoch_callback``/``create_tracking_callbacks``
 produce callbacks for train's ``iter_callback``/``epoch_callback`` parameters.
-``create_detailed_iter_callback`` is the exception: it consumes the final
-``GraphState``, which only ``make_train_step``'s step returns, so it plugs
-into a custom loop, not into ``train``.
+The iteration callback reads everything it logs from its ``IterContext``
+(metrics, parameters, the batch's GraphState, the batch and its key);
+``TrackingConfig`` decides which of the tracker's batch-level methods it
+calls, so one factory serves energy-only runs and full state tracking.
 """
 
 from typing import Any, Callable, Dict, Optional, Tuple
 
-from fabricpc.core.types import GraphState, GraphStructure
-from fabricpc.training.trainer import EpochContext
+from fabricpc.core.types import GraphStructure
+from fabricpc.graph_initialization.state_initializer import initialize_graph_state
+from fabricpc.training.trainer import (
+    EpochContext,
+    IterContext,
+    batch_size_of,
+    build_clamps,
+)
+from fabricpc.utils.dashboarding.inference_tracking import (
+    run_inference_with_full_history,
+)
 from fabricpc.utils.dashboarding.trackers import AimExperimentTracker, TrackingConfig
 
 
 def create_iter_callback(
     tracker: AimExperimentTracker,
-) -> Callable[[int, int, Dict[str, float]], Dict[str, float]]:
-    """Create an iter_callback for train that tracks batch energy.
+) -> Callable[[IterContext], Dict[str, float]]:
+    """Create an iter_callback for train; ``tracker.config`` decides what it logs.
+
+    Per batch, in order:
+
+    1. batch energy from ``ctx.metrics`` (``track_energy``);
+    2. per-node energy from ``ctx.state`` (``nodes_to_track``);
+    3. weight distributions from ``ctx.params`` every
+       ``tracking_every_n_batches`` (``track_weight_distributions``);
+    4. on those same batches, state tracking when ``track_state`` or
+       ``track_state_distributions`` is set. Under PC the callback re-runs
+       inference on ``ctx.batch`` from ``ctx.batch_key`` under the
+       post-update ``ctx.params`` and logs every
+       ``state_tracking_every_n_infer_steps``-th step: one extra inference
+       pass per tracked batch. Under backprop there is no settling to
+       record, so it logs the feedforward ``ctx.state`` once at
+       ``infer_step=0``.
+
+    A non-empty ``nodes_to_track`` scopes items 3 and 4 to those nodes; empty
+    tracks weights and state for every node.
 
     Args:
         tracker: AimExperimentTracker instance.
 
     Returns:
-        Callback function: (epoch_idx, batch_idx, metrics) -> metrics
+        Callback ``(ctx: IterContext) -> ctx.metrics``, so train stores the
+        float metrics as usual.
     """
 
-    def iter_callback(
-        epoch_idx: int, batch_idx: int, metrics: Dict[str, float]
-    ) -> Dict[str, float]:
-        # metrics["energy"] is the per-sample training objective.
-        tracker.track_batch_energy(metrics["energy"], epoch=epoch_idx, batch=batch_idx)
-        return metrics
+    def iter_callback(ctx: IterContext) -> Dict[str, float]:
+        epoch, batch = ctx.epoch_idx, ctx.batch_idx
+        config = tracker.config
+        # A non-empty nodes_to_track scopes weights and state; None means all.
+        nodes = config.nodes_to_track or None
+        # metrics["energy"] is the training objective per prediction.
+        tracker.track_batch_energy(ctx.metrics["energy"], epoch=epoch, batch=batch)
+        tracker.track_batch_energy_per_node(
+            ctx.state, ctx.structure, epoch=epoch, batch=batch
+        )
+        tracker.track_weight_distributions(
+            ctx.params, ctx.structure, epoch=epoch, batch=batch, nodes=nodes
+        )
+
+        if config.tracks_state and batch % config.tracking_every_n_batches == 0:
+            if ctx.algorithm == "pc":
+                clamps = build_clamps(ctx.batch, ctx.structure, clamp_target=True)
+                init_state = initialize_graph_state(
+                    ctx.structure,
+                    batch_size_of(ctx.batch, ctx.structure),
+                    ctx.batch_key,
+                    clamps=clamps,
+                    params=ctx.params,
+                )
+                _, history = run_inference_with_full_history(
+                    ctx.params, init_state, clamps, ctx.structure
+                )
+                for infer_step, step_state in enumerate(history):
+                    tracker.track_state(
+                        step_state,
+                        epoch=epoch,
+                        batch=batch,
+                        infer_step=infer_step,
+                        nodes=nodes,
+                    )
+            else:
+                tracker.track_state(
+                    ctx.state, epoch=epoch, batch=batch, infer_step=0, nodes=nodes
+                )
+        return ctx.metrics
 
     return iter_callback
 
@@ -43,12 +106,13 @@ def create_epoch_callback(
     eval_loader: Any = None,
     eval_config: Optional[dict] = None,
 ) -> Callable[[EpochContext], Optional[dict]]:
-    """Create an epoch_callback for train that tracks epoch metrics and
-    distributions.
+    """Create an epoch_callback for train that runs and tracks evaluation.
 
     The returned callback runs an optional evaluation and returns its metrics
     dict; train stores a non-None return as that epoch's ``epoch_results``
     entry, so dashboards get mid-training eval results in the history.
+    Weight distributions are logged by the iteration callback at the
+    ``tracking_every_n_batches`` cadence, not here.
 
     Args:
         tracker: AimExperimentTracker instance.
@@ -62,12 +126,6 @@ def create_epoch_callback(
     """
 
     def epoch_callback(ctx: EpochContext) -> Optional[dict]:
-        # Track weight distributions
-        tracker.track_weight_distributions(
-            ctx.params, ctx.structure, epoch=ctx.epoch_idx, batch=0
-        )
-
-        # Optionally run evaluation
         eval_metrics = None
         if eval_fn is not None and eval_loader is not None:
             eval_metrics = eval_fn(
@@ -128,53 +186,3 @@ def create_tracking_callbacks(
     )
 
     return tracker, iter_callback, epoch_callback
-
-
-def create_detailed_iter_callback(
-    tracker: AimExperimentTracker,
-    structure: GraphStructure,
-) -> Callable[[int, int, Dict[str, float], "GraphState"], Dict[str, float]]:
-    """Create a per-batch callback that also tracks state distributions.
-
-    This callback consumes the final GraphState, which only
-    ``make_train_step``'s step returns, so it plugs into a custom loop —
-    not into ``train(iter_callback=...)``, whose callbacks receive
-    ``(epoch_idx, batch_idx, metrics)`` without the state. Custom-loop
-    example: docs/user_guides/09_experiment_tracking.md.
-
-    Args:
-        tracker: AimExperimentTracker instance.
-        structure: GraphStructure.
-
-    Returns:
-        Callback function:
-        (epoch_idx, batch_idx, metrics, final_state) -> metrics,
-        where ``metrics`` is the step's metric dict
-        (``{"energy", "target_energy"}``).
-    """
-
-    def detailed_iter_callback(
-        epoch_idx: int,
-        batch_idx: int,
-        metrics: Dict[str, float],
-        final_state: GraphState,
-    ) -> Dict[str, float]:
-        # metrics["energy"] is the per-sample training objective.
-        tracker.track_batch_energy(
-            float(metrics["energy"]), epoch=epoch_idx, batch=batch_idx
-        )
-
-        # Track per-node energy
-        tracker.track_batch_energy_per_node(
-            final_state, structure, epoch=epoch_idx, batch=batch_idx
-        )
-
-        # Track state stats/distributions (if at right batch + infer_step frequency)
-        if batch_idx % tracker.config.tracking_every_n_batches == 0:
-            tracker.track_state(
-                final_state, epoch=epoch_idx, batch=batch_idx, infer_step=0
-            )
-
-        return metrics
-
-    return detailed_iter_callback

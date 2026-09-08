@@ -543,7 +543,7 @@ class TestFractionalEpochs:
             {"num_epochs": 0.5},
             rng_key,
             verbose=False,
-            iter_callback=lambda e, b, metrics: iters_half.append(1) or metrics,
+            iter_callback=lambda ctx: iters_half.append(1) or ctx.metrics,
         )
 
         iters_full = []
@@ -555,7 +555,7 @@ class TestFractionalEpochs:
             {"num_epochs": 1},
             rng_key,
             verbose=False,
-            iter_callback=lambda e, b, metrics: iters_full.append(1) or metrics,
+            iter_callback=lambda ctx: iters_full.append(1) or ctx.metrics,
         )
 
         assert len(iters_half) < len(iters_full)

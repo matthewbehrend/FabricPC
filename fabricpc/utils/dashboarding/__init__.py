@@ -14,7 +14,6 @@ from fabricpc.utils.dashboarding._aim_available import (
     require_aim,
 )
 from fabricpc.utils.dashboarding.callbacks import (
-    create_detailed_iter_callback,
     create_epoch_callback,
     create_iter_callback,
     create_tracking_callbacks,
@@ -58,7 +57,6 @@ __all__ = [
     "create_iter_callback",
     "create_epoch_callback",
     "create_tracking_callbacks",
-    "create_detailed_iter_callback",
     # Extractors
     "extract_node_energies",
     "extract_total_energy",

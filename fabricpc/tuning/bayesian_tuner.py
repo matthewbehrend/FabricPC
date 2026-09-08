@@ -9,7 +9,7 @@ import optax as _optax
 from pathlib import Path
 from typing import Callable, Any, Dict, Tuple, Optional
 
-from fabricpc.training import train, evaluate
+from fabricpc.training import EpochContext, evaluate, IterContext, train
 from fabricpc.core.types import GraphParams, GraphStructure
 
 
@@ -108,19 +108,19 @@ class BayesianTuner:
         optimizer = _optax.adam(config.get("lr", 1e-3))
         train_config = dict(config)
 
-        def iter_callback(epoch_idx, batch_idx, metrics):
-            if self.verbose and (batch_idx + 1) % 50 == 0:
+        def iter_callback(ctx: IterContext):
+            if self.verbose and (ctx.batch_idx + 1) % 50 == 0:
                 print(
                     f"  [Phase {phase}] Trial {trial.number} | "
-                    f"Epoch {epoch_idx + 1} | Batch {batch_idx + 1} | "
-                    f"Energy: {metrics['energy']:.4f}"
+                    f"Epoch {ctx.epoch_idx + 1} | Batch {ctx.batch_idx + 1} | "
+                    f"Energy: {ctx.metrics['energy']:.4f}"
                 )
 
         # Per-epoch mean energy, accumulated by epoch_callback for the divergence
         # guard so a diverging trial is stopped mid-training.
         trial_energy_means = []
 
-        def epoch_callback(ctx):
+        def epoch_callback(ctx: EpochContext):
             # 1) Scale-free divergence guard, applied each epoch. Energy is not
             #    comparable across architectures, so we prune only on size-free
             #    instability: non-finite energy, or energy risen above its best

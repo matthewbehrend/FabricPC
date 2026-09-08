@@ -1,5 +1,48 @@
 # Changelog
 
+## [0.5.2] - 2026-09-08
+
+`iter_callback` receives one `IterContext` argument, a superset of
+`EpochContext` that carries the batch's parameters, optimizer state,
+`GraphState`, the batch, and its key, so per-update diagnostics (stability
+probes, state tracking) run as `train` callbacks instead of re-implementing
+the loop over `make_train_step`. Both contexts also carry `algorithm` and
+every RNG key the trainer derived at or above their level. The dashboarding
+iteration callback reads everything it logs from the context and
+`TrackingConfig` decides what it logs, so state tracking works through
+`create_tracking_callbacks`; `examples/transformer_demo.py` runs on `train`.
+
+### Migration table
+
+| Changed | Replacement |
+|---|---|
+| `iter_callback(epoch_idx, batch_idx, metrics)` | `iter_callback(ctx: IterContext)` — read `ctx.epoch_idx`, `ctx.batch_idx`, `ctx.metrics`; `ctx.params`, `ctx.opt_state`, `ctx.state`, `ctx.step`, `ctx.batch`, `ctx.batch_key` are new |
+| `create_detailed_iter_callback(tracker, structure)` in a custom loop over `make_train_step` | removed — `train(..., iter_callback=create_iter_callback(tracker))` with `TrackingConfig(track_state=True)` (summary stats) or `track_state_distributions=True` (histograms too) |
+| `create_epoch_callback` logging weight distributions once per epoch for every node | the iteration callback logs them every `tracking_every_n_batches`, scoped to `nodes_to_track` when it is non-empty (one owner; no double record at batch 0) |
+| `EpochContext(...)` constructed by hand (test fakes) | add `algorithm` and `epoch_key` |
+
+### New
+
+- `fabricpc.training.IterContext(epoch_idx, batch_idx, step, params, opt_state,
+  state, structure, config, algorithm, rng_key, epoch_key, batch_key, batch,
+  metrics)`. The internal step returns the `GraphState` only when an
+  `iter_callback` is supplied, and the trainer drops its reference after the
+  callback returns, so the no-callback path is unchanged and a callback that
+  does not retain `ctx.state` adds no device memory.
+- `EpochContext.algorithm` and `EpochContext.epoch_key`
+  (`fold_in(rng_key, epoch_idx)`).
+- `TrackingConfig.track_state`: per-node state summary statistics on every
+  `tracking_every_n_batches`-th batch; `track_state_distributions` implies
+  it. On a tracked batch under PC the iteration callback re-runs inference
+  from the step's latent initialization under the updated parameters and
+  logs every `state_tracking_every_n_infer_steps`-th step (one extra
+  inference pass per tracked batch); under backprop it logs the feedforward
+  state once. Previously `track_state_distributions`,
+  `state_tracking_every_n_infer_steps`, and the state half of
+  `nodes_to_track` had no effect through `create_tracking_callbacks`.
+- `train`'s callback parameters are annotated
+  `Callable[[EpochContext], Any]` and `Callable[[IterContext], Any]`.
+
 ## [0.5.1] - 2026-09-07
 
 Gradients reaching optax are now means per prediction under both algorithms.

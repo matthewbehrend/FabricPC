@@ -128,24 +128,34 @@ supplied — both force a per-batch device sync):
 
 ## Callbacks
 
-**Iteration callback** — called after each batch with float metrics:
+**Iteration callback** — called after each batch with a single `IterContext`
+argument (fields: `epoch_idx`, `batch_idx`, `step`, `params`, `opt_state`,
+`state`, `structure`, `config`, `algorithm`, `rng_key`, `epoch_key`,
+`batch_key`, `batch`, `metrics`). `metrics` holds this batch's float
+metrics; `state` is the batch's `GraphState` (settled under PC, the
+feedforward pass under backprop); `batch` is the converted batch dict and
+`batch_key` the key the step used for latent initialization; `step` counts
+optimizer updates in this `train` call, this batch included:
 
 ```python
-def my_iter_callback(epoch_idx, batch_idx, metrics):
-    if batch_idx % 100 == 0:
-        print(f"  batch {batch_idx}: energy={metrics['energy']:.4f}")
+from fabricpc.training import IterContext
+
+def my_iter_callback(ctx: IterContext):
+    if ctx.batch_idx % 100 == 0:
+        print(f"  batch {ctx.batch_idx}: energy={ctx.metrics['energy']:.4f}")
 
 result = train(..., iter_callback=my_iter_callback)
 ```
 
 **Epoch callback** — called after each epoch with a single `EpochContext`
 argument (fields: `epoch_idx`, `step`, `params`, `opt_state`, `structure`,
-`config`, `rng_key`, `metrics`):
+`config`, `algorithm`, `rng_key`, `epoch_key`, `metrics`; `epoch_key` is
+`fold_in(rng_key, epoch_idx)`, the key the epoch's batch keys derive from):
 
 ```python
-from fabricpc.training import evaluate
+from fabricpc.training import EpochContext, evaluate
 
-def my_epoch_callback(ctx):
+def my_epoch_callback(ctx: EpochContext):
     metrics = evaluate(ctx.params, ctx.structure, test_loader, ctx.config, ctx.rng_key)
     print(f"  Epoch {ctx.epoch_idx}: acc={metrics['accuracy']:.4f}")
     return metrics
@@ -162,6 +172,10 @@ Contract guarantees:
 - The internal step donates its parameter buffers, so copy `ctx.params`
   (`jax.tree_util.tree_map(jnp.copy, ctx.params)`) if you retain it past the
   callback; the next training step invalidates it.
+- `ctx.state` and `ctx.batch` are not donated. The trainer drops its own
+  reference to the state when the iteration callback returns, so retain it
+  freely; a callback that does not retain it adds no device memory. Without
+  an `iter_callback` the step does not return the state at all.
 
 ## evaluate()
 

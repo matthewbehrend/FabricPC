@@ -34,6 +34,7 @@ from fabricpc.core.energy import CrossEntropyEnergy, GaussianEnergy, graph_energ
 from fabricpc.core.inference import InferenceSGD, InferenceSGDNormClip, run_inference
 from fabricpc.core.learning import compute_local_weight_gradients
 from fabricpc.core.topology import Edge
+from fabricpc.core.types import GraphParams, GraphState
 from fabricpc.graph_assembly import TaskMap, graph
 from fabricpc.graph_initialization import (
     GlobalStateInit,
@@ -45,6 +46,7 @@ from fabricpc.nodes import Linear
 from fabricpc.training import (
     EpochContext,
     EvalMetric,
+    IterContext,
     TrainResult,
     build_clamps,
     evaluate,
@@ -1252,11 +1254,15 @@ def test_epoch_context_fields_and_callback_replacement(rng_key, algorithm):
     loader = make_batches(rng_key, n_batches=2)
     seen = []
 
-    def epoch_callback(ctx):
+    def epoch_callback(ctx: EpochContext):
         assert isinstance(ctx, EpochContext)
         assert ctx.structure is structure
+        assert ctx.algorithm == algorithm
         assert set(ctx.metrics) == {"energy", "target_energy"}
         assert isinstance(ctx.metrics["energy"], float)
+        assert jnp.array_equal(
+            ctx.epoch_key, jax.random.fold_in(train_key, ctx.epoch_idx)
+        )
         seen.append((ctx.epoch_idx, ctx.step))
         return {"replaced": ctx.epoch_idx}
 
@@ -1286,7 +1292,7 @@ def test_callback_exceptions_propagate(rng_key):
     class Prune(Exception):
         pass
 
-    def epoch_callback(ctx):
+    def epoch_callback(ctx: EpochContext):
         raise Prune()
 
     with pytest.raises(Prune):
@@ -1301,7 +1307,7 @@ def test_callback_exceptions_propagate(rng_key):
             verbose=False,
         )
 
-    def iter_callback(epoch_idx, batch_idx, metrics):
+    def iter_callback(ctx: IterContext):
         raise Prune()
 
     with pytest.raises(Prune):
@@ -1317,31 +1323,48 @@ def test_callback_exceptions_propagate(rng_key):
         )
 
 
-def test_iter_callback_receives_floats_and_replaces(rng_key):
+@pytest.mark.parametrize("algorithm", ["pc", "backprop"])
+def test_iter_context_fields_and_callback_replacement(rng_key, algorithm):
     structure = classification_structure()
     params_key, train_key = jax.random.split(rng_key)
     params = initialize_params(structure, params_key)
     loader = make_batches(rng_key, n_batches=2)
     calls = []
 
-    def iter_callback(epoch_idx, batch_idx, metrics):
-        assert isinstance(metrics["energy"], float)
-        assert isinstance(metrics["target_energy"], float)
-        calls.append((epoch_idx, batch_idx))
-        return batch_idx  # replaces the stored entry
+    def iter_callback(ctx: IterContext):
+        assert isinstance(ctx, IterContext)
+        assert ctx.structure is structure
+        assert ctx.algorithm == algorithm
+        assert set(ctx.metrics) == {"energy", "target_energy"}
+        assert isinstance(ctx.metrics["energy"], float)
+        assert isinstance(ctx.metrics["target_energy"], float)
+        assert isinstance(ctx.params, GraphParams)
+        assert isinstance(ctx.state, GraphState)
+        assert set(ctx.state.nodes) == set(structure.nodes)
+        assert set(ctx.batch) == {"x", "y"}
+        epoch_key = jax.random.fold_in(train_key, ctx.epoch_idx)
+        assert jnp.array_equal(ctx.epoch_key, epoch_key)
+        assert jnp.array_equal(
+            ctx.batch_key, jax.random.fold_in(epoch_key, ctx.batch_idx)
+        )
+        calls.append((ctx.epoch_idx, ctx.batch_idx, ctx.step))
+        return ctx.batch_idx  # replaces the stored entry
 
     result = train(
         params,
         structure,
         loader,
         optax.adam(1e-3),
-        {"num_epochs": 1},
+        {"num_epochs": 2},
         train_key,
+        algorithm=algorithm,
+        start_epoch=5,
         iter_callback=iter_callback,
         verbose=False,
     )
-    assert calls == [(0, 0), (0, 1)]
-    assert result.iter_results == [[0, 1]]
+    # epoch_idx honours start_epoch; step counts updates in this call only.
+    assert calls == [(5, 0, 1), (5, 1, 2), (6, 0, 3), (6, 1, 4)]
+    assert result.iter_results == [[0, 1], [0, 1]]
 
 
 def test_step_metrics_keys(rng_key):

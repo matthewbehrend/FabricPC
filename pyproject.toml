@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "fabricpc"
-version = "0.5.1"
+version = "0.5.2"
 description = "A flexible, performant predictive coding library using JAX"
 readme = "README.md"
 requires-python = ">=3.11"

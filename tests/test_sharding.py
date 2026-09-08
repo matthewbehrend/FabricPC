@@ -14,10 +14,12 @@ import jax
 import jax.numpy as jnp
 import optax
 import pytest
+from jax.sharding import NamedSharding, PartitionSpec as P
 
 from conftest import ListLoader, make_classification_structure, max_param_diff
 from fabricpc.graph_initialization import initialize_params
-from fabricpc.training import evaluate, make_train_step, train
+from fabricpc.core.types import GraphState
+from fabricpc.training import evaluate, IterContext, make_train_step, train
 
 requires_two_devices = pytest.mark.skipif(
     jax.device_count() < 2,
@@ -153,3 +155,33 @@ def test_evaluate_padded_samples_zero_weight(rng_key):
     expected = float((jnp.sum(batch_a["x"][:, 0]) + jnp.sum(batch_b["x"][:, 0])) / 7.0)
     # If padded zeros leaked in, the denominator would be 8 and this fails.
     assert abs(out["first_feature"] - expected) < 1e-5
+
+
+@requires_two_devices
+def test_iter_context_under_mesh(rng_key):
+    """The iteration callback sees the data-sharded batch and the batch's
+    GraphState."""
+    structure = make_structure()
+    params = initialize_params(structure, rng_key)
+    k1, k2 = jax.random.split(rng_key)
+    loader = ListLoader([make_batch(k1, 4), make_batch(k2, 4)])
+    mesh = jax.make_mesh((2,), ("data",))
+    seen = []
+
+    def iter_callback(ctx: IterContext):
+        assert ctx.batch["x"].sharding == NamedSharding(mesh, P("data"))
+        assert isinstance(ctx.state, GraphState)
+        seen.append(ctx.batch_idx)
+
+    train(
+        params,
+        structure,
+        loader,
+        optax.adam(1e-2),
+        {"num_epochs": 1},
+        rng_key,
+        mesh=mesh,
+        verbose=False,
+        iter_callback=iter_callback,
+    )
+    assert seen == [0, 1]

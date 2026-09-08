@@ -5,6 +5,7 @@ import os
 
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
 
+import jax
 import numpy as np
 import optuna
 import pytest
@@ -12,7 +13,7 @@ import pytest
 from fabricpc.core.inference import InferenceSGDNormClip
 from fabricpc.models import create_deep_transformer
 from fabricpc.graph_initialization import initialize_params
-from fabricpc.training import EpochContext, TrainResult
+from fabricpc.training import EpochContext, IterContext, TrainResult
 from fabricpc.tuning.bayesian_tuner import BayesianTuner
 import fabricpc.tuning.bayesian_tuner as tuner_mod
 
@@ -50,7 +51,9 @@ def _tiny_loader(vocab_size=10, n_batches=1, batch=2, seq=4, seed=0):
 
 
 def _fake_train(energies, ces):
-    """Stand-in for train that drives epoch_callback with EpochContext."""
+    """Stand-in for train that drives both callbacks with their contexts: per
+    epoch one iteration callback at batch 49 (the tuner prints every 50th
+    batch), then the epoch callback."""
 
     def fake(
         params,
@@ -65,7 +68,29 @@ def _fake_train(energies, ces):
         **kwargs,
     ):
         opt_state = optimizer.init(params)
+        algorithm = kwargs.get("algorithm", "pc")
         for i, (e, ce) in enumerate(zip(energies, ces)):
+            epoch_key = jax.random.fold_in(rng, i)
+            metrics = {"energy": e, "target_energy": ce}
+            if iter_callback is not None:
+                iter_callback(
+                    IterContext(
+                        epoch_idx=i,
+                        batch_idx=49,
+                        step=i + 1,
+                        params=params,
+                        opt_state=opt_state,
+                        state=None,
+                        structure=structure,
+                        config=config,
+                        algorithm=algorithm,
+                        rng_key=rng,
+                        epoch_key=epoch_key,
+                        batch_key=jax.random.fold_in(epoch_key, 49),
+                        batch={},
+                        metrics=metrics,
+                    )
+                )
             if epoch_callback is not None:
                 epoch_callback(
                     EpochContext(
@@ -75,8 +100,10 @@ def _fake_train(energies, ces):
                         opt_state=opt_state,
                         structure=structure,
                         config=config,
+                        algorithm=algorithm,
                         rng_key=rng,
-                        metrics={"energy": e, "target_energy": ce},
+                        epoch_key=epoch_key,
+                        metrics=metrics,
                     )
                 )
         return TrainResult(
@@ -251,3 +278,27 @@ def test_both_phases_return_perplexity(tmp_path, monkeypatch):
     )
     assert "phase1_best_ppl" in results and np.isfinite(results["phase1_best_ppl"])
     assert "phase2_best_ppl" in results and np.isfinite(results["phase2_best_ppl"])
+
+
+def test_iter_callback_prints_progress_when_verbose(tmp_path, monkeypatch, capsys):
+    """The tuner's iteration callback reads IterContext fields. A signature
+    break would not fail loudly: train's TypeError is caught by the tuner and
+    every trial is pruned as 'failed during training'."""
+    tuner = _make_tuner(tmp_path, verbose=True)
+    monkeypatch.setattr(tuner_mod, "train", _fake_train([100.0], [2.0]))
+    monkeypatch.setattr(
+        tuner_mod,
+        "evaluate",
+        lambda *a, **k: {"perplexity": 7.0, "cross_entropy": 1.95, "accuracy": 0.1},
+    )
+    config = {
+        **tuner.base_config,
+        "depth": 1,
+        "eta_infer": 0.1,
+        "infer_steps": 3,
+        "lr": 1e-3,
+        "weight_init_std": 0.02,
+    }
+    t = _run_one(tuner, config)
+    assert t.state == optuna.trial.TrialState.COMPLETE
+    assert "Batch 50 | Energy: 100.0000" in capsys.readouterr().out

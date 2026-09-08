@@ -68,7 +68,7 @@ from fabricpc.core.initializers import (
     XavierInitializer,
 )
 from fabricpc.core.mupc import MuPCConfig
-from fabricpc.training import train, evaluate
+from fabricpc.training import EpochContext, evaluate, train
 from fabricpc.utils.data.dataloader import Cifar10Loader
 from fabricpc import setup_jax
 
@@ -406,7 +406,7 @@ def run_single_mupc(args):
     # Periodic evaluation callback
     eval_every = args.eval_every
 
-    def epoch_callback(ctx):
+    def epoch_callback(ctx: EpochContext):
         epoch_num = ctx.epoch_idx + 1
         if eval_every > 0 and (
             epoch_num % eval_every == 0 or epoch_num == args.num_epochs

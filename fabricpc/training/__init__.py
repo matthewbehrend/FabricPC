@@ -13,6 +13,7 @@ from fabricpc.training.generation import generate
 from fabricpc.training.metrics import EvalMetric
 from fabricpc.training.trainer import (
     EpochContext,
+    IterContext,
     TrainResult,
     batch_size_of,
     build_clamps,
@@ -38,6 +39,7 @@ __all__ = [
     "pc_weight_gradients",
     "TrainResult",
     "EpochContext",
+    "IterContext",
     "EvalMetric",
     "metrics",
 ]
