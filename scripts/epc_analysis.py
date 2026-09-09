@@ -1088,8 +1088,8 @@ def plot_track(csv_path):
         vertical_spacing=0.06,
         row_heights=[0.3, 0.2, 0.3, 0.2],
         subplot_titles=(
-            "excited extremes of the error Hessian on the probe batch (log scale)",
-            "gradient-weighted relaxed fraction f_bar and weight on negative curvature",
+            "excited extremes of the error Hessian (log scale)",
+            "f_bar and gradient weight on negative curvature",
             "Frobenius norm per weight",
             "test accuracy after each epoch",
         ),
@@ -1118,7 +1118,7 @@ def plot_track(csv_path):
             y=2.0 / eta,
             line=dict(color="#52514e", width=2),
             annotation_text=f"2/eta = {2.0 / eta:g}: eta*lambda_max = 2",
-            annotation_position="top left",
+            annotation_position="bottom right",
             row=1,
             col=1,
         )
@@ -1165,26 +1165,49 @@ def plot_track(csv_path):
         reversal = next((r for r in probes if r["output_gradient_reverses"]), None)
         crossing = next((r for r in probes if r["unstable"]), None)
         if reversal is not None:
-            events.append((reversal["update"], "output gradient reverses", PALETTE[4]))
+            events.append(
+                (reversal["update"], "output gradient reverses", PALETTE[4], "top left")
+            )
         if crossing is not None:
-            events.append((crossing["update"], "eta*lambda_max = 2", "#52514e"))
-    for update, text, color in events:
+            events.append(
+                (crossing["update"], "eta*lambda_max = 2", "#52514e", "top right")
+            )
+    # The two events can be one probe apart, so their labels sit on opposite
+    # sides of their lines.
+    for update, text, color, position in events:
         fig.add_vline(
             x=update,
             line=dict(color=color, width=1.5, dash="dash"),
             annotation_text=f"{text} (update {update})",
-            annotation_position="top right",
+            annotation_position=position,
         )
-    fig.update_yaxes(type="log", title_text="eigenvalue", row=1, col=1)
+
+    # Explicit log ranges: the renderer's autorange misjudges these panels.
+    def log_range(values, pad=0.3):
+        positive = [v for v in values if v is not None and v > 0]
+        lo, hi = math.log10(min(positive)), math.log10(max(positive))
+        return [lo - pad, hi + pad]
+
+    eigen_values = [r["lambda_max"] for r in probes] + [
+        abs(r["lambda_min"]) for r in probes
+    ]
+    if eta is not None:
+        eigen_values.append(2.0 / eta)
+    norm_values = [r[c] for r in probes for c in wnorm_columns]
+    fig.update_yaxes(
+        type="log", title_text="eigenvalue", range=log_range(eigen_values), row=1, col=1
+    )
     fig.update_yaxes(title_text="fraction", range=[0, 1.05], row=2, col=1)
-    fig.update_yaxes(type="log", title_text="||W||_F", row=3, col=1)
+    fig.update_yaxes(
+        type="log", title_text="||W||_F", range=log_range(norm_values), row=3, col=1
+    )
     fig.update_yaxes(title_text="accuracy (%)", row=4, col=1)
     fig.update_xaxes(title_text="weight updates", row=4, col=1)
     solver = (
         f"ePC eta_infer={eta:g}, infer_steps={steps}" if eta is not None else "backprop"
     )
     fig.update_layout(
-        title=f"{solver} (trainer {trainer}): spectrum, relaxation, and weight norms during training",
+        title=f"{solver}, trainer {trainer}: spectrum, relaxation, weight norms",
         template="plotly_white",
         paper_bgcolor="#fcfcfb",
         plot_bgcolor="#fcfcfb",
@@ -1192,6 +1215,7 @@ def plot_track(csv_path):
         legend=dict(orientation="h", y=-0.08),
         margin=dict(l=60, r=30, t=70, b=70),
         height=1200,
+        width=1100,
     )
     fig.update_xaxes(gridcolor="#e6e5e1", zeroline=False)
     fig.update_yaxes(gridcolor="#e6e5e1", zeroline=False)

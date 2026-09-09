@@ -52,11 +52,12 @@ Chart written to ``epc_convergence.html`` (and ``.png`` when kaleido is
 installed).
 
 ``--log_train_percent p1,p2,...`` adds trained checkpoints to convergence mode:
-one training run per solver (sPC at ``--spc_steps`` @ ``--spc_eta``, one ePC
+one ``train`` run per solver (sPC at ``--spc_steps`` @ ``--spc_eta``, one ePC
 run per eta at ``--epc_steps``), every run seeing the same batch schedule
-(shared loader seed and rng stream). Percent p logs a tracked
-``--track_steps`` history with the params after round(p/100 * total
-updates) weight updates, probed on the same test batch and init key as the
+(shared loader seed and rng key). Percent p logs a tracked ``--track_steps``
+history from ``train``'s iteration callback with the params after
+round(p/100 * total updates) weight updates (``ctx.params`` when ``ctx.step``
+reaches that count), probed on the same test batch and init key as the
 untrained report — params are the only variable across checkpoints and
 solvers, so E* is comparable between checkpoints and p = 0 reproduces the
 untrained histories. Writes ``epc_convergence__train_<p>pct.html`` plus
@@ -111,13 +112,12 @@ from pathlib import Path
 import jax
 import jax.numpy as jnp
 import numpy as np
-from tqdm.auto import tqdm
 
 from fabricpc.core.inference import InferenceSGDNormClip
 from fabricpc.core.inference_epc import EPCInference
 from fabricpc.experiments import ExperimentArm, PlannedMultiContrastExperiment
 from fabricpc.graph_initialization.state_initializer import initialize_graph_state
-from fabricpc.training import evaluate, make_train_step, train
+from fabricpc.training import evaluate, train
 from fabricpc.utils.data.dataloader import Cifar10Loader
 from fabricpc.utils.dashboarding.inference_tracking import make_tracked_probe
 from fabricpc import setup_jax
@@ -521,14 +521,18 @@ def _train_with_checkpoints(
 ):
     """One training run; returns {pct: tracked history on the probe batch}.
 
-    A checkpoint at percent p logs a tracked inference history (track_solver,
-    --track_steps) with the params after round(p/100 * total updates) weight
-    updates. Every checkpoint of every run probes the same batch
-    (probe_clamps — the untrained report's test batch) with the same init key
-    (probe_key), so params are the only variable across checkpoints and
-    solvers, and a p = 0 checkpoint reproduces the untrained histories. The
-    caller passes the same rng_key to every run and the loader seed is fixed
-    here, so all solvers also see the same training batch schedule.
+    Training runs through ``train``. A checkpoint at percent p logs a tracked
+    inference history (track_solver, --track_steps) from the iteration
+    callback on the batch whose ``ctx.step`` (weight updates applied so far,
+    that batch included) equals round(p/100 * total updates), with
+    ``ctx.params`` the params after that update; p = 0 is probed before
+    training and p = 100 after ``train`` returns. Every checkpoint of every
+    run probes the same batch (probe_clamps — the untrained report's test
+    batch) with the same init key (probe_key), so params are the only
+    variable across checkpoints and solvers, and a p = 0 checkpoint
+    reproduces the untrained histories. The caller passes the same rng_key
+    to every run and the loader seed is fixed here, so all solvers also see
+    the same training batch schedule.
     """
     loader = Cifar10Loader("train", batch_size=args.batch_size, shuffle=True, seed=0)
     steps_per_epoch = len(loader)
@@ -552,37 +556,32 @@ def _train_with_checkpoints(
     optimizer = _demo.make_optimizer(
         args.lr, args.weight_decay, args.num_epochs, steps_per_epoch
     )
-    opt_state = optimizer.init(params)
-    step_fn = make_train_step(train_structure, optimizer)
-    probe_batch_size = next(iter(probe_clamps.values())).shape[0]
-    tracked_probe = make_tracked_probe(
-        track_structure, probe_clamps, probe_key, probe_batch_size
-    )
+    tracked_probe = make_tracked_probe(track_structure)
 
     def log_probe(current_params):
-        _, metrics = tracked_probe(current_params)
+        _, metrics = tracked_probe(current_params, probe_key, probe_clamps)
         jax.block_until_ready(metrics)
         return jax.tree_util.tree_map(np.asarray, metrics)
 
-    checkpoints = {}
-    progress = tqdm(total=total_updates, desc=f"train {label}", leave=True)
-    update_idx = 0
-    for _ in range(args.num_epochs):
-        epoch_key, rng_key = jax.random.split(rng_key)
-        batch_keys = jax.random.split(epoch_key, steps_per_epoch)
-        for batch_idx, (images, labels) in enumerate(loader):
-            for pct in triggers.get(update_idx, ()):
-                checkpoints[pct] = log_probe(params)
-            batch = {"x": jnp.asarray(images), "y": jnp.asarray(labels)}
-            params, opt_state, train_metrics, _ = step_fn(
-                params, opt_state, batch, batch_keys[batch_idx]
-            )
-            update_idx += 1
-            progress.set_postfix(energy=f"{float(train_metrics['energy']):.4f}")
-            progress.update(1)
-    progress.close()
+    checkpoints = {pct: log_probe(params) for pct in triggers.pop(0, ())}
+
+    def iter_callback(ctx):
+        for pct in triggers.get(ctx.step, ()):
+            checkpoints[pct] = log_probe(ctx.params)
+
+    print(f"train {label}: {args.num_epochs} epochs, {total_updates} updates")
+    result = train(
+        params,
+        train_structure,
+        loader,
+        optimizer,
+        {"num_epochs": args.num_epochs},
+        rng_key,
+        verbose=True,
+        iter_callback=iter_callback,
+    )
     for pct in tail_pcts:
-        checkpoints[pct] = log_probe(params)
+        checkpoints[pct] = log_probe(result.params)
     return checkpoints
 
 
@@ -650,8 +649,8 @@ def run_convergence(args):
         structure = base_structure._replace(
             config={**base_structure.config, "inference": solver}
         )
-        tracked_probe = make_tracked_probe(structure, clamps, state_key, batch_size)
-        _, metrics = tracked_probe(params)  # warmup + result
+        tracked_probe = make_tracked_probe(structure)
+        _, metrics = tracked_probe(params, state_key, clamps)  # warmup + result
         jax.block_until_ready(metrics)
         histories[label] = jax.tree_util.tree_map(np.asarray, metrics)
 

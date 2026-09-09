@@ -30,7 +30,7 @@ from fabricpc.nodes import Linear
 from fabricpc.nodes.identity import IdentityNode
 from fabricpc.training import make_train_step
 from fabricpc.utils.dashboarding.inference_tracking import (
-    run_inference_with_full_history,
+    make_inference_history,
     run_inference_with_history,
 )
 
@@ -226,22 +226,86 @@ class TestTrackingParity:
                 atol=1e-6,
             ), f"{name}: tracked final state differs from run_inference"
 
-    def test_full_history_schedule_rows_and_final(self, rng_key):
+    @staticmethod
+    def _at(states, i):
+        return jax.tree_util.tree_map(lambda a: a[i], states)
+
+    @staticmethod
+    def _assert_states_close(a, b, what):
+        for name in a.nodes:
+            for field in ("z_latent", "z_mu", "error", "energy"):
+                assert jnp.allclose(
+                    getattr(a.nodes[name], field),
+                    getattr(b.nodes[name], field),
+                    atol=1e-6,
+                ), f"{name}.{field}: {what}"
+
+    def test_sampled_history_schedule_rows_and_final(self, rng_key):
+        """``make_inference_history`` iterates the segments inside one jitted
+        program: with ``every=1`` a 3-step ePC then 5-step sPC schedule
+        yields 3 + 5 + 1 sampled states, index 0 the initialization, index 3
+        the ePC segment's finalized state (what ``run_inference`` with the
+        ePC solver alone returns), and the last the full settle."""
         epc = EPCInference(eta_infer=0.01, infer_steps=3)
         spc = InferenceSGD(eta_infer=0.05, infer_steps=5)
         structure, params, clamps, state = _setup(InferenceSchedule(epc, spc), rng_key)
 
-        final_tracked, history = run_inference_with_full_history(
-            params, state, clamps, structure
+        final_tracked, states = make_inference_history(structure, every=1)(
+            params, state, clamps
         )
-        assert len(history) == 3 + 5
+        assert jax.tree_util.tree_leaves(states)[0].shape[0] == 3 + 5 + 1
         final_plain = run_inference(params, state, clamps, structure)
-        for name in structure.nodes:
-            assert jnp.allclose(
-                final_tracked.nodes[name].z_latent,
-                final_plain.nodes[name].z_latent,
-                atol=1e-6,
-            ), f"{name}: full-history final state differs from run_inference"
+        self._assert_states_close(final_tracked, final_plain, "final vs run_inference")
+        self._assert_states_close(self._at(states, 8), final_plain, "last sample")
+        self._assert_states_close(self._at(states, 0), state, "index 0")
+        epc_only = structure._replace(config={**structure.config, "inference": epc})
+        self._assert_states_close(
+            self._at(states, 3),
+            run_inference(params, state, clamps, epc_only),
+            "sample at the segment boundary",
+        )
+
+    def test_sampling_interval_crosses_segment_boundaries(self, rng_key):
+        """``every=2`` on the same schedule samples after steps 0, 2, 4, 6, 8:
+        the sample after step 4 (one sPC step past the ePC segment) equals
+        the ``every=1`` sample at index 4."""
+        epc = EPCInference(eta_infer=0.01, infer_steps=3)
+        spc = InferenceSGD(eta_infer=0.05, infer_steps=5)
+        structure, params, clamps, state = _setup(InferenceSchedule(epc, spc), rng_key)
+        _, dense = make_inference_history(structure, every=1)(params, state, clamps)
+        final, sparse = make_inference_history(structure, every=2)(
+            params, state, clamps
+        )
+        assert jax.tree_util.tree_leaves(sparse)[0].shape[0] == 5
+        for i in range(5):
+            self._assert_states_close(
+                self._at(sparse, i), self._at(dense, 2 * i), f"every=2 sample {i}"
+            )
+        self._assert_states_close(self._at(sparse, 4), final, "last sample is final")
+
+    def test_epc_samples_are_finalized_states(self, rng_key):
+        """Under ePC a sample after i steps is the derived state
+        ``run_inference`` returns at ``infer_steps=i``, not the raw state one
+        ε update behind."""
+        structure, params, clamps, state = _setup(
+            EPCInference(eta_infer=0.01, infer_steps=3), rng_key
+        )
+        final, states = make_inference_history(structure, every=1)(
+            params, state, clamps
+        )
+        for i in (1, 2, 3):
+            truncated = structure._replace(
+                config={
+                    **structure.config,
+                    "inference": EPCInference(eta_infer=0.01, infer_steps=i),
+                }
+            )
+            self._assert_states_close(
+                self._at(states, i),
+                run_inference(params, state, clamps, truncated),
+                f"ePC sample after {i} steps",
+            )
+        self._assert_states_close(self._at(states, 3), final, "last sample")
 
     def test_single_solver_tracking_unchanged(self, rng_key):
         solver = InferenceSGD(eta_infer=0.05, infer_steps=4)

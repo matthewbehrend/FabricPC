@@ -115,25 +115,37 @@ scripts/epc_analysis.py --plot_track CSV renders the file. Supplying the
 probe forces a device sync on every batch, probed or not.
 
 Control runs (docs/dev_plans/epc_review_fixes_lanczos_regime_probe.md,
-Design 4), each the first 30 epochs of the 100-epoch schedule at seed 42:
+Design 4; docs/reports/epc_regime_and_stability_report.md Section 5.9), each
+the first 30 epochs of the 100-epoch schedule at seed 42, run 2026-09-08:
 
     python examples/resnet18_cifar10_demo.py --num_epochs 30 --schedule_epochs 100 \
         --augment --activation gelu --track_regime 50 --eval_every 1 [cell]
 
-    cell                        outcome (fill from probe.summary(chance=0.1))
-    --eta_infer 1e-3 --infer_steps 5   (the defaults; the collapse series)   pending
-    --eta_infer 1e-3 --infer_steps 1   (the 100-epoch survivor)              pending
-    --trainer backprop                                                       pending
-    --eta_infer 1e-2 --infer_steps 1   (reversal expected before crossing)   pending
+    cell                               reversal / crossing / chance      lambda_max ep 1 -> 8 -> 12 -> 15 -> 30   accuracy ep 30
+    --eta_infer 1e-3 --infer_steps 5   update 2700 (ep 14) / 2750 (ep 15) / ep 15   22 -> 27 -> 103 -> 31060 -> 1   9.9%
+    --eta_infer 1e-3 --infer_steps 1   none / none / none                            22 -> 17 -> 20 -> 21 -> 29      67.7%
+    --trainer backprop                 none / none / none                            22 -> 16 -> 18 -> 19 -> 24      69.0%
+    --eta_infer 1e-2 --infer_steps 1   update 1150 (ep 6) / 1200 (ep 7) / ep 7      22 -> 1 (167 at ep 6, 6132 at ep 7)   10.0%
 
-Reading rule, fixed in advance: if lambda_max and the weight norms grow at a
-comparable rate in the backprop and (1e-3, 1) runs as in the collapsing
-cells, the growth is a weight-scale effect of this parameterization (no
-normalization, weight decay 1e-2) and the remedy is a rate that follows
-lambda_max or weight-norm control; if they grow only in the collapsing
-cells, ePC's relaxation feeds the growth. The growth phases quoted here
-must come from the (1e-3, 5) re-run's summary, not from the tracking CSVs
-that predate the normalized trainer.
+Growth phases of the defaults from probe.summary(): lambda_max between 16
+and 27 through epoch 8, 1.3 to 1.6x per epoch over epochs 9 to 12, then
+2.8x, 5.7x, and 19x over epochs 13 to 15; accuracy peaked at 55.82% in
+epoch 12 and was at chance in epoch 15. Reading rule, fixed in advance: if
+lambda_max and the weight norms grow at a comparable rate in the backprop
+and (1e-3, 1) runs as in the collapsing cells, the growth is a weight-scale
+effect of this parameterization (no normalization, weight decay 1e-2); if
+they grow only in the collapsing cells, ePC's relaxation feeds the growth.
+Observed: the second case. lambda_max drifts about 1.01x per epoch under
+backprop and under ePC at T = 1, the runaway occurs only in the two
+collapsing ePC cells, and the Frobenius norm of every convolution weight
+falls on the same weight-decay schedule in all four runs (total 1670 ->
+1600 to 1640), so the growth is not a weight-scale effect and weight-norm
+control would not have bounded it. lambda_min is negative from init in
+every run (-0.37) and stays above -1.2 in the controls; in the collapsing
+cells it reaches -22 and -1960 as the gradient weight on negative curvature
+rises from 0.1% to 10%. At update 1200 of the (1e-2, 1) run Lanczos reports
+lambda_max = 6132 with lambda_min = -354, where power iteration on the old
+trainer had returned -9399.
 
 Smoke Test (2 epochs)
 python examples/resnet18_cifar10_demo.py --inference epc

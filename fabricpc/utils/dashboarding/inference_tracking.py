@@ -3,14 +3,18 @@
 This module provides alternative inference and training functions that
 collect intermediate states for detailed tracking and debugging.
 
-Both history variants iterate ``structure.config["inference"].segments()``,
-so composed schedules (e.g. an ePC segment followed by an sPC segment) are
-tracked segment by segment and the per-step metric stacks are concatenated
-along the step axis. Metric semantics are per-segment: ``latent_grad_norm``
-is the norm of whatever that segment's solver accumulates into
-``latent_grad`` — under state-based solvers the one-hop dE/dz_latent, under
-``EPCInference`` the full-forward gradient of the total energy with respect
-to the relaxed errors.
+Both history variants iterate ``structure.config["inference"].segments()``
+inside one jitted program, so composed schedules (e.g. an ePC segment
+followed by an sPC segment) are tracked segment by segment: each segment
+runs its solver's ``begin_segment`` before its steps and ``finalize_state``
+after them, as ``run_inference`` does. ``run_inference_with_history``
+concatenates the per-step metric stacks along the step axis;
+``make_inference_history`` samples states at global step multiples across
+the segment boundaries. Metric semantics are per-segment:
+``latent_grad_norm`` is the norm of whatever that segment's solver
+accumulates into ``latent_grad`` — under state-based solvers the one-hop
+dE/dz_latent, under ``EPCInference`` the full-forward gradient of the total
+energy with respect to the relaxed errors.
 """
 
 from typing import Callable, Dict, List, Tuple, cast
@@ -108,13 +112,16 @@ def run_inference_with_history(
 
 def make_tracked_probe(
     structure: GraphStructure,
-    clamps: Dict[str, jnp.ndarray],
-    rng_key: jax.Array,
-    batch_size: int,
-) -> Callable[[GraphParams], Tuple[GraphState, Dict[str, Dict[str, jnp.ndarray]]]]:
-    """Jitted ``params -> (final_state, stacked_metrics)`` probe.
+) -> Callable[
+    [GraphParams, jax.Array, Dict[str, jnp.ndarray]],
+    Tuple[GraphState, Dict[str, Dict[str, jnp.ndarray]]],
+]:
+    """Jitted ``probe(params, key, clamps) -> (final_state, stacked_metrics)``.
 
-    Compiles ``initialize_graph_state`` and ``run_inference_with_history``
+    The per-step-metrics twin of
+    :func:`fabricpc.utils.dashboarding.callbacks.make_tracked_settle`: latent
+    initialization from ``clamps`` and ``key`` (the batch size is the
+    clamps' leading axis), then :func:`run_inference_with_history`, compiled
     into one XLA program. Splitting them — eager init, jitted tracking —
     breaks the feedforward-init invariant on GPU: at default matmul
     precision the two programs can select different cuDNN conv algorithms
@@ -122,18 +129,20 @@ def make_tracked_probe(
     difference between the two conv paths (up to ~1e-3) as its step-0
     energy instead of 0.
 
-    The returned callable takes only ``params`` and reuses the compiled
-    program across calls; ``clamps`` and ``rng_key`` are fixed at creation.
+    One compiled program per structure and clamp shape; call it with
+    different ``params`` (training checkpoints, or ``ctx.params`` from
+    ``train``'s iteration callback) to compare histories that differ only in
+    the parameters. Build it once per structure.
     """
 
-    def _probe(params, clamps):
+    def probe(params, key, clamps):
+        batch_size = next(iter(clamps.values())).shape[0]
         init_state = initialize_graph_state(
-            structure, batch_size, rng_key, clamps=clamps, params=params
+            structure, batch_size, key, clamps=clamps, params=params
         )
         return run_inference_with_history(params, init_state, clamps, structure)
 
-    probe = jax.jit(_probe)
-    return lambda params: probe(params, clamps)
+    return jax.jit(probe)
 
 
 def _unstack_metrics(
@@ -173,70 +182,85 @@ def make_inference_history(
     [GraphParams, GraphState, Dict[str, jnp.ndarray]], Tuple[GraphState, GraphState]
 ]:
     """Build a jitted settle that also returns the states at inference steps
-    ``0, every, 2*every, ...`` up to ``infer_steps``.
+    ``0, every, 2*every, ...`` up to the total step count.
 
     Returns ``history(params, initial_state, clamps) -> (final_state,
-    states)``. ``final_state`` is the settle after ``infer_steps`` steps, the
-    same state :func:`fabricpc.core.inference.run_inference` returns.
-    ``states`` is a GraphState pytree whose every leaf carries a new leading
-    axis of length ``infer_steps // every + 1``: index ``i`` is the state
-    after ``i * every`` inference steps, so index 0 is ``initial_state`` and,
-    when ``infer_steps`` is a multiple of ``every``, the last index is
-    ``final_state``. Read step ``i`` with
-    ``jax.tree_util.tree_map(lambda a: a[i], states)``.
+    states)``. ``final_state`` is the settle after every segment of
+    ``structure.config["inference"].segments()`` has run, the same state
+    :func:`fabricpc.core.inference.run_inference` returns. ``states`` is a
+    GraphState pytree whose every leaf carries a new leading axis of length
+    ``total_steps // every + 1``, ``total_steps`` the sum of the segments'
+    step counts: index ``i`` is the state after ``i * every`` inference
+    steps, so index 0 is ``initial_state`` and, when ``total_steps`` is a
+    multiple of ``every``, the last index is ``final_state``. Read step ``i``
+    with ``jax.tree_util.tree_map(lambda a: a[i], states)``.
+
+    Each segment runs its solver's ``begin_segment`` before its steps and
+    ``finalize_state`` after them, and every sampled state is passed through
+    the current segment's ``finalize_state`` too, so a sample is the state
+    ``run_inference`` would return if the schedule stopped there: under
+    ``EPCInference`` that is the derived state (latents and energies at the
+    sampled errors, not one ε update behind), under the state-based solvers
+    the identity. Sample points are counted across segment boundaries, so a
+    schedule of 3 ePC steps then 5 sPC steps at ``every=2`` samples after
+    steps 0, 2, 4, 6, 8.
 
     The loop is a ``lax.scan`` over blocks of ``every`` steps, each block a
-    ``fori_loop``, so the compiled program holds the sampled states only, not
-    one per step, and the whole settle is one XLA program. Build once per
-    structure and reuse the returned function; each factory call compiles
-    anew on its first invocation.
+    ``fori_loop``, with partial blocks at the segment boundaries, so the
+    compiled program holds the sampled states only, not one per step, and
+    the whole settle is one XLA program. Build once per structure and reuse
+    the returned function; each factory call compiles anew on its first
+    invocation.
     """
     if every < 1:
         raise ValueError(f"every must be >= 1, got {every}")
-    inference_obj = structure.config["inference"]
-    inference_cls = type(inference_obj)
-    config = inference_obj.config
-    infer_steps = config["infer_steps"]
-    n_blocks, remainder = divmod(infer_steps, every)
+    segments = tuple(structure.config["inference"].segments())
 
     def history(
         params: GraphParams,
         initial_state: GraphState,
         clamps: Dict[str, jnp.ndarray],
     ) -> Tuple[GraphState, GraphState]:
-        def step(_t, state):
-            return inference_cls.inference_step(
-                params, state, clamps, structure, config
-            )
+        def stacked(state):
+            return jax.tree_util.tree_map(lambda a: a[None], state)
 
-        def block(state, _):
-            state = jax.lax.fori_loop(0, every, step, state)
-            return state, state
+        samples = [stacked(initial_state)]
+        state = initial_state
+        done = 0  # inference steps completed before the current segment
+        for solver, n_steps in segments:
+            solver_cls, config = type(solver), solver.config
 
-        state, sampled = jax.lax.scan(block, initial_state, xs=None, length=n_blocks)
-        final_state = jax.lax.fori_loop(0, remainder, step, state)
+            def step(_t, s, solver_cls=solver_cls, config=config):
+                return solver_cls.inference_step(params, s, clamps, structure, config)
+
+            def sample(s, solver_cls=solver_cls):
+                return solver_cls.finalize_state(params, s, clamps, structure)
+
+            state = solver_cls.begin_segment(params, state, clamps, structure)
+            to_next = every - done % every  # steps to the next sample point
+            if to_next <= n_steps:
+                state = jax.lax.fori_loop(0, to_next, step, state)
+                samples.append(stacked(sample(state)))
+                n_full, tail = divmod(n_steps - to_next, every)
+                if n_full:
+
+                    def block(s, _, step=step, sample=sample):
+                        s = jax.lax.fori_loop(0, every, step, s)
+                        return s, sample(s)
+
+                    state, sampled = jax.lax.scan(block, state, xs=None, length=n_full)
+                    samples.append(sampled)
+                state = jax.lax.fori_loop(0, tail, step, state)
+            else:
+                state = jax.lax.fori_loop(0, n_steps, step, state)
+            state = solver_cls.finalize_state(params, state, clamps, structure)
+            done += n_steps
+
         states = jax.tree_util.tree_map(
-            lambda first, rest: jnp.concatenate([first[None], rest]),
-            initial_state,
-            sampled,
+            lambda *xs: jnp.concatenate(xs, axis=0), *samples
         )
-        return final_state, states
+        return state, states
 
-    """ ePC branch had this on old tracking API:
-    history: List[GraphState] = []
-    state = initial_state
-    
-    for solver, n_steps in structure.config["inference"].segments():
-        solver_cls = type(solver)
-        config = solver.config
-        state = solver_cls.begin_segment(params, state, clamps, structure)
-        for _ in range(n_steps):
-            state = solver_cls.inference_step(params, state, clamps, structure, config)
-            history.append(state)
-        state = solver_cls.finalize_state(params, state, clamps, structure)
-    
-    return state, history
-    """
     return jax.jit(history)
 
 

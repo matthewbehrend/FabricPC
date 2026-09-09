@@ -231,28 +231,50 @@ for epoch in range(num_epochs):
 tracker.close()
 ```
 
-### Standalone inference probes with `make_tracked_probe`
-#### TODO: migrate this to new callback API
-To record per-step energies on a fixed batch without training,
-`make_tracked_probe` returns a jitted `params -> (final_state,
-stacked_metrics)` callable that compiles `initialize_graph_state` and
-`run_inference_with_history` into one XLA program. Keep them together:
-initializing eagerly and tracking under `jax.jit` runs the same convolutions
-in two separately compiled programs, which on GPU at default precision can
-select different cuDNN algorithms (TF32 vs FP32, per conv shape) — unclamped
-nodes then record the squared difference between the two paths (up to ~1e-3)
-as their step-0 energy instead of 0.
+### Per-step metrics on a fixed batch with `make_tracked_probe`
+
+`make_tracked_settle` above returns sampled states. To record per-step
+metrics (per-node `energy`, `latent_grad_norm`, `error_norm`,
+`z_latent_mean`, `z_latent_std`) on a fixed batch, `make_tracked_probe(structure)`
+returns a jitted `probe(params, key, clamps) -> (final_state, stacked_metrics)`
+that compiles `initialize_graph_state` and `run_inference_with_history` into
+one XLA program. Keep them together: initializing eagerly and tracking under
+`jax.jit` runs the same convolutions in two separately compiled programs,
+which on GPU at default precision can select different cuDNN algorithms
+(TF32 vs FP32, per conv shape), so unclamped nodes record the squared
+difference between the two paths (up to ~1e-3) as their step-0 energy
+instead of 0. `stacked_metrics` is node → metric → array over the steps of
+every segment of the graph's inference schedule; row `i` is recorded after
+the step that produced the state after `i + 1` updates, with the energy
+computed at the latents before that update, so row `i` is the energy after
+`i` updates. `unstack_inference_history` turns it into per-step dicts.
+
+The probe is built once per structure and called with different parameters;
+inside a training run those come from the iteration callback's
+`ctx.params`, so a history at chosen checkpoints needs no custom loop:
 
 ```python
-from fabricpc.utils.dashboarding import make_tracked_probe
+from fabricpc.training import train
+from fabricpc.training.trainer import IterContext
+from fabricpc.utils.dashboarding import make_tracked_probe, unstack_inference_history
 
-probe = make_tracked_probe(structure, clamps, rng_key, batch_size)
-final_state, stacked_metrics = probe(params)  # reuse across param sets
+probe = make_tracked_probe(structure)
+histories = {}
+
+def iter_callback(ctx: IterContext):
+    if ctx.step in (100, 1000):  # weight updates applied so far, this batch included
+        _, stacked_metrics = probe(ctx.params, probe_key, probe_clamps)
+        histories[ctx.step] = unstack_inference_history(stacked_metrics)
+
+result = train(
+    params, structure, train_loader, optimizer, {"num_epochs": 5}, rng_key,
+    iter_callback=iter_callback,
+)
 ```
 
-`clamps` and `rng_key` are fixed at creation; calling the probe with new
-params (e.g. training checkpoints) reuses the compiled program, so recorded
-histories differ only in params.
+`probe_clamps` and `probe_key` are the same on every call, so the recorded
+histories differ only in the parameters. `examples/epc_spc_resnet18_compare.py
+--log_train_percent` is this pattern on the ResNet-18.
 
 ## Metric Extractors
 
