@@ -55,7 +55,8 @@ Usage:
     python examples/resnet18_cifar10_demo.py --num_epochs 100 --eval_every 10 --augment --activation gelu # full training with augmentation and gelu activation
 
 
-Results (RTX3090, cuda13, jax 0.10.2):
+Results (RTX 3090, CUDA 13, JAX 0.10.2)
+---------------------------------------
 ePC trains >40X faster per epoch than sPC (11 s vs 487 s) and reaches higher
 accuracy at 100 epochs. At these settings ePC is in its backprop regime: one
 step from zero error leaves each error at -eta_infer times the backprop
@@ -65,87 +66,83 @@ the scaling away; the --infer_steps 1 run below matches the backprop trainer
 on the same graph (76.73% vs 77.11%). sPC's error signal decays with depth,
 so its deep layers learn slowly within 120 steps.
 
-Stability: ePC is gradient descent on the energy in error coordinates and is
-stable only for eta_infer < 2/lambda_max, lambda_max the largest eigenvalue
-of that energy's Hessian that the starting gradient excites: 16.4 at init
-on this graph on a 64-sample test batch (eta_max = 0.12; a one-eigenvalue
-fit of the 2-epoch sweep gives lambda_eff = 12, a heuristic). The same
-measurement (scripts/epc_analysis.py --resnet18, 30 Lanczos steps) gives
-lambda_min = -0.42, an indefinite Hessian at init with 1.2% of the gradient
-on negative curvature, and f_bar = 0.010 against f_max = 0.080 for the
-defaults: most of the gradient weight sits near the precision floor, and
-the sweep's accuracy follows the top modes' relaxation (lambda_eff near
-lambda_max), not the gradient-weighted bulk. At odd infer_steps the output
-layer is damaged earlier than the bound: its
-weight gradient follows the output residual after T steps, which along the
-top mode is (1 - eta_infer*(lambda_max - 1))*r at T = 1 and reverses sign
-once eta_infer*(lambda_max - 1) > 1, while the hidden errors keep their
-sign for every eta_infer*lambda < 2. lambda_max = 1 + sigma_max(J)^2 (J the
-map from the hidden errors to the output prediction) grows with the
-weights, so a fixed eta_infer can cross either threshold late in training.
-The 100-epoch sweep (sweep_eta*_steps*.log, batch-summed weight gradients,
-before release 0.5.1's per-prediction normalization):
+Choosing eta_infer and infer_steps
+---------------------------------
+ePC is gradient descent on the energy in error coordinates. Two quantities of
+that energy's Hessian at the feedforward state decide its behavior. The
+settings block prints both at init (Lanczos through EPCInference.error_energy
+on a fixed 64-sample test batch; also scripts/epc_analysis.py --resnet18):
 
-    eta_infer  infer_steps  eta*T   final accuracy
-    0.001      1            0.001   76.73%
-    0.001      2            0.002   75.76%
-    0.001      5 (default)  0.005   9.75%   (54.76% at epoch 10, 9.68% at epoch 20)
-    0.01       1            0.01    9.92%   (at chance by epoch 10)
-    0.01       2            0.02    9.88%
-    0.01       5            0.05    10.13%
+    lambda_max  the largest eigenvalue the starting gradient excites. ePC is
+                stable only for eta_infer < 2/lambda_max. At odd infer_steps
+                the output layer is damaged earlier: its weight gradient
+                reverses sign once eta_infer*(lambda_max - 1) > 1.
+    f_bar       the gradient-weighted relaxed fraction: how far the error
+                modes that carry the starting gradient have moved toward the
+                PC equilibrium after infer_steps steps (a mode with eigenvalue
+                lambda relaxes by 1 - (1 - eta_infer*lambda)^infer_steps).
+                Below 0.1 the weight gradients are backprop's, rescaled;
+                above 0.9 they are the PC equilibrium's. f_max is the same
+                fraction for the top mode alone.
 
-Only eta*T <= 0.002 survived 100 epochs; at 2 epochs even eta*T = 0.16 still
-trains (examples/epc_spc_resnet18_compare.py sweep tables in
+At init on this graph: lambda_max = 16.4, so eta_infer < 0.12; lambda_min =
+-0.42, an indefinite Hessian with 1.2% of the gradient on negative curvature;
+the defaults (1e-3, 5) read f_bar 0.01 and f_max 0.08, backprop-like.
+lambda_max = 1 + sigma_max(J)^2, J the map from the hidden errors to the
+output prediction, grows during training, so a fixed eta_infer can cross the
+bound late in a run. The 100-epoch sweep (sweep_eta*_steps*.log; batch-summed
+weight gradients, before release 0.5.1's per-prediction normalization):
+
+    eta_infer  infer_steps  final accuracy
+    0.001      1            76.73%   (backprop trainer on the same graph: 77.11%)
+    0.001      2            75.76%
+    0.001      5 (default)   9.75%   (54.76% at epoch 10, at chance by epoch 20)
+    0.01       1             9.92%   (at chance by epoch 10)
+    0.01       2             9.88%
+    0.01       5            10.13%
+
+At 2 epochs even eta_infer*infer_steps = 0.16 still trains (the sweep tables
+of examples/epc_spc_resnet18_compare.py, in
 docs/dev_plans_archive/epc_inference_solver.md). Goemaere et al. trained
-ResNet-18 at the same (1e-3, 5) for 50 epochs without instability, with
-batch normalization after every convolution, ReLU, weight decay <= 1e-3,
-and a standard parameterization; this demo has no normalization layers,
-gelu, weight decay 1e-2, muPC scaling, and a 100-epoch schedule.
+ResNet-18 at (1e-3, 5) for 50 epochs without instability, with batch
+normalization after every convolution, ReLU, weight decay <= 1e-3, and a
+standard parameterization; this demo has no normalization layers, gelu,
+weight decay 1e-2, muPC scaling, and a 100-epoch schedule.
 
-The settings block prints str(EPCInference.regime(spectrum)) at init with
-lambda_min, the gradient-weighted relaxed fraction f_bar, the gradient
-weight on negative curvature, and the Ritz residual (spectrum_at_init).
---track_regime N runs fabricpc.training.RegimeProbe inside train(): every
-N weight updates it records the excited spectrum on the same fixed 64-sample
-test batch, the regime flags (output-gradient reversal, eta*lambda_max > 2),
-and the Frobenius norm of every weight, plus the test accuracy per epoch,
-and writes epc_regime_track__{trainer}_eta{eta}_T{T}.csv (backprop:
-epc_regime_track__backprop.csv); the run ends with probe.summary().
-scripts/epc_analysis.py --plot_track CSV renders the file. Supplying the
-probe forces a device sync on every batch, probed or not.
+Tracking the spectrum during training
+-------------------------------------
+--track_regime N runs fabricpc.training.RegimeProbe inside train(): every N
+weight updates it records lambda_max, lambda_min, f_bar, the two flags
+(output-gradient reversal, eta_infer*lambda_max > 2), and the Frobenius norm
+of every weight on the same fixed 64-sample test batch, plus the test
+accuracy per epoch, to epc_regime_track__{trainer}_eta{eta}_T{T}.csv
+(backprop: epc_regime_track__backprop.csv); the run ends with
+probe.summary(). scripts/epc_analysis.py --plot_track CSV renders the file.
+Supplying the probe forces a device sync on every batch, probed or not.
 
-Control runs (docs/dev_plans/epc_review_fixes_lanczos_regime_probe.md,
-Design 4; docs/reports/epc_regime_and_stability_report.md Section 5.9), each
-the first 30 epochs of the 100-epoch schedule at seed 42, run 2026-09-08:
+Four control runs, each the first 30 epochs of the 100-epoch schedule at seed
+42, probed every 50 updates (2026-09-08, the normalized trainer):
 
     python examples/resnet18_cifar10_demo.py --num_epochs 30 --schedule_epochs 100 \
         --augment --activation gelu --track_regime 50 --eval_every 1 [cell]
 
-    cell                               reversal / crossing / chance      lambda_max ep 1 -> 8 -> 12 -> 15 -> 30   accuracy ep 30
-    --eta_infer 1e-3 --infer_steps 5   update 2700 (ep 14) / 2750 (ep 15) / ep 15   22 -> 27 -> 103 -> 31060 -> 1   9.9%
-    --eta_infer 1e-3 --infer_steps 1   none / none / none                            22 -> 17 -> 20 -> 21 -> 29      67.7%
-    --trainer backprop                 none / none / none                            22 -> 16 -> 18 -> 19 -> 24      69.0%
-    --eta_infer 1e-2 --infer_steps 1   update 1150 (ep 6) / 1200 (ep 7) / ep 7      22 -> 1 (167 at ep 6, 6132 at ep 7)   10.0%
+    cell                               acc. ep 30  lambda_max at epochs 1/8/12/15/30  flags (epoch)
+    --eta_infer 1e-3 --infer_steps 5    9.9%       22 / 27 / 103 / 31060 / 1          reversal 14, unstable 15, chance 15
+    --eta_infer 1e-3 --infer_steps 1   67.7%       22 / 17 / 20 / 21 / 29             none
+    --trainer backprop                 69.0%       22 / 16 / 18 / 19 / 24             none
+    --eta_infer 1e-2 --infer_steps 1   10.0%       22 / 1 / 1 / 1 / 1                 reversal 6, unstable 7, chance 7
+                                                   (167 at epoch 6, 6132 at epoch 7)
 
-Growth phases of the defaults from probe.summary(): lambda_max between 16
-and 27 through epoch 8, 1.3 to 1.6x per epoch over epochs 9 to 12, then
-2.8x, 5.7x, and 19x over epochs 13 to 15; accuracy peaked at 55.82% in
-epoch 12 and was at chance in epoch 15. Reading rule, fixed in advance: if
-lambda_max and the weight norms grow at a comparable rate in the backprop
-and (1e-3, 1) runs as in the collapsing cells, the growth is a weight-scale
-effect of this parameterization (no normalization, weight decay 1e-2); if
-they grow only in the collapsing cells, ePC's relaxation feeds the growth.
-Observed: the second case. lambda_max drifts about 1.01x per epoch under
-backprop and under ePC at T = 1, the runaway occurs only in the two
-collapsing ePC cells, and the Frobenius norm of every convolution weight
-falls on the same weight-decay schedule in all four runs (total 1670 ->
-1600 to 1640), so the growth is not a weight-scale effect and weight-norm
-control would not have bounded it. lambda_min is negative from init in
-every run (-0.37) and stays above -1.2 in the controls; in the collapsing
-cells it reaches -22 and -1960 as the gradient weight on negative curvature
-rises from 0.1% to 10%. At update 1200 of the (1e-2, 1) run Lanczos reports
-lambda_max = 6132 with lambda_min = -354, where power iteration on the old
-trainer had returned -9399.
+lambda_max runs away only in the two collapsing ePC cells. Under backprop and
+under ePC at infer_steps 1 it drifts about 1% per epoch, and the Frobenius
+norm of every convolution weight falls in all four runs, so the growth is
+driven by ePC's relaxation, not by the weight scale: the lever is eta_infer
+and infer_steps (or a rate that follows lambda_max), not weight-norm control.
+In both collapses the reversal flag fired one probe before the stability
+crossing, and f_bar had crossed 0.1 two to three epochs before the reversal
+while accuracy was still improving, so f_bar is the early warning to read off
+the CSV. Per-epoch tables and the mechanism:
+docs/reports/epc_regime_and_stability_report.md, Sections 5.8 and 5.9.
 
 Smoke Test (2 epochs)
 python examples/resnet18_cifar10_demo.py --inference epc
@@ -154,23 +151,25 @@ Test Accuracy: 39.26%
 python examples/resnet18_cifar10_demo.py --inference spc
 Test Accuracy: 33.89%
 
-ePC at --infer_steps 1 (the backprop-equivalent regime; compare the backprop
-reference below):
-python examples/resnet18_cifar10_demo.py --num_epochs 100 --eval_every 10 --augment --activation gelu --inference epc --eta_infer 0.001 --infer_steps 1
-Trainer: pc  |  Inference: epc (eta 0.001, 1 steps)  |  Activation: gelu  |  Epochs: 100  |  LR: 0.001  |  Augment: True
-  Epoch 10: accuracy=55.83%
-  Epoch 20: accuracy=63.59%
-  Epoch 30: accuracy=68.87%
-  Epoch 40: accuracy=70.68%
-  Epoch 50: accuracy=72.59%
-  Epoch 60: accuracy=75.31%
-  Epoch 70: accuracy=75.19%
-  Epoch 80: accuracy=76.47%
-  Epoch 90: accuracy=76.45%
-  Epoch 100: accuracy=76.73%
-Training time: 1102.0s (11.0s per epoch)
+============================================================
+python examples/resnet18_cifar10_demo.py --num_epochs 100 --eval_every 10 --augment --activation gelu --inference epc --eta_infer 3e-4 --infer_steps 5
+ePC at --infer_steps 5 and --eta_infer 3e-4 is stable and backprop-like. Higher infer_steps or inference rate that would lead to ePC convergence are currently unstable over long training runs.
+
+ePC regime at init: eta*T*lambda_max = 0.0247 (gradient-weighted relaxed fraction 0.00, fastest mode 0.02): backprop-like spectrum on a 64-sample test batch: lambda_max 16.4 (eta_max = 2/lambda_max = 0.122), lambda_min -0.425, f_bar 0.003, gradient weight on negative curvature 0.012, Ritz residual 4.57e-04
+Training for 100 epochs (JIT compilation on first batch)...
+  Epoch 10: accuracy=55.14%
+  Epoch 20: accuracy=62.34%
+  Epoch 30: accuracy=67.80%
+  Epoch 40: accuracy=70.07%
+  Epoch 50: accuracy=71.67%
+  Epoch 60: accuracy=74.11%
+  Epoch 70: accuracy=73.86%
+  Epoch 80: accuracy=75.43%
+  Epoch 90: accuracy=75.43%
+  Epoch 100: accuracy=75.85%
+Training time: 2458.2s (24.6s per epoch)
 Final evaluation...
-Test Accuracy: 76.73%
+Test Accuracy: 75.85%
 
 
 Best sPC trial at 100 epochs:
