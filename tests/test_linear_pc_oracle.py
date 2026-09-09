@@ -1,16 +1,97 @@
-"""
-Tests for the linear-Gaussian oracle and for both solvers against it.
+r"""
+Tests for the linear-Gaussian oracle and for both ePC and sPC solvers against it.
 
-The oracle (``fabricpc.utils.linear_pc_oracle``) assembles the energy of a
-linear-Gaussian DAG as a quadratic from params, edges, muPC forward scales,
-biases, and precisions, and solves it exactly. ``TestOracleSelfChecks``
-pins the oracle against hand-computed numbers, Innocenti et al. 2024
-Theorem 1, and explicit Hessian forms. The solver tests then require
-``EPCInference`` and ``InferenceSGD`` to reach the oracle's equilibrium,
-pin the exact stability bound of each (which fixes the scale of the
-gradient implementations, not only their direction), and check the
-error-coordinate Hessian-vector product and the Lanczos spectrum estimator
-(``fabricpc.core.epsilon_spectrum``) against the oracle's H_ε.
+The oracle, ``fabricpc.utils.linear_pc_oracle``, writes the energy of a
+linear-Gaussian DAG as the quadratic E = ½‖A z_free − c‖² from params, edges,
+muPC forward scales, biases, and precisions, and solves it by least squares.
+Its module docstring (Part 1, steps 1–6) defines the symbols used below: A, c,
+z*, ε*, B, M, H_z = AᵀA, H_ε = MᵀAᵀAM, and Theorem 1's S, P_l, and r.
+
+Usage:
+    python -m pytest tests/test_linear_pc_oracle.py -v
+
+Fixtures. ``MODEL`` holds 12 graphs. ``ModelObject.make`` turns each into
+(structure, params, clamps) with BATCH = 3 Gaussian-clamped samples:
+
+    chain-h1 … chain-h4    x → h_1 … h_k → y, widths (5, 4, 3), weight std 0.3
+    chain-h2-bias          chain-h2 with nonzero biases (``inject_biases``)
+    chain-h2-precision     chain-h2 with p_h1 = 2 and p_y = 0.5
+    chain-h3-std0.8        chain-h3 with weight std 0.8 (larger λ_max)
+    fork-merge             x → {a, b} → y: y sums two weighted edges
+    clamped-internal       chain-h2 with h2 clamped as well
+    prior-source           an unclamped prior feeding h beside the clamped x
+    unclamped-readout      chain-h2 with y unclamped, so E* = 0
+    mupc-chain-h3          chain-h3 under ``MuPCConfig`` and ``MuPCInitializer``
+
+``CHAINS`` is the six chain fixtures without a precision override.
+
+Layer 1, the oracle alone: ``TestOracleSelfChecks``. No solver runs.
+
+    Hand-computed numbers      ``test_scalar_chain_hand_numbers``
+    Innocenti et al. 2024      ``test_theorem1_matches_least_squares``,
+    Theorem 1                  ``test_error_pullback_is_precision_weighted``
+    Explicit Hessian forms     ``test_epsilon_hessian_explicit_form``,
+                               ``test_eigenvalue_floor``
+    Quadratic vs its readouts  ``test_normal_equations_hold``,
+                               ``test_readouts_agree_with_quadratic``,
+                               ``test_unclamped_readout_has_zero_energy``
+    Validator                  ``test_validate_rejects_non_linear_gaussian``,
+                               ``test_validate_rejects_cycles_at_any_unroll``
+    Part 2 helpers             ``test_stability_bound_needs_positive_curvature``,
+                               ``test_gradient_weights_and_weighted_fraction``,
+                               ``test_relaxed_fraction_and_steps``
+
+Layer 2, solvers reach the oracle: ``TestEPCReachesOracle`` and
+``TestSPCReachesOracle``. ``_oracle_case`` builds a fixture, runs
+``initialize_graph_state`` (feedforward latents, ε = 0), reads each source's
+``z_mu`` from that state as ``source_means``, and calls ``linear_equilibrium``.
+``_epc_schedule`` sets η = 1/λ_max(H_ε) and T from ``steps_to_contract`` over
+the excited modes of H_ε, so the ε error times ‖M‖₂ falls below atol/10;
+``_spc_schedule`` does the same with H_z and its full spectrum.
+``_assert_matches_oracle`` then compares the solver's final state to the
+oracle per sample at rtol = atol = 1e-4: ``z_latent`` on every node,
+``error`` and ``energy`` on every in_degree > 0 node, the summed energy, and
+under ePC the ``error`` of each unclamped source.
+
+Layer 3, gradient scale: ``TestStabilityBracket``. Each solver runs at 0.95×
+and 1.05× its exact bound 2/λ_max. A gradient off by a constant factor would
+pass every equilibrium test and fail the bracket.
+
+Layer 4, spectrum estimator: ``TestEpsilonHVPMatchesOracle``. The
+Hessian-vector product through ``EPCInference.error_energy`` and the Lanczos
+estimator ``fabricpc.core.epsilon_spectrum`` are checked against the oracle's
+H_ε.
+
+| Test | Assertion | Result |
+|---|---|---|
+| `TestOracleSelfChecks::test_scalar_chain_hand_numbers` | x = 1, W_1 = 2, W_2 = 3, y = 1: z*_h = 0.5, E* = 1.25, ε*_h = −1.5, ε*_y = −0.5; Theorem 1 S = 10, r = −5; H_z = H_ε = 10; bound 0.2 | 1/1 pass |
+| `test_theorem1_matches_least_squares` on `CHAINS`, `chain-h2-precision`, `mupc-chain-h3` | Theorem 1 E* = ½ p_y r S⁻¹ rᵀ equals the least-squares total energy (rtol 1e-10, atol 1e-12) | 8/8 pass |
+| `test_error_pullback_is_precision_weighted` on `CHAINS` and `chain-h2-precision` | p_l ε*_l = p_y ε*_y P_lᵀ on every hidden node (atol 1e-10) | 7/7 pass |
+| `test_epsilon_hessian_explicit_form` on `fork-merge`, `prior-source`, `clamped-internal` | H_ε = diag(p over free row nodes) + Σ_{clamped t} p_t J_tᵀJ_t (atol 1e-10); triu(B) = 0; det M = 1 | 3/3 pass |
+| `test_eigenvalue_floor` | λ_min(H_ε) ≥ min p_t on `CHAINS` and `chain-h2-precision`; λ_min(H_ε) < 1 on `prior-source` | 1/1 pass |
+| `test_normal_equations_hold` on `fork-merge`, `prior-source`, `clamped-internal` | ‖Aᵀ(A z* − c)‖ ≤ 1e-10 · max(1, ‖c‖) | 3/3 pass |
+| `test_readouts_agree_with_quadratic` on `fork-merge`, `prior-source`, `clamped-internal`, `chain-h2-bias`, `chain-h2-precision` | error_star[t] = (A z* − c)[row_t] / √p_t on every row node; total_energy = ½‖A z* − c‖² per sample (atol 1e-12) | 5/5 pass |
+| `test_unclamped_readout_has_zero_energy` on `unclamped-readout` | E* = 0 and z* = z_ff on every node (atol 1e-12) | 1/1 pass |
+| `test_validate_rejects_non_linear_gaussian` | Tanh activation, CrossEntropy energy, `flatten_input=True`, and `StorkeyHopfield` each raise `ValueError` | 1/1 pass |
+| `test_validate_rejects_cycles_at_any_unroll` | a cycle raises at unroll 1 and 2, where the schedule length equals the node count | 2/2 pass |
+| `test_stability_bound_needs_positive_curvature` | λ_max ≤ 0 raises; diag(−3, 4) gives 2/4 = 0.5 | 1/1 pass |
+| `test_gradient_weights_and_weighted_fraction` | weights = squared eigenvector overlaps summed over samples and normalized; f̄ averages the positive modes only and is NaN with none | 1/1 pass |
+| `test_relaxed_fraction_and_steps` | f = 1 − (1 − ηλ)^T; `steps_to_contract` brackets the ratio; a non-contracting mode raises | 1/1 pass |
+| `TestEPCReachesOracle` (ePC, 12 graphs) | z_latent, per-node energy, total energy, and error (unclamped sources included) within rtol/atol 1e-4 | 12/12 pass |
+| `TestSPCReachesOracle` (sPC, 12 graphs) | same, source error skipped (sPC re-syncs source predictions) | 12/12 pass |
+| `TestStabilityBracket[epc]` on `chain-h3` and `mupc-chain-h3` | η = 0.95·(2/λ_max(H_ε)) reaches the oracle; η = 1.05·bound for 150 steps: finite, energy strictly increasing over the last 50 | 2/2 pass |
+| `TestStabilityBracket[spc]` | same with H_z, both chains | 2/2 pass |
+| `TestEpsilonHVPMatchesOracle::test_hvp` on `fork-merge` and `prior-source` | Hessian-vector product through `error_energy` = H_ε v, per sample, float32 against the float64 oracle (atol 1e-4) | 2/2 pass |
+| `TestEpsilonHVPMatchesOracle::test_lanczos_matches_excited_extremes` on `fork-merge`, `prior-source`, `chain-h3-std0.8`, `chain-h3`, each in float32 and float64 | Lanczos λ_max = max eig(H_ε) and λ_min = min excited eigenvalue (rtol 1e-3); f̄ = the oracle's weighted fraction (atol 1e-3). `chain-h3` in float32 is the near-breakdown case (β_3 about 1e-6·\|α\|) | 8/8 pass |
+
+The muPC chain under sPC confirms a design fact: with identity activations the
+muPC top-down scale equals the chain-rule factor of the pre-scaled input
+(`jacobian_gain` = 1) and the self-gradient scale is 1, so sPC with muPC is
+plain gradient descent on the input-scaled energy. The equilibrium test alone
+cannot pin that, because a diagonal preconditioner shares the fixed point; the
+muPC stability bracket does. The stability brackets pin the scale of each
+gradient implementation, not only its direction: a gradient off by a constant
+factor would pass every equilibrium test and fail the bracket.
 """
 
 import jax
@@ -158,7 +239,7 @@ def _identity_cycle(unroll):
     )
 
 
-BATCH = 3
+BATCH = 3  # Batch size
 
 
 def _clamps(structure, key, clamp_output=True, extra=()):
@@ -173,7 +254,7 @@ def _clamps(structure, key, clamp_output=True, extra=()):
     return clamps
 
 
-class Bunch:
+class ModelObject:
     """A fixture: how to build the structure, params, and clamps."""
 
     def __init__(self, build, clamp_output=True, extra_clamps=(), biases=False):
@@ -193,23 +274,25 @@ class Bunch:
         return structure, params, clamps
 
 
-BUNCH = {
-    "chain-h1": Bunch(lambda: _chain(1)),
-    "chain-h2": Bunch(lambda: _chain(2)),
-    "chain-h3": Bunch(lambda: _chain(3)),
-    "chain-h4": Bunch(lambda: _chain(4)),
-    "chain-h2-bias": Bunch(lambda: _chain(2), biases=True),
-    "chain-h2-precision": Bunch(lambda: _chain(2, precisions={"h1": 2.0, "y": 0.5})),
-    "chain-h3-std0.8": Bunch(lambda: _chain(3, std=0.8)),
-    "fork-merge": Bunch(_fork_merge),
-    "clamped-internal": Bunch(lambda: _chain(2), extra_clamps=("h2",)),
-    "prior-source": Bunch(_prior_source),
-    "unclamped-readout": Bunch(lambda: _chain(2), clamp_output=False),
-    "mupc-chain-h3": Bunch(
+MODEL = {
+    "chain-h1": ModelObject(lambda: _chain(1)),
+    "chain-h2": ModelObject(lambda: _chain(2)),
+    "chain-h3": ModelObject(lambda: _chain(3)),
+    "chain-h4": ModelObject(lambda: _chain(4)),
+    "chain-h2-bias": ModelObject(lambda: _chain(2), biases=True),
+    "chain-h2-precision": ModelObject(
+        lambda: _chain(2, precisions={"h1": 2.0, "y": 0.5})
+    ),
+    "chain-h3-std0.8": ModelObject(lambda: _chain(3, std=0.8)),
+    "fork-merge": ModelObject(_fork_merge),
+    "clamped-internal": ModelObject(lambda: _chain(2), extra_clamps=("h2",)),
+    "prior-source": ModelObject(_prior_source),
+    "unclamped-readout": ModelObject(lambda: _chain(2), clamp_output=False),
+    "mupc-chain-h3": ModelObject(
         lambda: _chain(3, scaling=MuPCConfig(), weight_init=MuPCInitializer())
     ),
 }
-CHAINS = [k for k in BUNCH if k.startswith("chain-h") and "precision" not in k]
+CHAINS = [k for k in MODEL if k.startswith("chain-h") and "precision" not in k]
 
 
 def _source_means(structure, state):
@@ -285,11 +368,9 @@ class TestOracleSelfChecks:
         )
         assert np.isnan(oracle.weighted_relaxed_fraction([-1.0], [1.0], 0.1, 3))
 
-    @pytest.mark.parametrize(
-        "bunch", CHAINS + ["chain-h2-bias", "chain-h2-precision", "mupc-chain-h3"]
-    )
+    @pytest.mark.parametrize("bunch", CHAINS + ["chain-h2-precision", "mupc-chain-h3"])
     def test_theorem1_matches_least_squares(self, rng_key, bunch):
-        structure, params, clamps = BUNCH[bunch].make(rng_key)
+        structure, params, clamps = MODEL[bunch].make(rng_key)
         eq = oracle.linear_equilibrium(params, structure, clamps)
         E_star, _, _ = oracle.theorem1_energy(params, structure, clamps)
         np.testing.assert_allclose(E_star, eq.total_energy, rtol=1e-10, atol=1e-12)
@@ -299,7 +380,7 @@ class TestOracleSelfChecks:
         """p_l·ε_l* = p_y·ε_y*·P_lᵀ on a chain (ε_l* = ε_y*·P_lᵀ at unit
         precision): the equilibrium hidden errors are the output error
         pulled back through the downstream maps."""
-        structure, params, clamps = BUNCH[bunch].make(rng_key)
+        structure, params, clamps = MODEL[bunch].make(rng_key)
         eq = oracle.linear_equilibrium(params, structure, clamps)
         w_eff = oracle.effective_edge_matrices(params, structure)
         order = structure.node_order
@@ -318,7 +399,7 @@ class TestOracleSelfChecks:
             )
 
     def test_unclamped_readout_has_zero_energy(self, rng_key):
-        structure, params, clamps = BUNCH["unclamped-readout"].make(rng_key)
+        structure, params, clamps = MODEL["unclamped-readout"].make(rng_key)
         eq = oracle.linear_equilibrium(params, structure, clamps)
         np.testing.assert_allclose(eq.total_energy, 0.0, atol=1e-12)
         for name in structure.nodes:
@@ -328,12 +409,40 @@ class TestOracleSelfChecks:
         "bunch", ["fork-merge", "prior-source", "clamped-internal"]
     )
     def test_normal_equations_hold(self, rng_key, bunch):
-        structure, params, clamps = BUNCH[bunch].make(rng_key)
+        structure, params, clamps = MODEL[bunch].make(rng_key)
         eq = oracle.linear_equilibrium(params, structure, clamps)
         quad = eq.quad
         z = oracle.flatten_free(quad, eq.z_star)
         residual = quad.A.T @ (quad.A @ z - quad.c)
         assert np.linalg.norm(residual) <= 1e-10 * max(1.0, np.linalg.norm(quad.c))
+
+    @pytest.mark.parametrize(
+        "bunch",
+        [
+            "fork-merge",
+            "prior-source",
+            "clamped-internal",
+            "chain-h2-bias",
+            "chain-h2-precision",
+        ],
+    )
+    def test_readouts_agree_with_quadratic(self, rng_key, bunch):
+        """Step 6 readouts against the step 2 residual: error_star[t] =
+        (A z* − c)[row_t] / √p_t on every row node, and total_energy =
+        ½‖A z* − c‖² per sample."""
+        structure, params, clamps = MODEL[bunch].make(rng_key)
+        eq = oracle.linear_equilibrium(params, structure, clamps)
+        quad = eq.quad
+        residual = quad.A @ oracle.flatten_free(quad, eq.z_star) - quad.c
+        for t in quad.rows:
+            np.testing.assert_allclose(
+                eq.error_star[t],
+                residual[quad.row_offsets[t]].T / np.sqrt(quad.precision[t]),
+                atol=1e-12,
+            )
+        np.testing.assert_allclose(
+            eq.total_energy, 0.5 * np.sum(residual**2, axis=0), atol=1e-12
+        )
 
     @pytest.mark.parametrize(
         "bunch", ["fork-merge", "prior-source", "clamped-internal"]
@@ -342,7 +451,7 @@ class TestOracleSelfChecks:
         """H_ε = diag(p over free in-degree > 0 nodes) + Σ_{clamped t} p_t J_tᵀJ_t,
         J_t = ∂μ_t/∂ε: an unclamped source contributes no diagonal block, so
         the floor comes only from the nodes that own an energy term."""
-        structure, params, clamps = BUNCH[bunch].make(rng_key)
+        structure, params, clamps = MODEL[bunch].make(rng_key)
         eq = oracle.linear_equilibrium(params, structure, clamps)
         quad = eq.quad
         D = quad.A.shape[1]
@@ -368,11 +477,11 @@ class TestOracleSelfChecks:
 
     def test_eigenvalue_floor(self, rng_key):
         for bunch in CHAINS + ["chain-h2-precision"]:
-            structure, params, clamps = BUNCH[bunch].make(rng_key)
+            structure, params, clamps = MODEL[bunch].make(rng_key)
             eq = oracle.linear_equilibrium(params, structure, clamps)
             lam_min = np.linalg.eigvalsh(oracle.epsilon_hessian(eq.quad))[0]
             assert lam_min >= min(eq.quad.precision.values()) - 1e-10, bunch
-        structure, params, clamps = BUNCH["prior-source"].make(rng_key)
+        structure, params, clamps = MODEL["prior-source"].make(rng_key)
         eq = oracle.linear_equilibrium(params, structure, clamps)
         assert np.linalg.eigvalsh(oracle.epsilon_hessian(eq.quad))[0] < 1.0
 
@@ -437,7 +546,7 @@ def _oracle_case(bunch, key):
     """Structure, params, clamps, the feedforward-initialized state, and the
     oracle equilibrium with every unclamped source's z_mu read from that
     state (the constant ePC holds it at)."""
-    structure, params, clamps = BUNCH[bunch].make(key)
+    structure, params, clamps = MODEL[bunch].make(key)
     state = initialize_graph_state(structure, BATCH, key, clamps, params=params)
     eq = oracle.linear_equilibrium(
         params, structure, clamps, source_means=_source_means(structure, state)
@@ -522,7 +631,7 @@ def _run(structure, inference, params, state, clamps):
 
 
 class TestEPCReachesOracle:
-    @pytest.mark.parametrize("bunch", list(BUNCH))
+    @pytest.mark.parametrize("bunch", list(MODEL))
     def test_equilibrium(self, rng_key, bunch):
         structure, params, clamps, state, eq = _oracle_case(bunch, rng_key)
         eta, steps = _epc_schedule(eq)
@@ -537,7 +646,7 @@ class TestEPCReachesOracle:
 
 
 class TestSPCReachesOracle:
-    @pytest.mark.parametrize("bunch", list(BUNCH))
+    @pytest.mark.parametrize("bunch", list(MODEL))
     def test_equilibrium(self, rng_key, bunch):
         """Includes the muPC chain: with identity activations the top-down
         scale a·jacobian_gain is the exact chain-rule factor (jacobian_gain

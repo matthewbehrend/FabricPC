@@ -2,35 +2,147 @@
 Exact predictive-coding equilibria on linear-Gaussian DAGs, and the spectral
 diagnostics that set how fast each solver reaches them.
 
-Part 1 — exact equilibrium (pure NumPy, float64). On a graph whose nodes are
-``Linear`` or ``IdentityNode`` with ``IdentityActivation`` and
-``GaussianEnergy``, the total energy over the ``in_degree > 0`` nodes,
+Reference. Francesco Innocenti, El Mehdi Achour, Ryan Singh, and Christopher
+L. Buckley. *Only Strict Saddles in the Energy Landscape of Predictive Coding
+Networks?* Advances in Neural Information Processing Systems 37 (NeurIPS
+2024), pp. 53649–53683. arXiv:2408.11979. Theorem 1: the equilibrated energy
+of a deep linear network is a rescaled mean-squared error with
+S = I + Σ_l P_lᵀP_l.
 
-    E = Σ_t ½·p_t·‖z_t − μ_t‖²,      μ_t = Σ_s z_s W_eff[s→t] + b_t,
+Part 1 — exact equilibrium (pure NumPy, float64)
+================================================
 
-is a quadratic in the stacked free latents z_free: E = ½‖A z_free − c‖²,
-one residual row block per in-degree > 0 node, one column block per
-unclamped node. The equilibrium is the least-squares solution
-z* = argmin ‖A z − c‖; the exact energy, per-node energies, and errors
-follow from it. Nothing here calls node or solver code: the assembly reads
-params, edges, muPC forward scales, biases, and precisions only, so it is an
-independent reference for ``EPCInference`` and the state-based solvers.
+Purpose. Inference relaxes the free latents toward the minimum of the graph
+energy. On a DAG whose nodes are ``Linear`` or ``IdentityNode`` with
+``IdentityActivation`` and ``GaussianEnergy`` the energy is a quadratic, so
+its minimum has a closed form. This module computes that minimum from the
+parameters and the graph description alone. It calls no node, solver, or
+JAX code, so it is an independent reference for ``EPCInference`` and the
+state-based solvers (``InferenceSGD`` and variants).
 
-Conventions. Nodes are enumerated in ``structure.node_order`` (topological
-on a DAG); samples are columns of c; the library's row convention
-``z_mu = z_s @ W`` becomes ``W_eff[s→t]ᵀ`` acting on a stacked column.
-W_eff[s→t] is the muPC ``forward_scale`` for the edge (1.0 when absent)
-times the Linear weight for that edge key, or times the IdentityNode
-``scale`` times the identity. An unclamped source (in_degree 0) has a
-column block but no row block: it carries no energy term, and under
-``EPCInference`` its ``z_mu`` stays at the constant initialization assigned
-(its initial latent; ``source_means``), which affects its error ε* but not
-z* or E*.
+What "a model matches the oracle" means. ``tests/test_linear_pc_oracle.py``
+(``TestEPCReachesOracle`` and ``TestSPCReachesOracle``, both through
+``_assert_matches_oracle``) builds a graph, initializes the state with
+``initialize_graph_state`` (feedforward latents, ε = 0, every source's
+``z_mu`` equal to its latent), passes those source ``z_mu`` values in as
+``source_means``, runs the solver at a rate and step count taken from the
+Part 2 Hessians, and asserts per sample at rtol = atol = 1e-4:
 
-Part 2 — spectral diagnostics. The Hessian in latent coordinates is
-H_z = AᵀA. Error coordinates are z_free = M(ε + const) with
-M = (I − B)⁻¹, where B is the strictly block-lower-triangular map through
-the edges, so H_ε = Mᵀ H_z M. The two Hessians govern the two solvers:
+    final.nodes[t].z_latent   ≈ z_star[t]         every node t
+    final.nodes[t].error      ≈ error_star[t]     every in_degree > 0 node
+    final.nodes[t].energy     ≈ node_energy[t]    every in_degree > 0 node
+    Σ_t final.nodes[t].energy ≈ total_energy      over in_degree > 0 nodes
+
+Under ``EPCInference`` the ``error`` of each unclamped source is checked
+too. ``InferenceSGD`` re-syncs a source's ``z_mu`` to its latent every
+step, so its source error is 0 by construction and is skipped.
+
+How the oracle is produced. ``linear_equilibrium`` calls
+``assemble_linear_quadratic`` to write the energy as E = ½‖A z_free − c‖²
+(steps 1–4), solves for z*_free with ``numpy.linalg.lstsq`` (step 5), and
+recomputes predictions, errors, and energies from z* with the same weights
+and biases (step 6). The steps are labelled at the matching lines of both
+functions.
+
+Symbols. Every stacked matrix holds samples as columns. A per-node array is
+(batch, d) as the library stores it; its transpose is a stacked column
+block.
+
+    t, s          node names; every edge s → t runs forward in ``node_order``
+    d_t           width of node t (rank-1 shapes only)
+    rows          the ``in_degree > 0`` nodes in ``node_order``: the nodes
+                  that own a Gaussian energy term. R = Σ_{t∈rows} d_t.
+    free          the unclamped nodes in ``node_order``: the variables.
+                  D = Σ_{t∈free} d_t.
+    z_t, ẑ_t      (d_t,) latent of node t, and its clamp value when clamped
+    W_eff[s→t]    (d_s, d_t) effective weight of edge s → t: the edge's muPC
+                  ``forward_scale`` (1 when absent) times the ``Linear``
+                  weight, or times the ``IdentityNode`` ``scale`` times I
+                  (``effective_edge_matrices``)
+    b_t           (d_t,) bias of node t, zeros when absent
+    p_t           ``GaussianEnergy`` precision of node t (default 1)
+    μ_t           prediction of t, μ_t = b_t + Σ_{s→t} W_eff[s→t]ᵀ z_s; the
+                  library's row form is ``z_mu = Σ_s z_s @ W_eff + b``
+    ε_t           prediction error z_t − μ_t
+    z_free        (D, batch) stacked latents of the free nodes
+    A, c          (R, D) and (R, batch): E = ½‖A z_free − c‖² per column
+    B, M          (D, D): the free-to-free part of μ, and M = (I − B)⁻¹
+    k             (D, batch) constant part of the free nodes' μ
+    z_ff          the latents at ε = 0, the feedforward point
+
+(1) Energy. Each row node t contributes
+
+        E_t = ½ p_t ‖z_t − μ_t‖² = ½ ‖√p_t (z_t − μ_t)‖²,    E = Σ_{t∈rows} E_t,
+
+    the ``GaussianEnergy`` of every ``in_degree > 0`` node. Sources own no
+    term. This is the sum ``EPCInference.error_energy`` and the training
+    loop take.
+
+(2) Residual blocks (``assemble_linear_quadratic``, one pass over rows).
+    z_t − μ_t is affine in z_free. Its free part fills row block
+    ``row_offsets[t]`` of A; its constant part fills the same rows of c:
+
+        A[row_t, col_t] = √p_t · I                       t free
+        A[row_t, col_s] = −√p_t · W_eff[s→t]ᵀ            each edge s→t, s free
+        c[row_t]        = √p_t · (b_t − ẑ_t·[t clamped]
+                                  + Σ_{s→t, s clamped} W_eff[s→t]ᵀ ẑ_s)
+
+    so that (A z_free − c)[row_t] = √p_t (z_t − μ_t) = √p_t ε_t, and
+    E = ½‖A z_free − c‖² column by column. A clamped row node has a row
+    block and no column block. A free source has a column block and no row
+    block: it enters A only through the −√p_t W_eff[s→t]ᵀ blocks in its
+    targets' rows.
+
+(3) Error coordinates (same pass). For a free node t, z_t = ε_t + μ_t.
+    Splitting μ_t into the part carried by free latents and the rest,
+
+        B[col_t, col_s] = W_eff[s→t]ᵀ           each edge s→t, s and t free
+        k[col_t]        = b_t + Σ_{s→t, s clamped} W_eff[s→t]ᵀ ẑ_s
+        z_free = ε + B z_free + k,   so   z_free = M (ε + k),   M = (I − B)⁻¹.
+
+    B is strictly block-lower-triangular because every edge runs forward
+    in ``node_order``, so I − B is unit lower triangular, M exists, and
+    det M = 1. A free source s has no in-edges: its B row block is zero,
+    its k block is ``source_means[s]`` (its constant ``z_mu``), and
+    ε_s = z_s − source_means[s].
+
+(4) Feedforward point. z_ff is the latent at ε = 0, z_ff,free = M k,
+    computed as a forward pass along ``node_order``: clamps, then
+    ``source_means``, then μ_t for each row node. This is the state
+    ``initialize_graph_state`` produces when ``source_means`` is read from
+    it, and the state both solvers start from.
+
+(5) Solve (``linear_equilibrium``). ∇_{z_free} E = Aᵀ(A z_free − c) = 0, so
+
+        z*_free = argmin ‖A z_free − c‖ = numpy.linalg.lstsq(A, c),
+
+    unique iff rank A = D. Rank drops when a free source's outgoing maps
+    are not jointly injective; ``linear_equilibrium`` raises then.
+    ``min_singular_value`` = σ_min(A) is the margin from that failure.
+    Clamped nodes keep z*_t = ẑ_t.
+
+(6) Readouts (``linear_equilibrium``). From z*, using W_eff and b again
+    rather than A:
+
+        z_mu_star[t]   = b_t + Σ_{s→t} W_eff[s→t]ᵀ z*_s       t ∈ rows
+        z_mu_star[s]   = ẑ_s if clamped, else source_means[s]   s a source
+        error_star[t]  = z*_t − z_mu_star[t]                    every node
+        node_energy[t] = ½ p_t ‖error_star[t]‖²                 t ∈ rows
+        total_energy   = Σ_{t∈rows} node_energy[t]
+
+    Two identities tie the readouts to the quadratic of step 2 and are
+    asserted by ``test_readouts_agree_with_quadratic``:
+    error_star[t] = (A z*_free − c)[row_t] / √p_t for every row node, and
+    total_energy = ½‖A z*_free − c‖² per column. ``source_means`` shifts
+    error_star of a free source and z_ff, never z* or E*, because a source
+    has no row in A or c.
+
+Part 2 — spectral diagnostics
+=============================
+
+The Hessian in latent coordinates is H_z = AᵀA. In error coordinates
+(step 3, z_free = M(ε + k)) it is H_ε = Mᵀ H_z M. The two Hessians govern
+the two solvers:
 
 - λ_min(H_z) decays with depth even for benign weights: the state-based
   solver's slow mode, which needs ~κ(H_z) steps to relax.
@@ -43,7 +155,7 @@ the edges, so H_ε = Mᵀ H_z M. The two Hessians govern the two solvers:
 
 Regime. After T gradient steps at rate η from ε = 0, each excited eigenmode
 λ of H_ε has relaxed toward equilibrium by f(λ) = 1 − (1 − ηλ)^T.
-Backprop-like behaviour (ε ≈ −η·T·∇E, the paper's Theorem C.9) requires
+Backprop-like behavior (ε ≈ −η·T·∇E, the paper's Theorem C.9) requires
 η·T·λ ≪ 1 on the modes that carry the gradient; the PC equilibrium requires
 f(λ) > 0.9 on those modes, which on a chain are the eig(S) modes, so the
 slowest of them sets the step count. Stability requires η·λ_max < 2 at
@@ -87,20 +199,33 @@ PerNode = Dict[str, Array]
 
 
 class LinearQuadratic(NamedTuple):
-    """E = ½‖A z_free − c‖² over the stacked free latents (samples as columns).
+    """E = ½‖A z_free − c‖² and the ε → z map, from ``assemble_linear_quadratic``
+    (module docstring, Part 1, steps 2–4). Samples are columns.
 
-    Attributes:
-        free: unclamped node names in ``node_order`` (the column blocks).
-        rows: ``in_degree > 0`` node names in ``node_order`` (the row blocks).
-        col_offsets: name -> slice of that node's columns in z_free.
-        row_offsets: name -> slice of that node's rows in the residual.
-        A: (R, D) residual Jacobian, precision-weighted.
-        c: (R, batch) residual offset (biases, clamps), precision-weighted.
-        B_lower: (D, D) strictly block-lower-triangular map z_free <- z_free.
-        M: (D, D) = (I − B_lower)⁻¹, the ε -> z map.
-        z_ff: name -> (batch, d) feedforward latents (the ε = 0 point).
-        precision: name -> precision of each row node.
-        source_means: name -> (batch, d) constant z_mu of each unclamped source.
+    Index sets and offsets:
+        free: unclamped node names in ``node_order``; z_free stacks their
+            latents.
+        rows: ``in_degree > 0`` node names in ``node_order``; each owns one
+            residual block of A and c.
+        col_offsets: name -> slice of that node's d_t columns in z_free
+            (D total).
+        row_offsets: name -> slice of that node's d_t rows in A z_free − c
+            (R total).
+
+    The quadratic (step 2):
+        A: (R, D). A[row_t, col_t] = √p_t I for free t;
+            A[row_t, col_s] = −√p_t W_eff[s→t]ᵀ for each edge s→t with s free.
+        c: (R, batch). c[row_t] = √p_t (b_t − ẑ_t·[t clamped]
+            + Σ_{s→t, s clamped} W_eff[s→t]ᵀ ẑ_s).
+        precision: name -> p_t of each row node.
+
+    Error coordinates (steps 3–4):
+        B_lower: (D, D). B[col_t, col_s] = W_eff[s→t]ᵀ for each edge s→t with
+            s and t free; strictly block-lower-triangular.
+        M: (D, D) = (I − B_lower)⁻¹, so z_free = M (ε + k).
+        z_ff: name -> (batch, d) latents at ε = 0, clamps included.
+        source_means: name -> (batch, d) constant z_mu of each unclamped
+            source; its block of k.
     """
 
     free: Tuple[str, ...]
@@ -117,16 +242,18 @@ class LinearQuadratic(NamedTuple):
 
 
 class LinearEquilibrium(NamedTuple):
-    """The exact minimizer of E and its readouts, all per sample.
+    """The minimizer of E and its readouts (Part 1, steps 5–6), per sample.
 
     Attributes:
-        z_star: name -> (batch, d) equilibrium latents (clamps included).
-        z_mu_star: name -> (batch, d) predictions at equilibrium (a source's
-            is its clamp or ``source_means`` entry).
-        error_star: name -> (batch, d) = z_star − z_mu_star.
-        node_energy: name -> (batch,) for every ``in_degree > 0`` node.
-        total_energy: (batch,) sum of ``node_energy``.
-        min_singular_value: smallest singular value of A (uniqueness margin).
+        z_star: name -> (batch, d). z*_free from least squares for free
+            nodes; ẑ_t for clamped nodes.
+        z_mu_star: name -> (batch, d). b_t + Σ_s z*_s @ W_eff[s→t] for row
+            nodes; a source's clamp or ``source_means`` entry.
+        error_star: name -> (batch, d) = z_star − z_mu_star, every node.
+        node_energy: name -> (batch,) = ½ p_t ‖error_star‖², every row node.
+        total_energy: (batch,) = Σ node_energy = ½‖A z*_free − c‖².
+        min_singular_value: σ_min(A), the margin from a non-unique
+            equilibrium.
         quad: the assembled quadratic.
     """
 
@@ -253,12 +380,14 @@ def assemble_linear_quadratic(
     *,
     source_means: Optional[PerNode] = None,
 ) -> LinearQuadratic:
-    """Build A, c, B_lower, M, and the feedforward point for the graph.
+    """Steps 1–4 of Part 1: A, c, B_lower, M, and z_ff for the graph.
 
-    ``clamps`` maps node names to (batch, d) arrays. ``source_means`` maps
-    each unclamped source to its constant z_mu (the initialized state's
-    ``z_mu``, which ``initialize_graph_state`` sets to the source's initial
-    latent); missing entries default to zeros.
+    One pass over ``rows`` writes row block t of A and c (step 2) and, when t
+    is free, row block t of B (step 3). A forward pass along ``node_order``
+    then fills z_ff (step 4). ``clamps`` maps node names to (batch, d) arrays.
+    ``source_means`` maps each unclamped source to its constant z_mu
+    (``initialize_graph_state`` sets it to the source's initial latent);
+    missing entries default to zeros.
     """
     validate_linear_gaussian(structure)
     clamped = set(clamps)
@@ -295,26 +424,28 @@ def assemble_linear_quadratic(
     c = np.zeros((R, batch))
     B = np.zeros((D, D))
     for t in rows:
+        # Step 2: row block t of A and c, (A z_free − c)[row_t] = √p_t (z_t − μ_t).
         sp = math.sqrt(precision[t])
         r = row_offsets[t]
+        # offset = constant part of μ_t − z_t. c[row_t] = √p_t · offset.
         offset = _bias(params, t, dims[t])[:, None] * np.ones((1, batch))
         if t in clamped:
-            offset = offset - _clamp_array(clamps, t).T
+            offset = offset - _clamp_array(clamps, t).T  # −ẑ_t
         else:
-            A[r, col_offsets[t]] = sp * np.eye(dims[t])
+            A[r, col_offsets[t]] = sp * np.eye(dims[t])  # √p_t z_t
         for edge in in_edges[t]:
             wt = w_eff[edge.key].T  # (d_t, d_s): acts on a stacked column
             if edge.source in clamped:
-                offset = offset + wt @ _clamp_array(clamps, edge.source).T
+                offset = offset + wt @ _clamp_array(clamps, edge.source).T  # W_effᵀ ẑ_s
             else:
-                A[r, col_offsets[edge.source]] += -sp * wt
+                A[r, col_offsets[edge.source]] += -sp * wt  # −√p_t W_effᵀ z_s
                 if t not in clamped:
-                    B[col_offsets[t], col_offsets[edge.source]] += wt
+                    B[col_offsets[t], col_offsets[edge.source]] += wt  # step 3
         c[r] = sp * offset
 
-    M = np.linalg.inv(np.eye(D) - B)
+    M = np.linalg.inv(np.eye(D) - B)  # Step 3: z_free = M (ε + k)
 
-    # Feedforward point: derive along node_order at ε = 0.
+    # Step 4: z_ff = M k by a forward pass along node_order at ε = 0.
     z_ff: PerNode = {}
     for name in structure.node_order:
         if name in clamped:
@@ -366,16 +497,19 @@ def linear_equilibrium(
     *,
     source_means: Optional[PerNode] = None,
 ) -> LinearEquilibrium:
-    """Exact minimizer of the linear-Gaussian energy by least squares.
+    """Steps 5–6 of Part 1: the exact minimizer of E and its readouts.
 
-    Raises ``ValueError`` when A is rank-deficient (non-unique equilibrium,
-    usually an unclamped source whose outgoing maps are not jointly
-    injective).
+    Assembles the quadratic, solves z*_free = lstsq(A, c), then recomputes
+    z_mu_star, error_star, node_energy, and total_energy from z* with W_eff
+    and the biases. Raises ``ValueError`` when A is rank-deficient (non-unique
+    equilibrium, usually an unclamped source whose outgoing maps are not
+    jointly injective).
     """
     quad = assemble_linear_quadratic(
         params, structure, clamps, source_means=source_means
     )
     D = quad.A.shape[1]
+    # Step 5: least squares; rank D is uniqueness.
     z_free, _, rank, singular = np.linalg.lstsq(quad.A, quad.c, rcond=None)
     if rank < D:
         raise ValueError(
@@ -386,6 +520,7 @@ def linear_equilibrium(
     z_star = dict(quad.z_ff)
     z_star.update(unflatten_free(quad, z_free))
 
+    # Step 6: readouts from z* with W_eff and b.
     w_eff = effective_edge_matrices(params, structure)
     dims = {name: _node_info(structure, name).shape[0] for name in structure.node_order}
     batch = quad.c.shape[1]
