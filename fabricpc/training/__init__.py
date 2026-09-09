@@ -11,6 +11,7 @@ backprop to learn meaningful weights in those recurrency paths.
 from fabricpc.training import metrics
 from fabricpc.training.generation import generate
 from fabricpc.training.metrics import EvalMetric
+from fabricpc.training.regime_probe import RegimeProbe, read_regime_csv
 from fabricpc.training.trainer import (
     EpochContext,
     IterContext,
@@ -41,5 +42,7 @@ __all__ = [
     "EpochContext",
     "IterContext",
     "EvalMetric",
+    "RegimeProbe",
+    "read_regime_csv",
     "metrics",
 ]

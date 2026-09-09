@@ -5,54 +5,66 @@ ePC-vs-sPC convergence figure (``examples/epc_spc_resnet18_compare.py``).
 
 Everything on linear graphs is exact, from ``fabricpc.utils.linear_pc_oracle``;
 the same diagnostics run on nonlinear graphs through
-``EPCInference.error_energy`` (Hessian-vector products, power iteration).
+``EPCInference.error_energy`` (Hessian-vector products, the Lanczos estimator
+``fabricpc.core.epsilon_spectrum``).
 
 Sections (``--section``; the default set runs on CPU in about a minute):
 
   backprop_regime      bullet 5. 1-step ePC weight gradients approach
                        eta * backprop (hidden) and backprop (output) at first
-                       order in eta; Adam removes the eta scaling; the 2-epoch
-                       resnet18 sweep is fitted by one effective error-Hessian
-                       eigenvalue lambda_eff through the relaxed fraction
-                       1 - (1 - eta*lambda)^T; the formula is validated
-                       against the solver on a linear chain.
+                       order in eta, both sides means per prediction through
+                       the trainer's normalization; Adam removes the eta
+                       scaling; the 2-epoch resnet18 sweep is fitted by one
+                       effective error-Hessian eigenvalue lambda_eff through
+                       the relaxed fraction 1 - (1 - eta*lambda)^T (a
+                       heuristic); the formula is validated against the
+                       solver on a linear chain.
   equilibrium_profile  bullets 2, 3. Per-layer equilibrium energies of linear
                        chains: the spread across layers and its slope follow
                        the downstream gain (eps_l* = eps_y* P_l^T); the sPC
                        transient is top-heavy early and approaches the oracle
-                       late; ePC moves every layer at once.
+                       late; ePC moves every layer at once. The equilibrium
+                       output error r S^-1 damps the learning signal along
+                       mode lambda_S by 1/lambda_S (Innocenti et al. 2024,
+                       Theorem 1), tabulated per depth and init.
   convergence_spectra  bullets 1, 7. lambda_max / lambda_min of H_z and of the
                        excited H_eps versus depth, and the steps each solver
                        needs to contract by 1e-3 at eta = 1/lambda_max, with
                        two depths measured.
   stability            bullets 4, 6. lambda_max(H_eps) and the bound
                        2/lambda_max versus weight scale and depth (the
-                       mechanism behind horizon-dependent collapse); power
-                       iteration agrees with the oracle; on a gelu MLP ePC
-                       descends at 0.9 eta_max and grows at 1.1 eta_max.
+                       mechanism behind horizon-dependent collapse); the
+                       Lanczos spectrum agrees with the oracle's excited
+                       extremes and gradient-weighted relaxed fraction; on a
+                       gelu MLP ePC descends at 0.9 eta_max and grows at
+                       1.1 eta_max.
 
 GPU, opt-in (CIFAR-10 via tfds, the demo's muPC resnet18):
 
-  --resnet18           lambda_max(H_eps) at init on one CIFAR batch by power
-                       iteration -> eta_max, compared with the sweep's fitted
-                       lambda_eff; the predicted regime label per recorded
-                       sweep cell beside its measured accuracy.
-  --track_lambda_max N train the demo graph for --num_epochs with the demo's
-                       optimizer and probe lambda_max on a fixed batch every N
-                       updates, logging eta*lambda_max beside train energy and
-                       test accuracy, for each (eta, T) in --track_cells. The
-                       hypothesis under test: a collapse is preceded by
-                       eta*lambda_max crossing 2 as the weights grow.
+  --resnet18           the excited spectrum at init on one CIFAR batch
+                       (lambda_max, lambda_min, the gradient weight on
+                       negative curvature, the Ritz residuals) -> eta_max and
+                       the regime of the defaults, compared with the sweep's
+                       fitted lambda_eff; the predicted gradient-weighted
+                       relaxed fraction and regime letter per recorded sweep
+                       cell beside its measured accuracy.
+
+Tracking the spectrum during training is the demo's job:
+``examples/resnet18_cifar10_demo.py --track_regime N`` runs
+``fabricpc.training.RegimeProbe`` and writes ``epc_regime_track__*.csv``;
+``--plot_track CSV...`` here renders those files (four panels: the extremes
+against 2/eta, the relaxed fraction and the negative weight, the weight norms,
+the test accuracy).
 
 Sweep numbers are the recorded 2-epoch tables in
 ``docs/dev_plans_archive/epc_inference_solver.md``; the 100-epoch outcomes are
-the six ``sweep_eta*_steps*.log`` files in the project root.
+the six ``sweep_eta*_steps*.log`` files in the project root. Both predate
+release 0.5.1's per-prediction gradient normalization.
 """
 
 from __future__ import annotations
 
 import argparse
-import csv
 import importlib.util
 import math
 import sys
@@ -65,7 +77,7 @@ import numpy as np
 import optax
 
 from fabricpc import setup_jax
-from fabricpc.core import EPCInference, InferenceSGD
+from fabricpc.core import EPCInference, EpsilonSpectrum, InferenceSGD, epsilon_spectrum
 from fabricpc.core.activations import (
     GeluActivation,
     IdentityActivation,
@@ -73,12 +85,12 @@ from fabricpc.core.activations import (
     TanhActivation,
 )
 from fabricpc.core.energy import CrossEntropyEnergy, graph_energy
+from fabricpc.core.epsilon_spectrum import weighted_relaxed_fraction
 from fabricpc.core.initializers import (
     MuPCInitializer,
     NormalInitializer,
     XavierInitializer,
 )
-from fabricpc.core.learning import compute_local_weight_gradients
 from fabricpc.core.mupc import MuPCConfig
 from fabricpc.core.topology import Edge
 from fabricpc.graph_assembly import TaskMap, graph
@@ -86,6 +98,8 @@ from fabricpc.graph_initialization import initialize_params
 from fabricpc.graph_initialization.state_initializer import initialize_graph_state
 from fabricpc.nodes import Linear
 from fabricpc.nodes.identity import IdentityNode
+from fabricpc.training import grad_denominator, pc_weight_gradients, read_regime_csv
+from fabricpc.training.regime_probe import WNORM_PREFIX
 from fabricpc.utils import linear_pc_oracle as oracle
 from fabricpc.utils.dashboarding.inference_tracking import run_inference_with_history
 
@@ -276,7 +290,9 @@ def fit_sweep_lambda():
     """One effective eigenvalue lambda_eff fitted by least squares to the
     normalized accuracy of the eta <= 0.01 cells (45 cells; every fit candidate
     keeps eta*lambda < 1 there, so the cell set does not change with lambda).
-    Returns (lambda_eff, rms_residual, per-cell rows)."""
+    A heuristic: it maps accuracy linearly onto the relaxed fraction and
+    reads one eigenvalue off it. Returns (lambda_eff, rms_residual, per-cell
+    rows)."""
     cells = [
         (eta, T, acc)
         for eta, accs in SWEEP_ACC.items()
@@ -301,31 +317,40 @@ def fit_sweep_lambda():
     return lam_eff, rms, rows
 
 
-def regime_letter(eta, steps, lam):
-    label = EPCInference(eta_infer=eta, infer_steps=steps).regime_label(lam)
-    if label.startswith("unstable"):
+def single_mode_spectrum(lam):
+    """The spectrum of one eigenvalue carrying the whole gradient, for
+    reading a regime off a fitted lambda_eff."""
+    return EpsilonSpectrum.from_modes([lam], [1.0])
+
+
+def regime_letter(eta, steps, spectrum):
+    """B backprop-like, P partially relaxed, E near PC equilibrium (bands on
+    the gradient-weighted relaxed fraction), U unstable (eta*lambda_max > 2);
+    an appended r marks an output-gradient reversal on the top mode."""
+    regime = EPCInference(eta_infer=eta, infer_steps=steps).regime(spectrum)
+    if regime.unstable:
         return "U"
-    if "backprop-like" in label:
-        return "B"
-    if "near PC equilibrium" in label:
-        return "E"
-    return "P"
+    letter = {"backprop-like": "B", "near PC equilibrium": "E"}.get(regime.band, "P")
+    return letter + ("r" if regime.output_gradient_reverses else "")
 
 
-def print_sweep_regime_table(lam, title):
+def print_sweep_regime_table(spectrum, title):
     print(title)
     print(
-        "  cell: measured accuracy % | predicted relaxed fraction | regime at "
-        "lambda (B backprop-like, P partially relaxed, E near equilibrium, "
-        "U unstable)"
+        "  cell: measured accuracy % | predicted gradient-weighted relaxed fraction "
+        "f_bar | fastest mode f_max | regime letter on f_bar (B backprop-like, P "
+        "partially relaxed, E near equilibrium, U unstable; r: the output-layer "
+        "gradient reverses on the top mode)"
     )
     headers = ["eta"] + [f"T={T}" for T in SWEEP_T]
     rows = []
     for eta, accs in SWEEP_ACC.items():
         row = [g(eta)]
         for T, acc in zip(SWEEP_T, accs):
+            regime = EPCInference(eta_infer=eta, infer_steps=T).regime(spectrum)
             row.append(
-                f"{acc:.1f}|{relaxed(eta, T, lam):.2f}{regime_letter(eta, T, lam)}"
+                f"{acc:.1f}|{regime.f_weighted:.2f}|{regime.f_max:.2f}"
+                f"{regime_letter(eta, T, spectrum)}"
             )
         rows.append(row)
     table(headers, rows)
@@ -357,10 +382,11 @@ def section_backprop_regime(args):
     )
     params = initialize_params(structure, key)
     clamps = random_clamps(structure, jax.random.fold_in(key, 1), batch)
+    denom = grad_denominator(structure, clamps)
 
     def loss(p):
         state = initialize_graph_state(structure, batch, key, clamps, params=p)
-        return graph_energy(state, structure, node_names=["y"])
+        return graph_energy(state, structure, node_names=["y"]) / denom
 
     g_bp = jax.grad(loss)(params)
     layers = hidden_names(structure) + ["y"]
@@ -369,14 +395,16 @@ def section_backprop_regime(args):
         s = with_solver(structure, EPCInference(eta_infer=eta, infer_steps=1))
         state = initialize_graph_state(s, batch, key, clamps, params=params)
         final = s.config["inference"].run_inference(params, state, clamps, s)
-        return compute_local_weight_gradients(params, final, s)
+        return pc_weight_gradients(params, final, s, clamps)
 
     print(
         "Relative deviation of the 1-step local weight gradient from eta*backprop\n"
-        "(hidden layers) and from backprop (output), per edge weight. h1's input is\n"
-        "the clamp, so its identity is exact (float32 noise only); downstream\n"
-        "layers see their input latent re-derived at the perturbed upstream state,\n"
-        "an O(eta) remainder."
+        "(hidden layers) and from backprop (output), per edge weight. Both sides\n"
+        "are means per prediction: pc_weight_gradients against jax.grad of the\n"
+        f"output energy divided by grad_denominator (N = {denom}), the trainer's\n"
+        "normalization. h1's input is the clamp, so its identity is exact (float32\n"
+        "noise only); downstream layers see their input latent re-derived at the\n"
+        "perturbed upstream state, an O(eta) remainder."
     )
     rows = []
     g_pc_by_eta = {}
@@ -413,18 +441,22 @@ def section_backprop_regime(args):
 
     lam_eff, rms, _ = fit_sweep_lambda()
     print(
-        f"\nSweep fit: one effective error-Hessian eigenvalue for the muPC resnet18,\n"
-        f"lambda_eff = {lam_eff:.1f} (rms residual {rms:.3f} in normalized accuracy,\n"
-        f"fitted on the 45 cells with eta <= 0.01). Regime per cell at lambda_eff:"
+        f"\nSweep fit (heuristic): one effective error-Hessian eigenvalue for the muPC\n"
+        f"resnet18, lambda_eff = {lam_eff:.1f} (rms residual {rms:.3f} in normalized\n"
+        f"accuracy, fitted on the 45 cells with eta <= 0.01; accuracy mapped linearly\n"
+        f"onto the relaxed fraction). Regime per cell with the whole gradient on\n"
+        f"lambda_eff:"
     )
-    print_sweep_regime_table(lam_eff, "")
+    print_sweep_regime_table(single_mode_spectrum(lam_eff), "")
     print(
-        "\n100-epoch outcomes (project-root logs), (eta, T) -> final accuracy %:\n  "
+        "\n100-epoch outcomes (project-root logs, batch-summed gradients before\n"
+        "release 0.5.1), (eta, T) -> final accuracy %:\n  "
         + "  ".join(f"({g(e)}, {T}) {acc}" for (e, T), acc in HUNDRED_EPOCH.items())
     )
     print(
-        f"  At lambda_eff the defaults (1e-3, 5) read "
-        f"'{EPCInference().regime_label(lam_eff)}' at init; they collapsed at epoch 20."
+        f"  At lambda_eff the defaults (1e-3, 5) read\n"
+        f"  '{EPCInference().regime(single_mode_spectrum(lam_eff))}'\n"
+        f"  at init; they collapsed at epoch 20."
     )
 
     print(
@@ -514,6 +546,34 @@ def section_equilibrium_profile(args):
          "spread", "slope/layer"],
         rows,
     )  # fmt: skip
+
+    print(
+        "\nEquilibrium output error (Innocenti et al. 2024, Theorem 1): eps_y* = r S^-1\n"
+        "with S = I + sum_l P_l^T P_l, so the learning signal along an eigenmode of S\n"
+        "with eigenvalue lambda_S is damped by 1/lambda_S, a matrix rescaling no\n"
+        "per-parameter optimizer undoes. ||r S^-1|| / ||r|| is the batch mean of the\n"
+        "per-sample ratio. This linear-chain mechanism, applied to the nonlinear\n"
+        "cross-entropy resnet18, is consistent with the 2-epoch sweep's PC-equilibrium\n"
+        "plateau (31%) trailing its backprop-like plateau (38.8%)."
+    )
+    rows = []
+    for depth in (3, 5, 10, 20):
+        for label, std, mupc in inits:
+            structure = build_chain(
+                depth, width, d_in, d_out, weight_std=std, mupc=mupc
+            )
+            params = initialize_params(structure, jax.random.fold_in(key, depth))
+            clamps = random_clamps(
+                structure, jax.random.fold_in(key, 100 + depth), batch
+            )
+            _, S, r = oracle.theorem1_energy(params, structure, clamps)
+            damped = r @ np.linalg.inv(S)
+            ratio = float(
+                np.mean(np.linalg.norm(damped, axis=1) / np.linalg.norm(r, axis=1))
+            )
+            eig_s = np.linalg.eigvalsh(S)
+            rows.append([depth, label, f"{ratio:.3f}", g(eig_s[0]), g(eig_s[-1])])
+    table(["depth", "init", "||r S^-1||/||r||", "lambda_min(S)", "lambda_max(S)"], rows)
 
     depth, std = 10, 1.0
     structure = build_chain(depth, width, d_in, d_out, weight_std=std)
@@ -681,8 +741,10 @@ def section_stability(args):
         "lambda_max(H_eps) = 1 + sigma_max(J)^2 grows with the product of the\n"
         "downstream gains, so a fixed eta crosses the bound 2/lambda_max as the\n"
         "weights grow during training: the mechanism behind a collapse that appears\n"
-        "only after many epochs, T = 1 included (one step lands each mode at\n"
-        "eta*lambda times its equilibrium value)."
+        "only after many epochs. At odd T the output layer is hit earlier: its\n"
+        "weight gradient follows the output residual after T steps, which along the\n"
+        "top mode is (1 - eta*(lambda_max - 1))*r at T = 1 and reverses sign once\n"
+        "eta*(lambda_max - 1) > 1."
     )
     rows = []
     for depth in (3, 5, 10):
@@ -706,16 +768,45 @@ def section_stability(args):
     params = initialize_params(structure, jax.random.fold_in(key, 5))
     clamps = random_clamps(structure, jax.random.fold_in(key, 105), batch)
     eq = oracle.linear_equilibrium(params, structure, clamps)
-    lam_oracle = float(np.linalg.eigvalsh(oracle.epsilon_hessian(eq.quad))[-1])
+    He = oracle.epsilon_hessian(eq.quad)
+    g0 = oracle.epsilon_gradient_at_zero(eq.quad)
+    eigs, weights = oracle.gradient_weights(He, g0)
+    excited = oracle.excited_eigenvalues(He, g0)
     state = initialize_graph_state(structure, batch, key, clamps, params=params)
     t0 = time.time()
-    lam_power = oracle.top_epsilon_eigenvalue(
-        params, state, clamps, structure, iters=200, key=key
+    spectrum = epsilon_spectrum(params, state, clamps, structure, iters=30, key=key)
+    elapsed = time.time() - t0
+    eta_probe, steps_probe = 0.5 / eigs[-1], 5
+    fbar_lanczos = weighted_relaxed_fraction(spectrum, eta_probe, steps_probe)
+    fbar_oracle = oracle.weighted_relaxed_fraction(
+        eigs, weights, eta_probe, steps_probe
+    )
+    guard_note = (
+        f"the breakdown guard froze the recurrence after k = {spectrum.k} steps"
+        if spectrum.k < spectrum.iters
+        else "float32 rounding kept beta above the breakdown guard, so the eps weight\n"
+        "floor selected the extremes over the modes carrying gradient weight"
     )
     print(
-        f"\nPower iteration through EPCInference.error_energy on the depth-5 chain:\n"
-        f"  lambda_max = {lam_power:.6g} vs oracle {lam_oracle:.6g} "
-        f"(relative error {abs(lam_power - lam_oracle) / lam_oracle:.2e}, {time.time() - t0:.1f}s incl. compile)"
+        f"\nLanczos through EPCInference.error_energy on the depth-5 chain (30 steps,\n"
+        f"{elapsed:.1f}s incl. compile; the Krylov space has dimension d_out = {d_out};\n"
+        f"{guard_note}):"
+    )
+    table(
+        ["quantity", "Lanczos", "oracle", "relative error"],
+        [
+            ["lambda_max", f"{spectrum.lambda_max:.6g}", f"{eigs[-1]:.6g}",
+             f"{abs(spectrum.lambda_max - eigs[-1]) / eigs[-1]:.2e}"],
+            ["lambda_min (excited)", f"{spectrum.lambda_min:.6g}", f"{excited.min():.6g}",
+             f"{abs(spectrum.lambda_min - excited.min()) / excited.min():.2e}"],
+            [f"f_bar at eta = 0.5/lambda_max, T = {steps_probe}", f"{fbar_lanczos:.6f}",
+             f"{fbar_oracle:.6f}", f"{abs(fbar_lanczos - fbar_oracle):.2e}"],
+        ],
+    )  # fmt: skip
+    print(
+        f"  full spectrum: {len(eigs)} modes, {len(excited)} excited; the unit-precision\n"
+        f"  floor (lambda = {eigs[0]:.4g}) is never excited from eps = 0 and Lanczos does\n"
+        f"  not report it."
     )
 
     batch = 16
@@ -726,11 +817,14 @@ def section_stability(args):
     params = initialize_params(mlp, jax.random.fold_in(key, 9))
     clamps = random_clamps(mlp, jax.random.fold_in(key, 10), batch)
     state = initialize_graph_state(mlp, batch, key, clamps, params=params)
-    lam = oracle.top_epsilon_eigenvalue(params, state, clamps, mlp, iters=60, key=key)
+    spectrum = epsilon_spectrum(params, state, clamps, mlp, iters=30, key=key)
+    lam = spectrum.lambda_max
     eta_max = 2.0 / lam
     print(
-        f"\ngelu MLP x32 -> 4 x h64 -> y10 (softmax + CE), batch {batch}: power iteration\n"
-        f"gives lambda_max = {lam:.4g} at init, eta_max = {eta_max:.4g}. ePC for 200 steps:"
+        f"\ngelu MLP x32 -> 4 x h64 -> y10 (softmax + CE), batch {batch}: Lanczos gives\n"
+        f"lambda_max = {lam:.4g}, lambda_min = {spectrum.lambda_min:.4g} (gradient weight\n"
+        f"on negative curvature {spectrum.negative_weight:.3f}) at init, eta_max =\n"
+        f"2/lambda_max = {eta_max:.4g}. ePC for 200 steps:"
     )
     rows = []
     for factor in (0.9, 1.1):
@@ -784,7 +878,7 @@ def cifar_probe_batch(structure, batch_size):
 
 
 def section_resnet18(args):
-    header("--resnet18: lambda_max(H_eps) at init on the muPC resnet18 (GPU)")
+    header("--resnet18: the excited spectrum at init on the muPC resnet18 (GPU)")
     demo = load_demo()
     # The demo's key split for trial seed --seed (its default trial seed is
     # 42), so the graph is the one the demo trains.
@@ -801,159 +895,56 @@ def section_resnet18(args):
         structure, args.probe_batch, state_key, clamps=clamps, params=params
     )
     t0 = time.time()
-    lam = oracle.top_epsilon_eigenvalue(
-        params, state, clamps, structure, iters=args.power_iters, key=state_key
+    spectrum = epsilon_spectrum(
+        params, state, clamps, structure, iters=args.lanczos_iters, key=state_key
     )
     elapsed = time.time() - t0
+    lam = spectrum.lambda_max
     lam_eff, rms, _ = fit_sweep_lambda()
+    defaults = EPCInference()
+    regime = defaults.regime(spectrum)
     print(
-        f"batch {args.probe_batch}, {args.power_iters} power iterations ({elapsed:.1f}s incl. compile)\n"
-        f"  lambda_max(H_eps) at init = {lam:.4g}   eta_max = 2/lambda_max = {2.0 / lam:.4g}\n"
-        f"  sweep-fitted lambda_eff  = {lam_eff:.4g}   (rms residual {rms:.3f})\n"
-        f"  ratio measured / fitted  = {lam / lam_eff:.3g}"
+        f"batch {args.probe_batch}, {args.lanczos_iters} Lanczos steps ({elapsed:.1f}s incl. compile;\n"
+        f"k = {spectrum.k} valid steps, ||g0|| = {spectrum.gradient_norm:.4g})\n"
+        f"  lambda_max(H_eps) at init = {lam:.4g}   (Ritz residual {spectrum.residual_max:.2e})   "
+        f"eta_max = 2/lambda_max = {2.0 / lam:.4g}\n"
+        f"  lambda_min (excited)      = {spectrum.lambda_min:.4g}   (Ritz residual {spectrum.residual_min:.2e})\n"
+        f"  gradient weight on negative curvature = {spectrum.negative_weight:.4f}\n"
+        f"  f_bar of the defaults     = {regime.f_weighted:.4f}   (fastest mode {regime.f_max:.4f})\n"
+        f"  sweep-fitted lambda_eff   = {lam_eff:.4g}   (rms residual {rms:.3f}; heuristic)\n"
+        f"  ratio measured / fitted   = {lam / lam_eff:.3g}"
     )
+    if spectrum.lambda_min < 0:
+        floor_note = (
+            f"negative: H_eps is indefinite at init (the second-derivative term of the\n"
+            f"  gelu + cross-entropy map); the negative modes carry "
+            f"{100 * spectrum.negative_weight:.1f}% of the gradient and grow by\n"
+            f"  {regime.growth_min:.4g}x over the defaults' {defaults.config['infer_steps']} steps"
+        )
+    elif spectrum.lambda_min <= 1.05:
+        floor_note = (
+            "at or below the unit-precision floor, as predicted for a nonlinear graph\n"
+            "  (the second-derivative term couples g0 to nearly every mode)"
+        )
+    else:
+        floor_note = (
+            "above the unit-precision floor: the excited band is compact on this graph"
+        )
+    print(f"  lambda_min at init is {floor_note}.")
     print(
         "  The fit reads one eigenvalue off accuracy; the measurement is the top of\n"
-        "  the spectrum at init. Agreement within a small factor means the excited\n"
-        "  spectrum is compact; a large ratio means the modes that move accuracy sit\n"
-        "  well below the top mode. Either outcome is reported as observed."
+        "  the spectrum at init. A ratio near 1 is consistent with the accuracy\n"
+        "  following the top modes. f_bar against f_max says where the gradient\n"
+        "  weight sits: f_bar well below f_max means most of it is on modes far\n"
+        "  below lambda_max. Either outcome is reported as observed."
     )
     print()
     print_sweep_regime_table(
-        lam, "Regime per recorded sweep cell at the measured lambda_max:"
+        spectrum,
+        "Regime per recorded sweep cell from the measured spectrum (f_bar and f_max\n"
+        "per cell from the init spectrum beside the measured 2-epoch accuracy):",
     )
-    print(f"\n  defaults at init: {EPCInference().regime_label(lam)}")
-
-
-def parse_cells(text):
-    cells = []
-    for item in text.split(","):
-        eta, steps = item.split(":")
-        cells.append((float(eta), int(steps)))
-    return cells
-
-
-def section_track_lambda_max(args):
-    header(
-        f"--track_lambda_max {args.track_lambda_max}: eta*lambda_max during training (GPU)"
-    )
-    from fabricpc.training import evaluate, make_train_step
-    from fabricpc.utils.data.dataloader import Cifar10Loader
-
-    demo = load_demo()
-    every = args.track_lambda_max
-    for eta, steps in parse_cells(args.track_cells):
-        schedule_len = args.schedule_epochs or args.num_epochs
-        print(f"\n--- cell eta={eta:g}, T={steps}  ({args.num_epochs} epochs of a {schedule_len}-epoch "
-              f"schedule, lr {args.lr}, weight decay {args.weight_decay}, batch {args.batch_size}, "
-              f"augment {args.augment}) ---")  # fmt: skip
-        # The demo's key split (run_trial): with --seed 42 and --augment this
-        # reproduces the 100-epoch run's init and batch order, probes aside.
-        graph_key, train_key, eval_key = jax.random.split(
-            jax.random.PRNGKey(args.seed), 3
-        )
-        probe_key = jax.random.fold_in(eval_key, 1)
-        inference = EPCInference(eta_infer=eta, infer_steps=steps)
-        params, structure = demo._create_mupc_model(
-            graph_key,
-            inference=inference,
-            activation=demo.get_activation(args.activation),
-        )
-        base_loader = Cifar10Loader(
-            "train", batch_size=args.batch_size, shuffle=True, seed=args.seed
-        )
-        loader = (
-            demo.AugmentedCifar10Loader(base_loader, seed=args.seed)
-            if args.augment
-            else base_loader
-        )
-        test_loader = Cifar10Loader("test", batch_size=args.batch_size, shuffle=False)
-        steps_per_epoch = len(loader)
-        schedule_epochs = args.schedule_epochs or args.num_epochs
-        optimizer = demo.make_optimizer(
-            args.lr, args.weight_decay, schedule_epochs, steps_per_epoch
-        )
-        opt_state = optimizer.init(params)
-        step_fn = make_train_step(structure, optimizer)
-
-        probe_clamps = cifar_probe_batch(structure, args.probe_batch)
-        top = oracle.make_top_epsilon_eigenvalue(structure, args.power_iters)
-
-        @jax.jit
-        def probe(p):
-            st = initialize_graph_state(
-                structure, args.probe_batch, probe_key, clamps=probe_clamps, params=p
-            )
-            return top(p, st, probe_clamps, probe_key)
-
-        csv_path = Path(f"epc_lambda_track__eta{eta:g}_T{steps}.csv")
-        rows = []
-        first_cross = None
-        first_chance = None
-        update_idx = 0
-        last_energy = float("nan")
-        for epoch in range(args.num_epochs):
-            epoch_key = jax.random.fold_in(train_key, epoch)
-            lam_epoch = []
-            for batch_idx, (images, labels) in enumerate(loader):
-                if update_idx % every == 0:
-                    lam = float(probe(params))
-                    lam_epoch.append(lam)
-                    rows.append((update_idx, epoch, lam, eta * lam, last_energy))
-                    if first_cross is None and eta * lam > 2.0:
-                        first_cross = (update_idx, epoch)
-                    print(f"  update {update_idx:6d} epoch {epoch + 1:3d}  lambda_max {lam:10.4g}  "
-                          f"eta*lambda_max {eta * lam:8.4g}  train energy {last_energy:.4g}")  # fmt: skip
-                batch = {"x": jnp.asarray(images), "y": jnp.asarray(labels)}
-                params, opt_state, metrics, _ = step_fn(
-                    params, opt_state, batch, jax.random.fold_in(epoch_key, batch_idx)
-                )
-                last_energy = float(metrics["energy"])
-                update_idx += 1
-            acc = evaluate(
-                params,
-                structure,
-                test_loader,
-                {"num_epochs": args.num_epochs},
-                eval_key,
-            )["accuracy"]
-            if first_chance is None and acc < 0.15:
-                first_chance = epoch
-            lam_txt = (
-                f"{min(lam_epoch):.4g}..{max(lam_epoch):.4g}" if lam_epoch else "-"
-            )
-            print(f"  == epoch {epoch + 1}: test accuracy {acc * 100:.2f}%  lambda_max over epoch {lam_txt}  "
-                  f"train energy {last_energy:.4g}")  # fmt: skip
-            rows.append(
-                (update_idx, epoch, float("nan"), float("nan"), last_energy, acc)
-            )
-        with csv_path.open("w", newline="") as fh:
-            w = csv.writer(fh)
-            w.writerow(
-                [
-                    "update",
-                    "epoch",
-                    "lambda_max",
-                    "eta_lambda_max",
-                    "train_energy",
-                    "test_accuracy",
-                ]
-            )
-            for r in rows:
-                w.writerow(list(r) + [""] * (6 - len(r)))
-        print(f"  wrote {csv_path}")
-        if args.plot:
-            plot_lambda_track(csv_path)
-        if first_chance is None:
-            print("  outcome: no collapse to chance within the run")
-        elif first_cross is None:
-            print(f"  outcome: accuracy reached chance in epoch {first_chance + 1} without "
-                  f"eta*lambda_max crossing 2 on the probe batch")  # fmt: skip
-        else:
-            u, e = first_cross
-            order = "before" if e <= first_chance else "after"
-            print(f"  outcome: eta*lambda_max first crossed 2 at update {u} (epoch {e + 1}), "
-                  f"{order} accuracy reached chance (epoch {first_chance + 1})")  # fmt: skip
+    print(f"\n  defaults at init: {regime}")
 
 
 # =============================================================================
@@ -1066,87 +1057,141 @@ def plot_spectra(spectra):
     write_chart(fig, "epc_analysis_spectra")
 
 
-def plot_lambda_track(csv_path):
-    """Two stacked panels from a --track_lambda_max CSV: lambda_max on the
-    probe batch (log scale) against the stability bound 2/eta, and test
-    accuracy per epoch. eta and T are read from the file name
-    (``epc_lambda_track__eta{eta}_T{T}.csv``)."""
-    import re
-
+def plot_track(csv_path):
+    """Four stacked panels from a ``RegimeProbe`` CSV (the demo's
+    ``--track_regime N``): the excited extremes lambda_max and |lambda_min| on
+    the probe batch (log scale) against the stability bound 2/eta, drawn only
+    when the file records an ePC eta_infer; the gradient-weighted relaxed
+    fraction f_bar with the gradient weight on negative curvature; the
+    Frobenius norm of every weight; the test accuracy per epoch. Vertical
+    lines mark the first output-gradient reversal and the first crossing of
+    eta*lambda_max = 2. eta, T, and the trainer come from the metadata
+    columns, not from the file name."""
     import plotly.graph_objects as go
     from plotly.subplots import make_subplots
 
     csv_path = Path(csv_path)
-    m = re.search(r"eta([0-9.e+-]+)_T(\d+)", csv_path.stem)
-    eta, steps = float(m.group(1)), int(m.group(2))
-    with csv_path.open() as fh:
-        rows = list(csv.DictReader(fh))
-    probes = [
-        (int(r["update"]), float(r["lambda_max"]))
-        for r in rows
-        if r["lambda_max"] not in ("", "nan")
-    ]
-    evals = [
-        (int(r["update"]), 100.0 * float(r["test_accuracy"]))
-        for r in rows
-        if r["test_accuracy"] not in ("",)
-    ]
+    metadata, rows = read_regime_csv(csv_path)
+    probes = [r for r in rows if r["lambda_max"] is not None]
+    evals = [r for r in rows if r["test_accuracy"] is not None]
+    eta, steps = metadata["eta_infer"], metadata["infer_steps"]
+    trainer = metadata["trainer"]
+    updates = [r["update"] for r in probes]
+    wnorm_columns = sorted(
+        c for c in (probes[0] if probes else {}) if c.startswith(WNORM_PREFIX)
+    )
+
     fig = make_subplots(
-        rows=2,
+        rows=4,
         cols=1,
         shared_xaxes=True,
-        vertical_spacing=0.1,
+        vertical_spacing=0.06,
+        row_heights=[0.3, 0.2, 0.3, 0.2],
         subplot_titles=(
-            "lambda_max of the error Hessian on the probe batch (log scale)",
+            "excited extremes of the error Hessian on the probe batch (log scale)",
+            "gradient-weighted relaxed fraction f_bar and weight on negative curvature",
+            "Frobenius norm per weight",
             "test accuracy after each epoch",
         ),
     )
+    marker = dict(size=5, line=dict(color="#fcfcfb", width=1.5))
     fig.add_trace(
         go.Scatter(
-            x=[u for u, _ in probes],
-            y=[lam for _, lam in probes],
-            mode="lines+markers",
-            name="lambda_max",
-            line=dict(color=PALETTE[0], width=2),
-            marker=dict(size=6, line=dict(color="#fcfcfb", width=2)),
-            hovertemplate="update %{x}: lambda_max %{y:.3g}<extra></extra>",
+            x=updates, y=[r["lambda_max"] for r in probes], mode="lines+markers",
+            name="lambda_max", line=dict(color=PALETTE[0], width=2), marker=marker,
+            hovertemplate="update %{x}: lambda_max %{y:.4g}<extra></extra>",
         ),
-        row=1,
-        col=1,
-    )
-    fig.add_hline(
-        y=2.0 / eta,
-        line=dict(color="#52514e", width=2),
-        annotation_text=f"2/eta = {2.0 / eta:g}: eta*lambda_max = 2",
-        annotation_position="top left",
-        row=1,
-        col=1,
-    )
+        row=1, col=1,
+    )  # fmt: skip
     fig.add_trace(
         go.Scatter(
-            x=[u for u, _ in evals],
-            y=[a for _, a in evals],
-            mode="lines+markers",
-            name="test accuracy",
+            x=updates, y=[abs(r["lambda_min"]) for r in probes], mode="lines+markers",
+            name="|lambda_min|",
+            line=dict(color=PALETTE[2], width=2, dash="dot"), marker=marker,
+            text=["negative" if r["lambda_min"] < 0 else "positive" for r in probes],
+            hovertemplate="update %{x}: |lambda_min| %{y:.4g} (%{text})<extra></extra>",
+        ),
+        row=1, col=1,
+    )  # fmt: skip
+    if eta is not None:
+        fig.add_hline(
+            y=2.0 / eta,
+            line=dict(color="#52514e", width=2),
+            annotation_text=f"2/eta = {2.0 / eta:g}: eta*lambda_max = 2",
+            annotation_position="top left",
+            row=1,
+            col=1,
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=updates, y=[r["f_weighted"] for r in probes], mode="lines+markers",
+                name="f_bar", line=dict(color=PALETTE[0], width=2), marker=marker,
+                hovertemplate="update %{x}: f_bar %{y:.3f}<extra></extra>",
+            ),
+            row=2, col=1,
+        )  # fmt: skip
+    fig.add_trace(
+        go.Scatter(
+            x=updates, y=[r["negative_weight"] for r in probes], mode="lines+markers",
+            name="negative-curvature weight",
+            line=dict(color=PALETTE[3], width=2, dash="dot"), marker=marker,
+            hovertemplate="update %{x}: negative weight %{y:.3f}<extra></extra>",
+        ),
+        row=2, col=1,
+    )  # fmt: skip
+    for i, column in enumerate(wnorm_columns):
+        label = column[len(WNORM_PREFIX) :]
+        fig.add_trace(
+            go.Scatter(
+                x=updates, y=[r[column] for r in probes], mode="lines", name=label,
+                line=dict(color=SEQUENTIAL_BLUE[i % len(SEQUENTIAL_BLUE)], width=1.2),
+                showlegend=False,
+                hovertemplate="update %{x}: " + label + " %{y:.4g}<extra></extra>",
+            ),
+            row=3, col=1,
+        )  # fmt: skip
+    fig.add_trace(
+        go.Scatter(
+            x=[r["update"] for r in evals], y=[100.0 * r["test_accuracy"] for r in evals],
+            mode="lines+markers", name="test accuracy",
             line=dict(color=PALETTE[1], width=2),
             marker=dict(size=8, line=dict(color="#fcfcfb", width=2)),
             hovertemplate="update %{x}: %{y:.2f}%<extra></extra>",
         ),
-        row=2,
-        col=1,
+        row=4, col=1,
+    )  # fmt: skip
+    events = []
+    if eta is not None:
+        reversal = next((r for r in probes if r["output_gradient_reverses"]), None)
+        crossing = next((r for r in probes if r["unstable"]), None)
+        if reversal is not None:
+            events.append((reversal["update"], "output gradient reverses", PALETTE[4]))
+        if crossing is not None:
+            events.append((crossing["update"], "eta*lambda_max = 2", "#52514e"))
+    for update, text, color in events:
+        fig.add_vline(
+            x=update,
+            line=dict(color=color, width=1.5, dash="dash"),
+            annotation_text=f"{text} (update {update})",
+            annotation_position="top right",
+        )
+    fig.update_yaxes(type="log", title_text="eigenvalue", row=1, col=1)
+    fig.update_yaxes(title_text="fraction", range=[0, 1.05], row=2, col=1)
+    fig.update_yaxes(type="log", title_text="||W||_F", row=3, col=1)
+    fig.update_yaxes(title_text="accuracy (%)", row=4, col=1)
+    fig.update_xaxes(title_text="weight updates", row=4, col=1)
+    solver = (
+        f"ePC eta_infer={eta:g}, infer_steps={steps}" if eta is not None else "backprop"
     )
-    fig.update_yaxes(type="log", title_text="lambda_max", row=1, col=1)
-    fig.update_yaxes(title_text="accuracy (%)", row=2, col=1)
-    fig.update_xaxes(title_text="weight updates", row=2, col=1)
     fig.update_layout(
-        title=f"ePC eta_infer={eta:g}, infer_steps={steps}: lambda_max during training",
+        title=f"{solver} (trainer {trainer}): spectrum, relaxation, and weight norms during training",
         template="plotly_white",
         paper_bgcolor="#fcfcfb",
         plot_bgcolor="#fcfcfb",
         font=dict(color="#0b0b0b"),
-        legend=dict(orientation="h", y=-0.15),
+        legend=dict(orientation="h", y=-0.08),
         margin=dict(l=60, r=30, t=70, b=70),
-        height=700,
+        height=1200,
     )
     fig.update_xaxes(gridcolor="#e6e5e1", zeroline=False)
     fig.update_yaxes(gridcolor="#e6e5e1", zeroline=False)
@@ -1180,30 +1225,7 @@ def parse_args():
     p.add_argument(
         "--resnet18",
         action="store_true",
-        help="GPU: lambda_max at init on the demo's muPC resnet18",
-    )
-    p.add_argument("--track_lambda_max", type=int, default=None, metavar="N",
-                   help="GPU: train the demo graph and probe lambda_max every N updates")  # fmt: skip
-    p.add_argument("--track_cells", default="1e-3:5,1e-2:1",
-                   help="(eta:T) cells for --track_lambda_max, comma-separated (default: 1e-3:5,1e-2:1)")  # fmt: skip
-    p.add_argument(
-        "--num_epochs",
-        type=int,
-        default=30,
-        help="epochs for --track_lambda_max (default: 30)",
-    )
-    p.add_argument(
-        "--schedule_epochs",
-        type=int,
-        default=None,
-        help="length of the warmup-cosine schedule in epochs (default: --num_epochs); "
-        "pass 100 to run the first --num_epochs of the 100-epoch demo schedule",
-    )
-    p.add_argument("--batch_size", type=int, default=256)
-    p.add_argument("--lr", type=float, default=0.001)
-    p.add_argument("--weight_decay", type=float, default=0.01)
-    p.add_argument(
-        "--augment", action="store_true", help="the demo's crop + flip augmentation"
+        help="GPU: the excited spectrum at init on the demo's muPC resnet18",
     )
     p.add_argument(
         "--activation", default="gelu", choices=["relu", "tanh", "gelu", "leaky_relu"]
@@ -1212,16 +1234,22 @@ def parse_args():
         "--probe_batch",
         type=int,
         default=64,
-        help="CIFAR batch for the lambda_max probe",
+        help="CIFAR batch for the --resnet18 spectrum (default: 64)",
     )
     p.add_argument(
         "--plot_track",
         nargs="+",
         default=None,
         metavar="CSV",
-        help="render charts from existing --track_lambda_max CSVs and exit",
+        help="render four-panel charts from RegimeProbe CSVs (the demo's "
+        "--track_regime output) and exit",
     )
-    p.add_argument("--power_iters", type=int, default=30)
+    p.add_argument(
+        "--lanczos_iters",
+        type=int,
+        default=30,
+        help="Lanczos steps for the --resnet18 spectrum (default: 30)",
+    )
     p.add_argument(
         "--seed",
         type=int,
@@ -1235,21 +1263,18 @@ def main():
     args = parse_args()
     if args.plot_track:
         for path in args.plot_track:
-            plot_lambda_track(path)
+            plot_track(path)
         return
-    gpu = args.resnet18 or args.track_lambda_max is not None
-    if gpu:
+    if args.resnet18:
         setup_jax()
     else:
         setup_jax(platform="cpu")
     t0 = time.time()
-    if not gpu:
-        for name in args.section:
-            SECTIONS[name](args)
     if args.resnet18:
         section_resnet18(args)
-    if args.track_lambda_max is not None:
-        section_track_lambda_max(args)
+    else:
+        for name in args.section:
+            SECTIONS[name](args)
     print(f"\ntotal {time.time() - t0:.1f}s")
 
 

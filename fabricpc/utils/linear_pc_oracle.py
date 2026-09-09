@@ -42,20 +42,32 @@ the edges, so H_ε = Mᵀ H_z M. The two Hessians govern the two solvers:
   only eig(S), S = I + Σ_l P_lᵀP_l (Innocenti et al. 2024, Theorem 1).
 
 Regime. After T gradient steps at rate η from ε = 0, each excited eigenmode
-λ of H_ε has relaxed toward equilibrium by 1 − (1 − ηλ)^T. Backprop-like
-behaviour (ε ≈ −η·T·∇E, the paper's Theorem C.9) requires η·T·λ_max ≪ 1;
-near-equilibrium requires η·T·λ_min,excited ≳ 3; stability requires
-η·λ_max < 2, T = 1 included: one step lands each mode at ε_1 = η·λ·ε*_λ,
-so a mode with η·λ > 2 ends farther from equilibrium than it started.
+λ of H_ε has relaxed toward equilibrium by f(λ) = 1 − (1 − ηλ)^T.
+Backprop-like behaviour (ε ≈ −η·T·∇E, the paper's Theorem C.9) requires
+η·T·λ ≪ 1 on the modes that carry the gradient; the PC equilibrium requires
+f(λ) > 0.9 on those modes, which on a chain are the eig(S) modes, so the
+slowest of them sets the step count. Stability requires η·λ_max < 2 at
+every T. At odd T the output-layer weight gradient reverses sign along the
+top mode once (1 − ηλ_max)^T < −1/(λ_max − 1) (T = 1: η(λ_max − 1) > 1),
+before the iteration bound: the output residual after T steps is
+r_T = (r/λ)·[1 + (λ − 1)(1 − ηλ)^T] per mode, while the hidden errors
+(1 − (1 − ηλ)^T)·ε* keep their sign for every ηλ < 2.
+
+Scope. The oracle is defined on DAGs: ``validate_linear_gaussian`` rejects
+cycles, whose unrolled ε-energy carries warm-started latents and is not a
+pure function of ε. The quadratic is per sample (samples are columns of c),
+so the solver's batch Hessian is block-diagonal over samples with this H as
+every block: a batch's λ_max is the per-sample maximum, and a larger batch's
+bound is at least as tight. The same diagnostics on any graph the solver
+accepts, nonlinear included, are ``fabricpc.core.epsilon_spectrum``
+(Lanczos on Hessian-vector products through ``EPCInference.error_energy``).
 """
 
 from __future__ import annotations
 
 import math
-from typing import Callable, Dict, Mapping, NamedTuple, Optional, Tuple
+from typing import Dict, Mapping, NamedTuple, Optional, Tuple
 
-import jax
-import jax.numpy as jnp
 import numpy as np
 
 from fabricpc.core.activations import IdentityActivation
@@ -493,8 +505,18 @@ def epsilon_gradient_at_zero(quad: LinearQuadratic) -> Array:
 
 
 def stability_bound(H: Array) -> float:
-    """Largest stable gradient-descent rate on ½ xᵀHx: 2 / λ_max(H)."""
-    return 2.0 / float(np.linalg.eigvalsh(H)[-1])
+    """Largest stable gradient-descent rate on ½ xᵀHx: 2 / λ_max(H).
+
+    Raises ``ValueError`` when λ_max ≤ 0: with no positive curvature there
+    is no descent direction to bound, and 2/λ_max would be a negative rate.
+    """
+    lam_max = float(np.linalg.eigvalsh(H)[-1])
+    if lam_max <= 0.0:
+        raise ValueError(
+            f"no positive curvature: lambda_max = {lam_max:.3g} <= 0, so the "
+            f"quadratic has no stable gradient-descent rate"
+        )
+    return 2.0 / lam_max
 
 
 def excited_eigenvalues(H: Array, g0: Array, rel_tol: float = 1e-8) -> Array:
@@ -510,6 +532,36 @@ def excited_eigenvalues(H: Array, g0: Array, rel_tol: float = 1e-8) -> Array:
     scale = np.linalg.norm(g0, axis=0, keepdims=True) + 1e-300
     excited = (overlap / scale > rel_tol).any(axis=1)
     return eigs[excited]
+
+
+def gradient_weights(H: Array, g0: Array) -> Tuple[Array, Array]:
+    """Every eigenvalue of H with the fraction of ‖g0‖² its eigenvector carries.
+
+    The batch Hessian is block-diagonal over samples with H as every block,
+    so the weight on eigenvalue λ sums the squared overlaps over the samples:
+    w_λ = Σ_n (v_λᵀ g0[:, n])² / ‖g0‖_F². Returns ``(eigs, weights)``, both
+    (D,) in ascending eigenvalue order with the weights summing to 1; an
+    unexcited mode has weight 0. These are the exact counterparts of the
+    Lanczos Ritz values and weights in ``fabricpc.core.epsilon_spectrum``.
+    """
+    eigs, vecs = np.linalg.eigh(H)
+    overlap = vecs.T @ g0  # (D, batch)
+    weights = np.sum(overlap**2, axis=1)
+    return eigs, weights / weights.sum()
+
+
+def weighted_relaxed_fraction(eigs, weights, eta: float, steps: int) -> float:
+    """Σ_{λ > 0} w_λ·f(λ) / Σ_{λ > 0} w_λ with f(λ) = 1 − (1 − eta·λ)^steps,
+    the exact form of the Lanczos f̄ for eigenvalues and weights from
+    :func:`gradient_weights`."""
+    eigs = np.asarray(eigs, dtype=np.float64)
+    weights = np.asarray(weights, dtype=np.float64)
+    positive = eigs > 0
+    total = float(weights[positive].sum())
+    if total <= 0.0:
+        return float("nan")
+    f = relaxed_fraction(eta, steps, eigs[positive])
+    return float((weights[positive] * f).sum() / total)
 
 
 def relaxed_fraction(eta: float, steps: int, eigs) -> Array:
@@ -533,82 +585,3 @@ def steps_to_contract(eta: float, eigs, ratio: float) -> int:
     if worst == 0.0 or ratio >= 1.0:
         return 1
     return int(math.ceil(math.log(ratio) / math.log(worst)))
-
-
-# =============================================================================
-# Part 2b — the same diagnostic on any graph, through the solver's ε-energy
-# =============================================================================
-
-
-def _tree_dot(a, b) -> jnp.ndarray:
-    return sum(
-        jnp.sum(x * y)
-        for x, y in zip(jax.tree_util.tree_leaves(a), jax.tree_util.tree_leaves(b))
-    )
-
-
-def make_top_epsilon_eigenvalue(
-    structure: GraphStructure, iters: int = 30
-) -> Callable[[GraphParams, object, Mapping[str, object], jax.Array], jnp.ndarray]:
-    """Compile ``(params, state, clamps, key) -> λ_max(H_ε)`` for one graph.
-
-    Power iteration on the Hessian-vector product of the total energy in
-    error coordinates, through ``EPCInference.error_energy`` (so it works on
-    any graph the solver accepts, nonlinear included, and needs no explicit
-    Hessian). The state is first passed through ``begin_segment`` so the
-    Hessian is evaluated at the state's latents. Returns the Rayleigh
-    quotient after ``iters`` iterations, which converges to the eigenvalue
-    of largest magnitude; the compiled callable is reused across calls, so
-    a training loop can probe λ_max repeatedly at one compile.
-    """
-    from fabricpc.core.inference_epc import EPCInference
-
-    def run(params, state, clamps, key):
-        synced = EPCInference.begin_segment(params, state, clamps, structure)
-        energy_of, errors = EPCInference.error_energy(params, synced, clamps, structure)
-        grad_fn = jax.grad(lambda e: energy_of(e)[0])
-
-        def hvp(v):
-            return jax.jvp(grad_fn, (errors,), (v,))[1]
-
-        leaves, treedef = jax.tree_util.tree_flatten(errors)
-        keys = jax.random.split(key, len(leaves))
-        v = treedef.unflatten(
-            [
-                jax.random.normal(k, leaf.shape, leaf.dtype)
-                for k, leaf in zip(keys, leaves)
-            ]
-        )
-
-        def normalize(t):
-            norm = jnp.sqrt(_tree_dot(t, t))
-            return jax.tree_util.tree_map(lambda x: x / norm, t)
-
-        def body(_, carry):
-            vec, _lam = carry
-            hv = hvp(vec)
-            return normalize(hv), _tree_dot(vec, hv)
-
-        _, lam = jax.lax.fori_loop(
-            0, iters, body, (normalize(v), jnp.zeros((), leaves[0].dtype))
-        )
-        return lam
-
-    return jax.jit(run)
-
-
-def top_epsilon_eigenvalue(
-    params: GraphParams,
-    state,
-    clamps: Mapping[str, object],
-    structure: GraphStructure,
-    iters: int = 30,
-    key: Optional[jax.Array] = None,
-) -> float:
-    """λ_max(H_ε) at the state's latents by power iteration (one compile per
-    call; use ``make_top_epsilon_eigenvalue`` for repeated probes). The
-    stability bound of ``EPCInference`` on this graph is 2 / the result."""
-    key = jax.random.PRNGKey(0) if key is None else key
-    return float(
-        make_top_epsilon_eigenvalue(structure, iters)(params, state, clamps, key)
-    )

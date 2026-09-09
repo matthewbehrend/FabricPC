@@ -2,6 +2,8 @@
 
 ## Context
 
+Oracle rev 2
+
 Reviewed the implementation of `docs/dev_plans/epc_reviewer_response_oracle_and_analysis.md` (commits 29bb1ac..30aeb83) against Innocenti et al. 2024 (arXiv 2408.11979, Theorem 1) and Goemaere et al. 2025 (arXiv 2505.20137, Appendix C.3, Table E.10). Verified by: re-deriving the oracle math, running `tests/test_linear_pc_oracle.py` and `tests/test_inference_epc.py` (89 passed, 22 s), and reading the two `epc_lambda_track__*.csv` files and `epc_lambda_track.log`.
 
 Two questions: (1) does the work verify FabricPC's ePC code, and (2) does it help a user pick `eta_infer` and `infer_steps` inside a stable regime.

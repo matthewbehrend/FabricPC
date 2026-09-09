@@ -88,13 +88,18 @@ limit (38.8%; no backprop arm was run, the 100-epoch demo holds the only
 measured backprop number) toward the PC equilibrium (31.0% at every eta for
 T >= 32), with sPC-120 at 34.6% between them because 120 state-based steps
 do not reach equilibrium. The regime parameter is eta*T*lambda_max, lambda_max
-the top eigenvalue of the energy's Hessian in error coordinates: each excited
-error mode relaxes by 1 - (1 - eta*lambda)^T. A one-eigenvalue fit of the
-cells gives lambda_eff = 12; power iteration at init gives lambda_max = 16.4
-(scripts/epc_analysis.py --resnet18), so the eta = 0.1 arms that collapsed at
-T <= 3 sit at eta*lambda_max = 1.6, overshooting every mode. The per-arm
-report prints each ePC arm's EPCInference.regime_label at the measured
-lambda_max.
+the largest excited eigenvalue of the energy's Hessian in error coordinates:
+each excited error mode relaxes by 1 - (1 - eta*lambda)^T, and the regime is
+read on the gradient-weighted relaxed fraction f_bar over the modes that carry
+the starting gradient. A one-eigenvalue fit of the cells gives lambda_eff = 12
+(a heuristic); the Lanczos spectrum at init gives lambda_max = 16.4
+(scripts/epc_analysis.py --resnet18), consistent with a compact excited band.
+The eta = 0.1 arms that collapsed at T <= 3 sit at eta*lambda_max = 1.6: at
+T = 1 the output residual after the step is (1 - eta*(lambda_max - 1))*r along
+the top mode, so the output layer's weight gradient had reversed sign there
+(eta*(lambda_max - 1) = 1.5 > 1). The per-arm report prints each ePC arm's
+regime band, f_bar, and reversal flag from EPCInference.regime on the spectrum
+measured once at init.
 """
 
 import argparse
@@ -250,24 +255,39 @@ def run_sweep(args):
         data_loader_factory=make_loader_factory(args.batch_size),
         n_trials=args.n_trials,
     )
-    # lambda_max of the energy's Hessian in error coordinates at init, one
-    # measurement on one test batch: the regime label per arm depends on the
-    # arm's (eta, T) and on this graph property only.
+    # The excited spectrum of the energy's Hessian in error coordinates at
+    # init, one measurement on one test batch: the regime per arm depends on
+    # the arm's (eta, T) and on this graph property only.
     probe_key = jax.random.PRNGKey(0)
     probe_params, probe_structure = make_model_factory(
         EPCInference(eta_infer=epc_eta, infer_steps=1), args.activation
     )(probe_key)
-    lam = _demo.lambda_max_at_init(probe_params, probe_structure, probe_key)
+    spectrum = _demo.spectrum_at_init(probe_params, probe_structure, probe_key)
     print(
-        f"lambda_max(H_eps) at init: {lam:.4g}  (eta_max = 2/lambda_max = {2.0 / lam:.4g})"
+        f"excited spectrum at init: lambda_max {spectrum.lambda_max:.4g} "
+        f"(eta_max = 2/lambda_max = {2.0 / spectrum.lambda_max:.4g}), "
+        f"lambda_min {spectrum.lambda_min:.4g}, gradient weight on negative "
+        f"curvature {spectrum.negative_weight:.3f}"
     )
 
     results = runner.run()
 
-    _report_sweep(results, epc_steps, spc_name, args, lam)
+    _report_sweep(results, epc_steps, spc_name, args, spectrum)
 
 
-def _report_sweep(results, epc_steps, spc_name, args, lam):
+def _regime_cell(eta, steps, spectrum):
+    """band, f_bar, and the flags of one ePC arm at the init spectrum."""
+    regime = EPCInference(eta_infer=eta, infer_steps=steps).regime(spectrum)
+    flags = []
+    if regime.output_gradient_reverses:
+        flags.append("output gradient reverses")
+    if regime.unstable:
+        flags.append("unstable")
+    tail = f"; {', '.join(flags)}" if flags else ""
+    return f"{regime.band} (f_bar {regime.f_weighted:.2f}{tail})"
+
+
+def _report_sweep(results, epc_steps, spc_name, args, spectrum):
     epc_eta = parse_epc_etas(args)[0]
     n_trials = results.n_trials
     spc_acc = results.per_arm_metrics(spc_name)
@@ -306,7 +326,8 @@ def _report_sweep(results, epc_steps, spc_name, args, lam):
     print("--- Per-arm results (mean +/- SE over trials) ---")
     print(
         f"{'arm':<12} {'accuracy%':<18} {'train time (s)':<18} "
-        f"regime at init (lambda_max {lam:.3g})"
+        f"regime at init (lambda_max {spectrum.lambda_max:.3g}, "
+        f"lambda_min {spectrum.lambda_min:.3g})"
     )
     for name in [spc_name] + [f"ePC-{t1}" for t1 in epc_steps]:
         acc = results.per_arm_metrics(name) * 100
@@ -316,7 +337,7 @@ def _report_sweep(results, epc_steps, spc_name, args, lam):
         regime = ""
         if name != spc_name:
             t1 = int(name.split("-")[1])
-            regime = EPCInference(eta_infer=epc_eta, infer_steps=t1).regime_label(lam)
+            regime = _regime_cell(epc_eta, t1, spectrum)
         print(f"{name:<12} {acc_field:<18} {t.mean():<18.1f} {regime}")
 
     print()

@@ -17,8 +17,11 @@ point from the true energy minimum ePC reaches), insertion-order
 independence, and the z_latent = z_mu + ε invariant of the finalized state.
 """
 
+import math
+
 import jax
 import jax.numpy as jnp
+import numpy as np
 import pytest
 
 from conftest import inject_biases, total_energy, with_inference
@@ -29,6 +32,7 @@ from fabricpc.core.activations import (
     TanhActivation,
 )
 from fabricpc.core.energy import CrossEntropyEnergy, graph_energy
+from fabricpc.core.epsilon_spectrum import EpsilonSpectrum, epsilon_spectrum
 from fabricpc.core.initializers import NormalInitializer
 from fabricpc.core.learning import compute_local_weight_gradients
 from fabricpc.core.mupc import MuPCConfig
@@ -41,7 +45,6 @@ from fabricpc.graph_initialization.state_initializer import initialize_graph_sta
 from fabricpc.nodes import Linear, StorkeyHopfield
 from fabricpc.nodes.identity import IdentityNode
 from fabricpc.training import grad_denominator, pc_weight_gradients
-from fabricpc.utils.linear_pc_oracle import top_epsilon_eigenvalue
 
 W_INIT = NormalInitializer(std=0.3)
 
@@ -1058,9 +1061,9 @@ class TestBackpropCorrespondence:
             rng_key, output, batch=batch, std=std
         )
         denom = grad_denominator(structure, clamps)
-        lam = top_epsilon_eigenvalue(
-            params, state, clamps, structure, iters=200, key=rng_key
-        )
+        lam = epsilon_spectrum(
+            params, state, clamps, structure, iters=30, key=rng_key
+        ).lambda_max
 
         def loss(p):
             st = initialize_graph_state(structure, batch, rng_key, clamps, params=p)
@@ -1101,15 +1104,96 @@ class TestBackpropCorrespondence:
             assert 3.0 <= r1 <= 30.0 and 3.0 <= r2 <= 30.0, (key, lam, r1, r2)
 
 
-class TestRegimeLabel:
-    def test_bands(self):
-        default = EPCInference()
-        assert "backprop-like" in default.regime_label(1.0)
-        assert "partially relaxed" in default.regime_label(75.0)
-        assert "near PC equilibrium" in EPCInference(
-            eta_infer=0.05, infer_steps=100
-        ).regime_label(10.0)
-        assert default.regime_label(3000.0).startswith("unstable")
-        assert "overshooting" in EPCInference(
-            eta_infer=0.15, infer_steps=1
-        ).regime_label(10.0)
+class TestRegime:
+    """``EPCInference.regime`` on constructed spectra: the band reads the
+    gradient-weighted relaxed fraction f̄, the flags read the extremes."""
+
+    def test_bands_on_a_compact_spectrum(self):
+        compact = EpsilonSpectrum.from_modes([10.0, 12.0, 16.4], [0.3, 0.3, 0.4])
+        r = EPCInference().regime(compact)  # eta 1e-3, T 5: eta*T*lambda ~ 0.06
+        assert r.band == "backprop-like" and not r.unstable
+        assert r.f_max == pytest.approx(1.0 - (1.0 - 1e-3 * 16.4) ** 5)
+        assert 0.0 < r.f_weighted < r.f_max
+        r = EPCInference(eta_infer=0.05, infer_steps=100).regime(compact)
+        assert r.band == "near PC equilibrium"
+        assert EPCInference(eta_infer=0.02, infer_steps=5).regime(compact).band == (
+            "partially relaxed"
+        )
+
+    def test_band_reads_where_the_gradient_sits_not_the_extremes(self):
+        """Same extremes (1 and 50), different bands: the weight at the top
+        relaxes with the fast mode, the weight at the floor does not."""
+        at_top = EpsilonSpectrum.from_modes([1.0, 50.0], [1e-4, 1.0])
+        at_floor = EpsilonSpectrum.from_modes([1.0, 50.0], [1.0, 1e-4])
+        solver = EPCInference(eta_infer=0.03, infer_steps=5)
+        top, floor = solver.regime(at_top), solver.regime(at_floor)
+        assert top.lambda_max == floor.lambda_max == 50.0
+        assert top.f_max == floor.f_max
+        assert top.band == "near PC equilibrium"
+        assert floor.band == "partially relaxed"
+        assert floor.f_weighted == pytest.approx(1.0 - 0.97**5, abs=1e-3)
+
+    def test_output_gradient_reversal(self):
+        """T = 1: reverses at eta*(lambda_max - 1) > 1; T = 5: at
+        (1 - eta*lambda)^5 < -1/(lambda - 1); never at even T below 2/lambda."""
+        spectrum = EpsilonSpectrum.from_modes([10.0], [1.0])
+        assert (
+            not EPCInference(eta_infer=0.1, infer_steps=1)
+            .regime(spectrum)
+            .output_gradient_reverses
+        )
+        one_step = EPCInference(eta_infer=0.12, infer_steps=1).regime(spectrum)
+        assert one_step.output_gradient_reverses and not one_step.unstable
+        assert (
+            not EPCInference(eta_infer=0.12, infer_steps=5)
+            .regime(spectrum)
+            .output_gradient_reverses
+        )
+        five = EPCInference(eta_infer=0.18, infer_steps=5).regime(spectrum)
+        assert (1 - 1.8) ** 5 < -1 / 9 and five.output_gradient_reverses
+        for eta in np.linspace(0.01, 0.199, 40):
+            assert (
+                not EPCInference(eta_infer=float(eta), infer_steps=2)
+                .regime(spectrum)
+                .output_gradient_reverses
+            )
+        assert (
+            not EPCInference(eta_infer=0.5, infer_steps=1)
+            .regime(EpsilonSpectrum.from_modes([1.0], [1.0]))
+            .output_gradient_reverses
+        )
+
+    def test_unstable_outranks_everything(self):
+        r = EPCInference().regime(
+            EpsilonSpectrum.from_modes([-5.0, 3000.0], [0.5, 0.5])
+        )
+        assert r.unstable and r.eta_lambda_max == pytest.approx(3.0)
+        assert str(r).startswith("unstable")
+
+    def test_indefinite_precedence_by_growth(self):
+        """negative_weight 0.2 with growth 1.08 prints the band; growth 1.5
+        prints indefinite."""
+        mild = EpsilonSpectrum.from_modes([-15.0, 1.1, 1.3], [0.2, 0.4, 0.4])
+        r = EPCInference(eta_infer=1e-3, infer_steps=5).regime(mild)
+        assert r.negative_weight == pytest.approx(0.2)
+        assert r.growth_min == pytest.approx(1.015**5)
+        assert r.band == "backprop-like" and "backprop-like" in str(r)
+        assert "indefinite" not in str(r)
+        strong = EPCInference(eta_infer=0.03, infer_steps=3).regime(mild)
+        assert strong.growth_min == pytest.approx(1.45**3)
+        assert str(strong).startswith("indefinite") and "20%" in str(strong)
+
+    def test_str_carries_the_numbers(self):
+        r = EPCInference(eta_infer=0.12, infer_steps=1).regime(
+            EpsilonSpectrum.from_modes([10.0], [1.0])
+        )
+        text = str(r)
+        assert "eta*T*lambda_max = 1.2" in text
+        assert "partially relaxed" in text or "near PC equilibrium" in text
+        assert "reverses" in text
+        assert r.f_weighted == pytest.approx(r.f_max)
+
+    def test_no_positive_curvature(self):
+        r = EPCInference().regime(EpsilonSpectrum.from_modes([-2.0, -1.0], [0.5, 0.5]))
+        assert r.band == "no positive curvature" and math.isnan(r.f_weighted)
+        assert r.negative_weight == 1.0

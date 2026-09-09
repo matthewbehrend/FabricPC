@@ -66,11 +66,25 @@ on the same graph (76.73% vs 77.11%). sPC's error signal decays with depth,
 so its deep layers learn slowly within 120 steps.
 
 Stability: ePC is gradient descent on the energy in error coordinates and is
-stable only for eta_infer < 2/lambda_max, lambda_max the top eigenvalue of
-that energy's Hessian: 16.4 at init on this graph (eta_max = 0.12; a
-one-eigenvalue fit of the 2-epoch sweep gives lambda_eff = 12). lambda_max
-grows with the weights, so a fixed eta_infer can cross the bound late in
-training. The 100-epoch sweep (sweep_eta*_steps*.log):
+stable only for eta_infer < 2/lambda_max, lambda_max the largest eigenvalue
+of that energy's Hessian that the starting gradient excites: 16.4 at init
+on this graph on a 64-sample test batch (eta_max = 0.12; a one-eigenvalue
+fit of the 2-epoch sweep gives lambda_eff = 12, a heuristic). The same
+measurement (scripts/epc_analysis.py --resnet18, 30 Lanczos steps) gives
+lambda_min = -0.42, an indefinite Hessian at init with 1.2% of the gradient
+on negative curvature, and f_bar = 0.010 against f_max = 0.080 for the
+defaults: most of the gradient weight sits near the precision floor, and
+the sweep's accuracy follows the top modes' relaxation (lambda_eff near
+lambda_max), not the gradient-weighted bulk. At odd infer_steps the output
+layer is damaged earlier than the bound: its
+weight gradient follows the output residual after T steps, which along the
+top mode is (1 - eta_infer*(lambda_max - 1))*r at T = 1 and reverses sign
+once eta_infer*(lambda_max - 1) > 1, while the hidden errors keep their
+sign for every eta_infer*lambda < 2. lambda_max = 1 + sigma_max(J)^2 (J the
+map from the hidden errors to the output prediction) grows with the
+weights, so a fixed eta_infer can cross either threshold late in training.
+The 100-epoch sweep (sweep_eta*_steps*.log, batch-summed weight gradients,
+before release 0.5.1's per-prediction normalization):
 
     eta_infer  infer_steps  eta*T   final accuracy
     0.001      1            0.001   76.73%
@@ -82,31 +96,44 @@ training. The 100-epoch sweep (sweep_eta*_steps*.log):
 
 Only eta*T <= 0.002 survived 100 epochs; at 2 epochs even eta*T = 0.16 still
 trains (examples/epc_spc_resnet18_compare.py sweep tables in
-docs/dev_plans_archive/epc_inference_solver.md). The settings block prints
-EPCInference.regime_label at init; scripts/epc_analysis.py --track_lambda_max N
-logs eta_infer*lambda_max during training beside accuracy.
+docs/dev_plans_archive/epc_inference_solver.md). Goemaere et al. trained
+ResNet-18 at the same (1e-3, 5) for 50 epochs without instability, with
+batch normalization after every convolution, ReLU, weight decay <= 1e-3,
+and a standard parameterization; this demo has no normalization layers,
+gelu, weight decay 1e-2, muPC scaling, and a 100-epoch schedule.
 
-lambda_max tracked during training (scripts/epc_analysis.py
---track_lambda_max 50 --num_epochs 30 --schedule_epochs 100 --augment, seed
-42: the first 30 epochs of the 100-epoch runs above, probes on a fixed
-64-sample test batch every 50 updates; epc_lambda_track__eta*_T*.csv/.html):
+The settings block prints str(EPCInference.regime(spectrum)) at init with
+lambda_min, the gradient-weighted relaxed fraction f_bar, the gradient
+weight on negative curvature, and the Ritz residual (spectrum_at_init).
+--track_regime N runs fabricpc.training.RegimeProbe inside train(): every
+N weight updates it records the excited spectrum on the same fixed 64-sample
+test batch, the regime flags (output-gradient reversal, eta*lambda_max > 2),
+and the Frobenius norm of every weight, plus the test accuracy per epoch,
+and writes epc_regime_track__{trainer}_eta{eta}_T{T}.csv (backprop:
+epc_regime_track__backprop.csv); the run ends with probe.summary().
+scripts/epc_analysis.py --plot_track CSV renders the file. Supplying the
+probe forces a device sync on every batch, probed or not.
 
-    eta_infer 0.001, infer_steps 5: 54.76% at epoch 10 (the 100-epoch log's
-    number), 56.36% at epoch 12. lambda_max 16 at init, 51 at epoch 10, 130
-    at epoch 12, 470 at epoch 13, 3500 at epoch 14 (eta*lambda_max first
-    above 2 at update 2700), 12500 early in epoch 15, then a dead network
-    (lambda_max = 1, chance). Accuracy began falling at epoch 13 (53.4%),
-    when eta*lambda_max of 0.2-0.5 had taken the run out of the backprop
-    regime, and collapsed once the bound was crossed.
-    eta_infer 0.01, infer_steps 1: lambda_max 15 -> 40 by epoch 5, 220 in
-    epoch 6 (eta*lambda_max first above 2 at update 1150), chance at epoch
-    7. One step cannot iterate, but with eta*lambda_max > 2 that step lands
-    each error mode farther from equilibrium than it started.
+Control runs (docs/dev_plans/epc_review_fixes_lanczos_regime_probe.md,
+Design 4), each the first 30 epochs of the 100-epoch schedule at seed 42:
 
-Both collapses were preceded by eta*lambda_max crossing 2. lambda_max grew
-about threefold per epoch once training was under way, so a bound measured
-at init is a starting point, not a guarantee; a rate set from lambda_max
-during training is the follow-up.
+    python examples/resnet18_cifar10_demo.py --num_epochs 30 --schedule_epochs 100 \
+        --augment --activation gelu --track_regime 50 --eval_every 1 [cell]
+
+    cell                        outcome (fill from probe.summary(chance=0.1))
+    --eta_infer 1e-3 --infer_steps 5   (the defaults; the collapse series)   pending
+    --eta_infer 1e-3 --infer_steps 1   (the 100-epoch survivor)              pending
+    --trainer backprop                                                       pending
+    --eta_infer 1e-2 --infer_steps 1   (reversal expected before crossing)   pending
+
+Reading rule, fixed in advance: if lambda_max and the weight norms grow at a
+comparable rate in the backprop and (1e-3, 1) runs as in the collapsing
+cells, the growth is a weight-scale effect of this parameterization (no
+normalization, weight decay 1e-2) and the remedy is a rate that follows
+lambda_max or weight-norm control; if they grow only in the collapsing
+cells, ePC's relaxation feeds the growth. The growth phases quoted here
+must come from the (1e-3, 5) re-run's summary, not from the tracking CSVs
+that predate the normalized trainer.
 
 Smoke Test (2 epochs)
 python examples/resnet18_cifar10_demo.py --inference epc
@@ -208,10 +235,10 @@ from fabricpc.core.initializers import (
     XavierInitializer,
 )
 from fabricpc.core.mupc import MuPCConfig
-from fabricpc.training import EpochContext, evaluate, train
+from fabricpc.training import RegimeProbe, EpochContext, evaluate, train
 from fabricpc.graph_initialization.state_initializer import initialize_graph_state
 from fabricpc.utils.data.dataloader import Cifar10Loader
-from fabricpc.utils.linear_pc_oracle import top_epsilon_eigenvalue
+from fabricpc.core.epsilon_spectrum import EpsilonSpectrum, epsilon_spectrum
 from fabricpc import setup_jax
 
 setup_jax()
@@ -256,24 +283,51 @@ def make_inference(args):
         )
 
 
-def lambda_max_at_init(params, structure, rng_key, batch_size=64, iters=30):
-    """Top eigenvalue of the energy's Hessian in error coordinates at init,
-    by power iteration through ``EPCInference.error_energy`` on one CIFAR-10
-    test batch. ePC's stability bound is 2/lambda_max and
-    ``EPCInference.regime_label(lambda_max)`` names the regime."""
+PROBE_BATCH = 64
+
+
+def probe_batch_clamps(structure, batch_size=PROBE_BATCH):
+    """Clamps for the first ``batch_size`` CIFAR-10 test samples: the fixed
+    batch the init spectrum and the regime probe are measured on."""
     # Slice the split to exactly one batch and read it fully (a half-read tfds
     # iterator warns on teardown).
     loader = Cifar10Loader(f"test[:{batch_size}]", batch_size=batch_size, shuffle=False)
     [(images, labels)] = list(loader)  # labels arrive one-hot
-    clamps = {
+    return {
         structure.task_map["x"]: jnp.asarray(images),
         structure.task_map["y"]: jnp.asarray(labels),
     }
+
+
+def spectrum_at_init(
+    params, structure, rng_key, batch_size=PROBE_BATCH, iters=30
+) -> EpsilonSpectrum:
+    """The excited spectrum of the energy's Hessian in error coordinates at
+    init (Lanczos through ``EPCInference.error_energy``) on one CIFAR-10 test
+    batch: lambda_max sets ePC's stability bound 2/lambda_max, lambda_min
+    reports indefiniteness, and the Ritz weights give the gradient-weighted
+    relaxed fraction; ``EPCInference.regime(spectrum)`` reads the verdict."""
+    clamps = probe_batch_clamps(structure, batch_size)
     state = initialize_graph_state(
         structure, batch_size, rng_key, clamps=clamps, params=params
     )
-    return top_epsilon_eigenvalue(
-        params, state, clamps, structure, iters=iters, key=rng_key
+    return epsilon_spectrum(params, state, clamps, structure, iters=iters, key=rng_key)
+
+
+def describe_spectrum(inference, spectrum):
+    """The settings-block lines: the regime verdict and the spectrum numbers."""
+    regime = inference.regime(spectrum)
+    eta_max = (
+        f"eta_max = 2/lambda_max = {2.0 / spectrum.lambda_max:.3g}"
+        if spectrum.lambda_max > 0
+        else "no positive curvature"
+    )
+    return (
+        f"ePC regime at init: {regime}\n"
+        f"  spectrum on a {PROBE_BATCH}-sample test batch: lambda_max "
+        f"{spectrum.lambda_max:.3g} ({eta_max}), lambda_min {spectrum.lambda_min:.3g}, "
+        f"f_bar {regime.f_weighted:.3f}, gradient weight on negative curvature "
+        f"{spectrum.negative_weight:.3f}, Ritz residual {spectrum.residual_max:.2e}"
     )
 
 
@@ -584,11 +638,8 @@ def run_trial(args, trial_seed):
     total_params = sum(p.size for p in jax.tree_util.tree_leaves(params))
     print(f"Total parameters: {total_params:,}")
     if trainer_mode == "pc" and isinstance(inference, EPCInference):
-        lam = lambda_max_at_init(params, structure, graph_key)
         print(
-            f"ePC regime at init: {inference.regime_label(lam)}  "
-            f"(lambda_max {lam:.3g} on a 64-sample test batch, "
-            f"eta_max = 2/lambda_max = {2.0 / lam:.3g})"
+            describe_spectrum(inference, spectrum_at_init(params, structure, graph_key))
         )
 
     # Data
@@ -601,18 +652,45 @@ def run_trial(args, trial_seed):
         train_loader = base_train_loader
     test_loader = Cifar10Loader("test", batch_size=args.batch_size, shuffle=False)
 
-    # Cosine LR schedule with warmup
+    # Cosine LR schedule with warmup; --schedule_epochs 100 with --num_epochs 30
+    # runs the first 30 epochs of the 100-epoch schedule.
     steps_per_epoch = len(train_loader)
+    schedule_epochs = args.schedule_epochs or args.num_epochs
     optimizer = make_optimizer(
-        args.lr, args.weight_decay, args.num_epochs, steps_per_epoch
+        args.lr, args.weight_decay, schedule_epochs, steps_per_epoch
     )
     train_config = {"num_epochs": args.num_epochs}
+
+    # Regime probe: the excited spectrum, the regime flags, and the weight
+    # norms every --track_regime updates on the fixed probe batch, the test
+    # accuracy per epoch, written to a CSV after every epoch.
+    probe = None
+    if args.track_regime > 0:
+        if trainer_mode == "backprop":
+            csv_name = "epc_regime_track__backprop.csv"
+        else:
+            csv_name = (
+                f"epc_regime_track__pc_eta{inference.config['eta_infer']:g}"
+                f"_T{inference.config['infer_steps']}.csv"
+            )
+        probe = RegimeProbe(
+            structure,
+            probe_batch_clamps(structure),
+            every=args.track_regime,
+            key=jax.random.fold_in(eval_key, 1),
+            csv_path=csv_name,
+        )
+        print(
+            f"Regime probe every {args.track_regime} updates on {PROBE_BATCH} test "
+            f"samples -> {csv_name}"
+        )
 
     # Periodic evaluation callback
     eval_every = args.eval_every
 
     def epoch_callback(ctx: EpochContext):
         epoch_num = ctx.epoch_idx + 1
+        metrics = None
         if eval_every > 0 and (
             epoch_num % eval_every == 0 or epoch_num == args.num_epochs
         ):
@@ -625,8 +703,9 @@ def run_trial(args, trial_seed):
                 algorithm=trainer_mode,
             )
             print(f"  Epoch {epoch_num}: accuracy={metrics['accuracy'] * 100:.2f}%")
-            return metrics
-        return None
+        if probe is not None:
+            probe.on_epoch(ctx, None if metrics is None else metrics["accuracy"])
+        return metrics
 
     print(
         f"\nTraining for {args.num_epochs} epochs "
@@ -644,6 +723,7 @@ def run_trial(args, trial_seed):
         algorithm=trainer_mode,
         verbose=False,
         epoch_callback=epoch_callback,
+        iter_callback=None if probe is None else probe.on_iter,
     )
     trained_params = result.params
 
@@ -651,6 +731,9 @@ def run_trial(args, trial_seed):
     print(
         f"\nTraining time: {elapsed:.1f}s ({elapsed / args.num_epochs:.1f}s per epoch)"
     )
+    if probe is not None:
+        print(f"\nRegime track ({probe.csv_path}):")
+        print(probe.summary(chance=0.1))
 
     # Final evaluation
     print("Final evaluation...")
@@ -737,6 +820,23 @@ def parse_args():
         type=int,
         default=0,
         help="Evaluate on test set every N epochs (0 to disable; default: 0)",
+    )
+    parser.add_argument(
+        "--track_regime",
+        type=int,
+        default=0,
+        metavar="N",
+        help="Record the excited error-Hessian spectrum, the ePC regime flags, and "
+        "the weight norms every N weight updates on a fixed 64-sample test batch "
+        "(fabricpc.training.RegimeProbe) and write epc_regime_track__*.csv; forces "
+        "a device sync every batch (0 to disable; default: 0)",
+    )
+    parser.add_argument(
+        "--schedule_epochs",
+        type=int,
+        default=None,
+        help="Length of the warmup-cosine schedule in epochs (default: --num_epochs); "
+        "100 with --num_epochs 30 runs the first 30 epochs of the 100-epoch schedule",
     )
     parser.add_argument("--verbose", action="store_true", help="Print per-epoch output")
     return parser.parse_args()

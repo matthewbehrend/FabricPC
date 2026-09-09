@@ -8,6 +8,8 @@ This plan adds five things: a split of the node forward contract into `predict` 
 
 It also fixes five latent defects the design exposed: (1) `InferenceBase` template methods re-resolve their own class via `type(structure.config["inference"])` (`core/inference.py:100-101`, `:212-213`, `:258-259`), which breaks any composition (Component 2); (2) on cyclic graphs `_topological_sort` returns a partial order behind a print warning (`graph_construction.py:102-103`) — on `x→a⇄b→y` the order is just `("x",)`, so feedforward init leaves cycle members *and everything downstream* at random init, and muPC attaches no scaling to them (Component 1); (3) every state initializer leaves `in_degree == 0` nodes with z_mu = 0 while error = 0, violating error = z_latent − z_mu at init — sPC masks this on the first forward (`nodes/base.py:495-507`), ePC would read the invalid z_mu directly (Formulation, Component 1); (4) sPC forces unclamped readouts to error = 0, energy = 0, zeroing a Hopfield readout's attractor energy (Component 3); (5) the node contract fuses prediction, the additive error map, and energy scoring in one `forward()` — `error = z_latent − z_mu` is copy-pasted into every node body while `GaussianEnergy` recomputes the difference itself and never reads `state.error`, custom energy terms are post-hoc `state._replace` patches (StorkeyHopfield; `ScaledSumNode`, `tests/test_external_custom_node.py:150-153`), and source semantics live in the solver branch (`nodes/base.py:495-507`) so `IdentityNode.forward` crashes if ever called with `in_degree == 0` (Component 3).
 
+A second review round (2026-09-03 to 2026-09-08) followed the resnet18 results. It added an exact linear oracle for both solvers and regime and stability diagnostics for ePC, and it is recorded in full under "Review round 2" below.
+
 ## Design overview
 
 ePC solves the DAG; state-based PC (sPC, today's settling path) refines around cycles; a cycle can instead be unrolled into ePC's own graph. Symbols: `T` = settling ticks per update in sPC alone, `T1` = ePC steps, `T2` = sPC refinement steps, `U` = unrolled cycle traversals, `(H)` = a Hopfield (recurrent) node.
@@ -356,9 +358,200 @@ Remaining before the PR merges:
 
 - The PR description must state that cyclic graphs previously got partial-order feedforward init (cycle members skipped), so training curves on cyclic graphs shift even where tests hold (Verification item 2).
 
+## Review round 2 (2026-09-03 to 2026-09-08): ePC oracle, regime test, and stability analysis
 
-Resnet18/CIFAR-10 Results:
-======================================================================
+The second review round covered two things the first round had not: an independent check that `EPCInference` and the state-based solvers reach the correct equilibrium, and a way for a user to choose `eta_infer` and `infer_steps` inside a stable regime on any graph. It ran in three iterations, recorded here in order so the design decisions can be read without the intermediate documents:
+
+1. The reviewer's requests after the resnet18 convergence figure, and the response that built an exact linear oracle, a regime label, a power-iteration eigenvalue estimator, and an analysis script.
+2. A critical review of that implementation. Verdict: the correctness verification is sound; the tuning diagnostics are defective.
+3. The replacement design: a Lanczos spectrum estimator, a structured `Regime` verdict, a `RegimeProbe` training callback usable on any graph, and four GPU control runs with a reading rule fixed in advance.
+
+Iterations 1 and 2 are implemented on this branch. Iteration 3 is designed and sequenced; its first two commits are independent of the trainer, and the rest waits on a separate PR that gives `train(iter_callback=...)` a context object carrying the parameters (Status, below). The measurements behind every number here are in the technical report `docs/reports/epc_regime_and_stability_report.md`.
+
+### Symbols
+
+| Symbol | Meaning |
+|---|---|
+| z_t, μ_t, ε_t | node t's latent (`NodeState.z_latent`), its prediction from in-edge sources (`NodeState.z_mu`), and the prediction error z_t − μ_t (`NodeState.error`), the variable `EPCInference` relaxes |
+| p_t, E | node t's Gaussian precision (1.0 unless set), and the total energy Σ over in_degree > 0 nodes of ½·p_t·‖z_t − μ_t‖²; a cross-entropy output replaces its quadratic term |
+| H_z, H_ε | Hessians of E in latent coordinates and in error coordinates, at the feedforward point ε = 0 |
+| g0 | ∇_ε E at ε = 0, which equals the backprop activation gradient at every node |
+| excited mode | an eigenvector of H_ε along which g0 has a nonzero component; the only modes gradient descent from ε = 0 moves |
+| λ_max, λ_min | the largest and smallest eigenvalues among the excited modes |
+| J, S, r, d_y | on a linear chain: J maps the stacked hidden ε to the output prediction μ_y; S = I + JJᵀ (Innocenti et al. 2024, Theorem 1); r = y − μ_y is the feedforward output residual; d_y is the output width |
+| σ_max(J) | the largest singular value of J, so λ_max = 1 + σ_max(J)² at unit precision |
+| η, T | `eta_infer`, `infer_steps` |
+| f(λ), f_max | relaxed fraction 1 − (1 − ηλ)^T of a mode with eigenvalue λ after T steps; f_max = f(λ_max) |
+| θ_k, w_k | the k-th Ritz value (an eigenvalue of the Lanczos tridiagonal matrix T_k) and the fraction of ‖g0‖² that Ritz mode carries; Σ_k w_k = 1 |
+| f̄ | gradient-weighted relaxed fraction Σ_{θ_k > 0} w_k·f(θ_k) / Σ_{θ_k > 0} w_k over the positive Ritz modes |
+| α_j, β_j | the Lanczos recurrence coefficients, the diagonal and off-diagonal of T_k |
+
+### Background: what sets ePC's regime
+
+Every FabricPC run starts inference at the feedforward state, ε = 0. Near that point E is a quadratic in ε, and gradient descent on a quadratic splits into independent modes along the eigenvectors of H_ε. One step multiplies a mode's distance to its minimum by (1 − ηλ): for 0 < ηλ < 1 the mode moves part of the way on the same side; for 1 < ηλ < 2 it overshoots to the other side but ends closer; for ηλ > 2 it ends farther away than it started. After T steps a mode has closed the fraction f(λ) = 1 − (1 − ηλ)^T of its distance. Only the excited modes move at all.
+
+Two regimes and one bound follow. When η·T·λ ≪ 1 on every excited mode, the T-step result is ε ≈ −η·T·g0, and the local weight gradients computed from those errors are backprop's, hidden layers scaled by η·T and the output layer unscaled (Goemaere et al., Theorem C.9). That is the backprop-like regime. When every excited mode has relaxed, ε is the PC equilibrium and the output error is r S⁻¹. That is the PC-equilibrium regime. At every T, η·λ_max < 2 is required for the iteration not to diverge.
+
+On a linear chain at unit precision H_ε = I + JᵀJ and g0 = Jᵀr, so the excited modes are the d_y directions of the row space of J and their eigenvalues are eig(S). λ_max = 1 + σ_max(J)² grows with the product of the downstream weights, and that product grows during training, so a fixed η eventually crosses the bound.
+
+### Iteration 1: the reviewer's requests and the first response
+
+**Requests.** The reviewer replied to the observation bullets that accompanied the resnet18 convergence figure (`examples/epc_spc_resnet18_compare.py --mode convergence`) with three groups of requests.
+
+- Test-suite invariants: a linear oracle that returns the exact equilibrium state and energy for a range of linear networks, both `EPCInference` and the state-based solvers checked against it, and the oracle itself checked against hand-computed numbers or Innocenti et al. 2024, Theorem 1. A warning that 1-step ePC is backprop with gradients scaled by `eta_infer`.
+- Analytical questions: why sPC struggles with deep layers; what sets the equilibrium energy spacing across layers; ePC stability in deep networks and how to pick the largest stable `eta_infer`; whether the training collapses also occur under muPC (they do; the resnet18 demo is a muPC model); how many steps sPC needs to reach equilibrium and why oracle checks should stay at five layers or fewer.
+- Warning adequacy: whether the existing caution against `infer_steps=1` said the right thing and appeared where users would see it.
+
+**Facts established from the existing data** (the 2-epoch sweep in the Appendix and the six 100-epoch logs `sweep_eta{0.001,0.01}_steps{1,2,5}.log` in the project root):
+
+- The ePC paper (Appendix C.3, Theorem C.9) gives two backprop-equivalence conditions: T = 1 yields backprop gradients scaled by η, and η·T ≪ 1 yields backprop gradients scaled by η·T. The second condition carries an implicit O(1) Jacobian scale; the graph-dependent form is η·T·λ_max ≪ 1.
+- In the sweep, accuracy departs from the small-η·T limit (38.8%) at η·T ≈ 0.01 to 0.02 for every η tested and reaches the PC plateau (about 31%) by η·T ≈ 0.15. The library defaults `EPCInference(eta_infer=1e-3, infer_steps=5)` sit at the backprop value at 2 epochs (38.70% against 38.84% at T = 1), and the 100-epoch demo at T = 1 (76.73%) matches the backprop trainer on the same graph (77.11%).
+- Over 100 epochs, (1e-3, 1) reached 76.73% and (1e-3, 2) 75.76%; the defaults (1e-3, 5) reached 54.76% at epoch 10 and 9.68% at epoch 20; every (1e-2, T) cell was at chance by epoch 10. Collapse is a training-horizon effect: the weights grow, λ_max grows with them, and a fixed η eventually exceeds 2/λ_max.
+- The existing caution ("Use infer_steps > 1") keyed on the wrong criterion, since T = 5 at η = 1e-3 is equally backprop, and the tuning table recommended `infer_steps` 1 to 5 two paragraphs below it.
+
+**Three claims corrected by the design review of the oracle math.** Before: an unclamped source node contributes a curvature floor in ε coordinates. After: it contributes none; in the quadratic form it has columns but no residual row, because a source has no energy term. Before: ePC is better conditioned than sPC. After: the statement holds per regime; λ_min(H_z) decays with depth even for benign weights (sPC's slow mode), while λ_max(H_ε) grows with the downstream weight products (ePC's shrinking stability bound). Before: 1-step weight gradients equal η × backprop. After: the ε identity ε_1 = −η·g0 is exact, but the weight-gradient identity holds only to first order in η·λ_max, because `finalize_state` re-derives the latents before the local weight gradient is taken; the paper's Case 1 proof evaluates ∂ŝ/∂θ at the unperturbed point.
+
+**User decisions (2026-09-03 and 2026-09-04).** Keep the defaults and document the regime at every touch point. No `warnings.warn`; the demos print the regime instead. The oracle lives in a package module shared by tests and the analysis script. The regime label is graph-aware and takes λ_max. Test the collapse hypothesis by tracking λ_max during resnet18 training behind a GPU flag, not on a CPU MNIST MLP, and let that tracking decide an adaptive-rate follow-up. Build the weight-gradient parity test in this work rather than deferring it to the mean-gradient-normalization plan; that normalization shipped in release 0.5.1 (2026-09-07) as `pc_weight_gradients` and `grad_denominator`, and the parity test runs through it.
+
+**Built.**
+
+- `fabricpc/utils/linear_pc_oracle.py`. Part one is the exact-equilibrium core in NumPy float64: it assembles E = ½‖A z_free − c‖² over the stacked free latents from params, edges, muPC forward scales, the IdentityNode scale, biases, and precision, and never calls node or solver code. `linear_equilibrium` solves by least squares; `theorem1_energy` gives the chain closed form E* = ½·r S⁻¹ rᵀ; `epsilon_hessian` gives H_ε = MᵀAᵀAM with M = (I − B)⁻¹ the ε → z map and B the strictly lower-triangular edge map; `stability_bound`, `excited_eigenvalues`, `relaxed_fraction`, and `steps_to_contract` are the diagnostics; `validate_linear_gaussian` rejects nonlinear, non-Gaussian, and cyclic graphs. Part two is `top_epsilon_eigenvalue`: power iteration on Hessian-vector products through the solver's own ε-energy, usable on any graph the solver accepts.
+- `fabricpc/core/inference_epc.py`. `error_energy` is the ε-energy closure extracted from `forward_value_and_grad` (same ops, bit-identical gradients) so that Hessian-vector products can be taken through it. `regime_label(lambda_max) -> str` bands on f_max: below 0.1 "backprop-like", 0.1 to 0.9 "partially relaxed", above 0.9 "near PC equilibrium", and "unstable" when η·λ_max > 2.
+- Tests. `tests/test_linear_pc_oracle.py`: oracle self-checks, including a hand-built scalar chain (x = 1, W1 = 2, W2 = 3, y = 1 gives z_h* = 0.5, E* = 1.25, S = [[10]]), Theorem 1 against the least-squares energy, the precision-weighted error pull-back, and the explicit H_ε form; both solvers reach the oracle on twelve graph shapes (chains to depth 4, biases, precisions, fork-merge, clamped internal node, unclamped prior source, unclamped readout, muPC chain); stability brackets at 0.95× and 1.05× of 2/λ_max for both solvers on the depth-3 chain, which pin the gradient's scale and not only its direction; the Hessian-vector product against H_ε. `TestBackpropCorrespondence` in `tests/test_inference_epc.py`: g0 equals a hand-written backprop recursion; after one step `error == −η·g0` exactly; the local weight gradients through `pc_weight_gradients` match a backprop reference divided by the same `grad_denominator`, the first hidden layer exactly (its input is the clamp) and the downstream layers with a remainder linear in η.
+- `scripts/epc_analysis.py`. CPU sections under two minutes: `backprop_regime` (the O(η) approach of 1-step gradients to η × backprop; the one-eigenvalue fit of the sweep), `equilibrium_profile` (per-layer equilibrium energies from the oracle against sPC's transient), `convergence_spectra` (H_z and H_ε spectra and steps to contract against depth), `stability` (λ_max against weight scale and depth; a gelu bracket at 0.9× and 1.1× of 2/λ_max). GPU opt-ins: `--resnet18` (λ_max at init on the demo graph) and `--track_lambda_max N` (λ_max every N updates during demo training).
+- Documentation: a "Backprop regime" paragraph and tuning-table rows in `docs/user_guides/12_api_inference.md`, the troubleshooting FAQ, the demo and compare-script docstrings with the 100-epoch table, and the CHANGELOG.
+
+**Measured** (2026-09-04, one RTX 3090, batch-summed weight gradients; epochs 1-indexed):
+
+| Quantity | Value |
+|---|---|
+| λ_max at init, muPC resnet18, 64-sample test batch | 16.4, so 2/λ_max = 0.12 |
+| One eigenvalue fitted to the 45 sweep cells with η ≤ 0.01 | λ_eff = 12.0, rms residual 0.05 in normalized accuracy |
+| Defaults at init | η·T·λ_max = 0.08; fastest mode 8% relaxed |
+| (1e-3, 5) tracked every 50 updates | λ_max 15 to 27 through epoch 8; 51 at epoch 10; 84, 131, 471, 3508, 12539 at epochs 11 to 15; η·λ_max > 2 first at update 2700; chance from epoch 15 |
+| (1e-2, 1) tracked | λ_max 101 at update 1100 and 220 at update 1150 (epoch 6); chance in epoch 7 |
+| Steps to contract by 1e-3, linear chain, depth 20 | sPC 30 343, ePC 75 |
+| Power iteration against the oracle's λ_max, depth-5 chain | relative error 6e-8 |
+| First hidden layer's 1-step weight gradient | exactly η × backprop at every η; the O(η²) remainder appears only downstream |
+
+### Iteration 2: critical review of the implementation
+
+The reviewer re-derived the oracle math, ran the two test files, and read the two tracking CSVs. Two questions: does the work verify FabricPC's ePC code, and does it help a user pick η and T inside a stable regime.
+
+**Verdict.** Correctness verification: strong. The oracle is independent of node and solver code; the assembly and the precision-weighted Theorem 1 re-derive correctly; the solver tests pin the equilibrium and the gradient scale, so two wrong solvers agreeing is ruled out; the 1-step identity and its first-order weight-gradient consequence are right. Tuning utility: weak, for the defects below.
+
+**Defect 1: the estimator returns the largest-magnitude eigenvalue, not the largest positive one.** Power iteration from a random start converges to the eigenvalue of largest magnitude. On a graph with gelu activations and a softmax cross-entropy output, H_ε contains the term Σ_k (∂L/∂μ_k)·∂²μ_k/∂ε², the loss gradient weighting the second derivatives of the network map, and that term makes H_ε indefinite once the weights are large. The (1e-2, 1) tracking CSV records λ_max = −9398.9 at update 1200. Consequences: `regime_label(−9399)` returned "backprop-like", because a negative η·λ makes f_max negative and below the 0.1 band edge; the crossing detector tested η·λ > 2 and never fired; the demo would have printed a negative 2/λ_max. Power iteration also reports no convergence indicator, and for a positive-definite H its Rayleigh quotient is a lower bound on λ_max, so an unconverged value overstates the safe rate.
+
+**Defect 2: the equilibrium band reads the fastest mode, and the condition is misprinted.** Before: "near PC equilibrium" was declared from f_max > 0.9, which says the fastest excited mode has relaxed 90%. After: equilibrium needs the modes that carry the gradient to relax, and the slowest of them sets the pace. Before: the class docstring, the guide paragraph, and the tuning table stated the condition as "η·T·λ_max ≳ 3/λ_min,excited", which as written multiplies by λ_max and divides by λ_min, a dimensional error. After: η·T·λ ≳ 3 on the gradient-carrying modes. The label also reported a "slowest" mode from a hard-coded floor eigenvalue of 1, wrong for any precision other than 1. On the resnet18 the excited band happened to be compact (λ_eff = 12 against λ_max = 16.4), so the label matched the sweep there; that is not general.
+
+**Defect 3: the T = 1 danger threshold is too lenient.** On the unit-precision chain, gradient descent from ε = 0 leaves the output residual after T steps at r_T = (r/λ)·[1 + (λ − 1)(1 − ηλ)^T] along a mode with eigenvalue λ; the equilibrium value r/λ per mode is r S⁻¹. At T = 1 this is r_1 = (1 − η(λ − 1))·r. The output layer's local weight gradient is proportional to r_1, so it reverses sign along the top mode at η(λ_max − 1) > 1, before the iteration bound η·λ_max > 2. The hidden errors ε_T = f(λ)·ε* keep the sign of their equilibrium value for every ηλ < 2, so the reversal is confined to the output layer. For general T the flip condition is (1 − ηλ)^T < −1/(λ − 1), which can hold only at odd T because (1 − ηλ)^T ≥ 0 at even T. The data agree: in the (1e-2, 1) run λ_max passed 100 at update 1100, where η(λ − 1) ≈ 1, test accuracy fell that epoch from 43.2% to 40.6%, and the network was at chance one epoch later; in the 2-epoch sweep the (0.1, 1) cell at η·λ_max = 1.6 (η(λ_max − 1) = 1.5) collapsed and the (0.03, 1) cell at η·λ_max = 0.49 did not. Before: the docs described the T = 1 danger as "lands farther from equilibrium than it started" at η·λ > 2 and marked η·λ > 1 only as "overshooting". After: the output-gradient reversal at η(λ_max − 1) > 1 is the warning users act on; η·λ_max > 2 remains the iteration bound.
+
+**Defect 4: the tracking tool cannot run on a user's graph.** `--track_lambda_max` re-implemented the training loop over `make_train_step` (about 120 lines) and reached into the demo module for the model builder, the optimizer, and the data loader. It existed because `train()`'s `iter_callback(epoch_idx, batch_idx, metrics)` cannot see the parameters. `epoch_callback(ctx)` can, but per-epoch access is too coarse: in the defaults collapse λ_max grew from 584 to 1608 within 50 updates.
+
+**Defect 5: no control runs, and the paper's contrary result is undocumented.** Both tracked cells collapsed, so "η·λ_max crossed 2 before the collapse" is an ordering, not a cause. Separating "λ_max grows regardless of the solver and a fixed η eventually crosses the bound" from "ePC's relaxation beyond the backprop-like regime drives the weight growth" needs the cells that did not collapse: (1e-3, 1) and the backprop trainer. Goemaere et al. (Tables E.9 and E.10) trained ResNet-18 at the same error rate 1e-3 with zero error momentum, T = 5, SGD on the errors and Adam on the weights, for 25 epochs in the sweep and 50 in the final run, and reported no instability. Their network has batch normalization after every convolution, ReLU, weight decay searched in [1e-6, 1e-3], and a standard parameterization; the demo uses the muPC parameterization, no normalization layers (none exist in `fabricpc/nodes`), gelu, weight decay 1e-2, and a 100-epoch schedule. λ_max is a weight-scale quantity, so normalization and weight decay are levers the guide must name.
+
+**Smaller defects.**
+
+- Before: the demo docstring said λ_max "grew about threefold per epoch". After: the CSV shows growth of about 1.13× per epoch through epoch 10 (16 to 51) and a runaway from epoch 11.
+- "Under Adam the η scaling is normalized away" holds only while η·|g| ≫ Adam's ε of 1e-8; at η = 1e-4, hidden-layer gradients of order 1e-7 are damped by ε. Without Adam, hidden layers learn η times slower than the output layer.
+- At equilibrium the output error is r S⁻¹, which damps the learning signal along mode λ_S by 1/λ_S, up to 16× on this graph, a matrix rescaling a per-parameter optimizer cannot undo. This linear-chain mechanism is consistent with the 31% plateau trailing the 38.8% plateau, and the analysis script did not show it.
+- The sPC+muPC equilibrium test cannot pin the gradient's scale, because a positive diagonal preconditioner shares the fixed point with plain gradient descent; only a stability bracket does.
+- The oracle docstring did not say that cyclic graphs are outside it (the unrolled ε-energy is quadratic for linear nodes, but the warm-started carried latents make it not a pure function of ε), nor that a batch's λ_max is the per-sample maximum (`error_energy` sums per-sample energies, so H_ε is block-diagonal over samples).
+- The one-eigenvalue sweep fit is a heuristic; the guide must not call it agreement.
+- The parity test asserted linear scaling in η at one unknown λ_max; it now measures λ_max and asserts d(η) ≤ C·η·λ_max.
+
+### Iteration 3: the replacement design
+
+A second review of this design's first draft is folded into it. Its two CPU experiments are the Evidence below, and its findings set the estimator's second statistic (f̄, not λ_min), the breakdown guard, the indefiniteness rule, and the control-run set.
+
+**Spectrum estimator: Lanczos from g0 with Ritz weights** (`fabricpc/core/epsilon_spectrum.py`, new).
+
+Chosen: `lanczos_extremes(hvp, v0, iters)` runs the three-term Lanczos recurrence from v0 = g0 using only Hessian-vector products (`jax.jvp` of `jax.grad` of the ε-energy). Lanczos builds an orthonormal basis of span{g0, H g0, H² g0, …} and represents H_ε in that basis as a k × k tridiagonal matrix T_k. The Ritz values θ_k approximate eigenvalues of H_ε and converge fastest at both ends of the spectrum; the weight w_k is the fraction of ‖g0‖² that Ritz mode carries. One run therefore returns the three things the regime needs: λ_max (the bound 2/λ_max), λ_min (negative means indefinite), and the distribution {(θ_k, w_k)} of the gradient over the spectrum, from which f̄ is the relaxed fraction of the gradient that drives the weight update. A mode with θ_k ≤ 0 has no minimum to relax toward, so it is left out of f̄ and judged by its weight and growth instead. Three vectors are carried, so memory is independent of `iters`. `make_epsilon_spectrum(structure, iters=30)` compiles `(params, state, clamps, key) -> EpsilonSpectrum` (fields: `lambda_max`, `lambda_min`, `ritz_values`, `ritz_weights`, the residuals of both extremes, `negative_weight`, `gradient_norm`, `random_start`, `k`); when ‖g0‖ = 0 a random start is used and flagged, and the extremes then describe the full spectrum.
+
+Why the weights, not only the extremes. On a linear graph g0 = Jᵀr has components only along the row space of J, so every w_k lies on one of the d_y eigenvalues eig(S), a compact band, and the two extremes describe it. On a nonlinear graph the second-derivative term in H_ε couples g0 to every direction, so nearly every mode is excited and λ_min is the bottom of the full spectrum, far from where the gradient sits. On the analysis script's gelu MLP (Evidence, second table) 943 of 1024 modes are excited, the smallest excited eigenvalue is 0.555, below the unit-precision floor, and 80% of the gradient's weight lies between 1.06 and 1.39. A band on λ_min would say the slowest mode is far from relaxed while the modes carrying the gradient are done. f̄ from 30 Lanczos steps equals f̄ from the exact 1024 × 1024 eigendecomposition to three digits. On a linear graph f̄ averages f over eig(S), so it agrees with the slowest-excited-mode condition whenever that band is compact, which is the resnet18's case.
+
+Breakdown guard. When β_j ≤ √eps(dtype)·max(max_i |α_i|, max_i β_i), the Krylov space is exhausted and the recurrence freezes; frozen steps decouple from T_k as 1 × 1 blocks with zero weight, and `k` counts the valid steps. An exact-zero guard fails: on the linear test fixtures the Krylov space has dimension at most d_y = 3, so β_3 is zero in exact arithmetic but about 1e-6·|α| in float32 and 1e-15·|α| in float64, the recurrence continues on rounding noise, and the minimum Ritz value converges to the unexcited floor of 1.0 (Evidence, first table). λ_max is unaffected, which is why power iteration never exposed this.
+
+Placement. The module is solver machinery: it calls `EPCInference.begin_segment` and `error_energy`, and no module in `fabricpc/core` imports from `fabricpc/utils` today. The linear oracle stays in `fabricpc/utils/linear_pc_oracle.py` and becomes NumPy-only; `top_epsilon_eigenvalue` and `regime_label` are deleted in one commit with every caller migrated (the demo's settings line, the compare script, the analysis script, and the oracle, parity, and regime tests).
+
+Rejected:
+
+- Shifted power iteration (a second pass on H + |λ_1|·I when the first returns λ_1 < 0). Ten lines and a sign fix, but it yields one number: no λ_min, no weights, so the equilibrium band would have to be dropped, and it converges slowly on a compact spectrum.
+- Lanczos extremes with the equilibrium band on λ_min. Exact on linear graphs. On nonlinear graphs λ_min is the bottom of the full spectrum, near or below 1, so f(λ_min) > 0.9 would need η·T ≳ 3 and most sweep cells on the 31% plateau would be labelled "partially relaxed": at η = 0.03, T = 5 (31.4%), f(1) = 0.14. The label would contradict the data it was built to explain.
+- Full reorthogonalization. Keeps k vectors of ε size to suppress ghost eigenvalues that duplicate converged extremes and split their weight; ghosts move neither the extremes nor the weighted sums.
+- Module in `fabricpc/utils`. `EPCInference.regime(spectrum)` would make core import utils, the first such edge in the package.
+
+**`Regime`: a structured verdict** (`EPCInference.regime(spectrum) -> Regime`, a NamedTuple).
+
+| Field | Meaning |
+|---|---|
+| `eta_lambda_max`, `eta_T_lambda_max` | η·λ_max and η·T·λ_max |
+| `unstable` | η·λ_max > 2: the top mode's distance grows every step |
+| `output_gradient_reverses` | (1 − ηλ_max)^T < −1/(λ_max − 1) at unit precision (T = 1: η(λ_max − 1) > 1); always False at even T |
+| `f_max`, `f_weighted` | f(λ_max) and f̄ |
+| `band` | on f̄: "backprop-like" below 0.1, "near PC equilibrium" above 0.9, "partially relaxed" between |
+| `negative_weight`, `growth_min` | the fraction of ‖g0‖² on negative-curvature modes, and (1 + η·max(0, −λ_min))^T, the growth of the most negative mode over T steps |
+| `lambda_max`, `lambda_min` | the extremes |
+
+`__str__` is the one-line label with precedence: `unstable`, then `growth_min > 1.1` ("indefinite: negative curvature carrying X% of the gradient grows Y× over T steps"), then the band with f̄, f_max, and the reversal note. Indefiniteness is judged by weight and growth, not by a boolean: at weight std 2.0 the gelu MLP is indefinite at init, with 16 negative eigenvalues down to −14.8 carrying 22.6% of ‖g0‖², yet one ePC step from ε = 0 is still exactly −η·g0; curvature sign enters at the second step, and over T steps a negative mode grows by (1 + η|λ_min|)^T, which at the defaults is 1.08. The reversal formula is the linear unit-precision chain's; on a nonlinear graph it is the local quadratic model's prediction at ε = 0, and the (1e-2, 1) control run tests it (the flag should fire at update 1100).
+
+Rejected: a string label with an optional `lambda_min_excited` argument (keeps substring parsing in the analysis script and cannot carry the flags); a boolean `indefinite` that outranks the band (any negative eigenvalue would print "indefinite" over "backprop-like", telling a user whose setting is exact backprop that it is broken); bands on f_max (Defect 2); bands on f(λ_min) (above).
+
+**`RegimeProbe`: the diagnostic as a `train()` callback** (`fabricpc/training/regime_probe.py`, new, exported from `fabricpc.training`).
+
+Chosen: `RegimeProbe(structure, probe_clamps=None, *, every, inference=None, iters=30, key, csv_path=None)`. `on_iter(ctx)` runs every `every` updates: it initializes a graph state at `ctx.params`, runs the compiled spectrum estimator, records per-edge Frobenius weight norms, the training energy, and `inference.regime(spectrum)` when `inference` is an `EPCInference`. `probe_clamps` are fixed clamps built once by the caller (the demo uses a 64-sample test batch); `None` measures on the training batch. `on_epoch(ctx, accuracy=None)` records the epoch row. Readouts: `first_reversal()`, `first_crossing()`, `first_chance(chance, margin=0.05)`, `growth_phases()` (the per-epoch λ_max maximum and its ratio to the previous epoch), `write_csv()`, `summary()`. The CSV carries metadata columns first (`trainer, eta_infer, infer_steps, every, probe_batch`), then the spectrum, the regime flags, energy, accuracy, and one `wnorm:<edge_key>` column per weight, so readers take η, T, and the trainer from the columns and the filename is only a label. It works under `algorithm="backprop"` (spectrum and norms; regime columns empty). Cost, stated in the docstring: supplying `iter_callback` forces a device sync on every batch, not only on probed ones.
+
+The probe consumes a separate PR that changes `iter_callback` to receive an `IterContext` with `params`, `opt_state`, `step`, `batch`, and `metrics`. The training step donates the parameter buffers, so `ctx.params` is valid only during the callback; the probe reads it there and stores floats. That PR migrates every three-argument caller in the same change (the dashboarding callbacks, the transformer demo, the Bayesian tuner, and the trainer tests).
+
+Rejected: `epoch_callback` only (no trainer change, but per-epoch access misses a collapse in which λ_max grows 2.75× within 50 updates); a trainer flag `probe_every=N, probe=callable` (a second per-batch mechanism beside `iter_callback`, with its own sync and return semantics); keeping the script's custom loop (not reusable); η and T parsed from the CSV filename (the backprop file has neither); the name `LambdaMaxProbe` (names one column of a probe that records a spectrum, weight norms, and flags).
+
+**Control runs: four cells and a reading rule fixed in advance.**
+
+Chosen: `python examples/resnet18_cifar10_demo.py --num_epochs 30 --schedule_epochs 100 --augment --activation gelu --track_regime 50 --eval_every 1` for four runs, about 20 minutes each on the 3090: (1e-3, 5), the defaults collapse the report rests on; (1e-3, 1), the 100-epoch survivor; `--trainer backprop`; and (1e-2, 1), the run whose CSV holds the −9399. All four train under the 0.5.1 per-prediction gradient normalization, which the earlier tracked cells and the 100-epoch runs predate, so the reading rule compares the four runs with one another, and the (1e-3, 5) re-run, not the old CSV, becomes the report's collapse series. Reading rule: if λ_max and the weight norms grow at a comparable rate in the backprop and (1e-3, 1) runs as in the collapsing cells, growth is a weight-scale effect of this parameterization (no normalization, weight decay 1e-2) and the remedy is a rate that follows λ_max or weight-norm control; if they grow only in the collapsing cells, ePC's relaxation feeds the growth. Also recorded: whether λ_max grows in the runs that do not collapse; λ_min and `negative_weight` through the collapses; for (1e-2, 1) a positive λ_max at update 1200 and the reversal flag at update 1100.
+
+Rejected: three runs without (1e-3, 5). That leaves the report's headline series in the old CSV schema, from the sign-ambiguous estimator and the batch-summed trainer, without λ_min or weight norms through the collapse.
+
+**Evidence from the first-draft review (CPU).**
+
+Plain Lanczos on a rank-3 excited spectrum: H = I + JᵀJ, D = 40, J of rank 3, start vector g0 = Jᵀr, 30 steps, no reorthogonalization. Excited eigenvalues eig(S): 15.72, 24.19, 33.62; floor 1.0 on the 37 unexcited modes. β_3 was 4.0e-5 in float32 and 8.6e-14 in float64.
+
+| precision | guard | stopped at | min Ritz | max Ritz |
+|---|---|---|---|---|
+| float32 | β = 0 | never | 1.000002 | 33.6245 |
+| float64 | β = 0 | never | 1.000000 | 33.6245 |
+| float32 | β ≤ 1e-5·\|α\| | step 3 | 15.7200 | 33.6245 |
+| float64 | β ≤ 1e-5·\|α\| | step 3 | 15.7200 | 33.6245 |
+
+The design's threshold √eps(dtype)·max(max_i |α_i|, max_i β_i) is about 1.2e-2 in float32 and 5e-7 in float64 on this spectrum, above β_3 in both precisions, so it also stops at step 3.
+
+Full ε-Hessian of the gelu MLP fixture (x32 → four hidden layers of 64 gelu units → 10-way softmax with cross-entropy, batch 4, 1024 ε entries, `jax.hessian` of `error_energy`):
+
+| weight std | λ_min | λ_max | negative modes | excited modes | Σ w_k on λ < 0 | 90% of g0 weight below λ |
+|---|---|---|---|---|---|---|
+| 1.0 | 0.555 | 1.557 | 0 | 943 of 1024 | 0 | 1.39 |
+| 2.0 | −14.8 | 11.4 | 16 | 256 of 1024 | 0.226 | 3.08 |
+
+At η = 0.03, T = 10 the gradient-weighted relaxed fraction from 30 Lanczos steps equals the exact value at both weight scales (0.298 at std 1.0; 0.458 at std 2.0, measured as the unnormalized sum Σ_{θ_k > 0} w_k f(θ_k); the normalized f̄ at std 2.0 is 0.458 / 0.774 ≈ 0.59 and has not been re-measured), while f(λ_max) alone reads 0.380 and 0.985.
+
+**Deliverables** (one commit each, suite green at each gate; the first two do not touch the trainer):
+
+1. `fabricpc/core/epsilon_spectrum.py` with `tests/test_epsilon_spectrum.py` (an explicit matrix with eigenvalues {−50, −1, 1, 3, 10} and a start vector of known eigen-components; a start vector inside a 2-dimensional invariant subspace triggers the breakdown at step 2; a zero start vector; the tanh and gelu MLP fixtures against `jax.hessian`); the oracle docstring gains the cyclic-graph limit and the per-sample-maximum sentence; `stability_bound` raises when λ_max ≤ 0.
+2. `Regime` and `regime(spectrum)`; deletion of `regime_label`, `top_epsilon_eigenvalue`, and `section_track_lambda_max` with every caller migrated; `spectrum_at_init` in the demo and the compare script's regime column; the analysis script's `stability` section checks Lanczos against the oracle's two extremes and against the oracle's weighted fraction Σ_{λ > 0} (v_λᵀg0)² f(λ) / Σ_{λ > 0} (v_λᵀg0)² over the excited modes, v_λ the unit eigenvector of eigenvalue λ; `TestRegime` (bands from constructed spectra with the weight at the top versus at the floor, same extremes, different bands; reversal at T = 1 and 5, none at T = 2; `growth_min` precedence); `TestStabilityBracket` parametrized over the plain and muPC depth-3 chains, so the muPC bracket pins sPC+muPC's gradient scale; the class docstring rewritten with the f̄ condition, the reversal mechanism, the Adam and SGD caveats, λ_max as a weight-scale quantity, and the paper's ResNet-18 setting.
+3. After the `IterContext` rebase: `RegimeProbe` with `tests/test_regime_probe.py` (a tanh MLP trained two epochs with `every=2` under both trainers; the CSV round-trips through the plot reader); the demo's `--track_regime N` and `--schedule_epochs`; the analysis script's `--plot_track` (four panels: λ_max and |λ_min| with the 2/η line only when η is present, f̄ with `negative_weight`, weight norms, test accuracy; vertical lines at the first reversal and the first crossing), the r S⁻¹ damping table in `equilibrium_profile`, and the normalized gradient comparison in `backprop_regime`.
+4. Documentation: the guide's backprop-regime paragraph and tuning-table rows (η below 1/(λ_max − 1) at odd T for the output gradient and below 2/λ_max at every T, measured with `epsilon_spectrum` and tracked with `RegimeProbe`; `infer_steps` by f̄); a `RegimeProbe` fence; the FAQ; the CHANGELOG (all three replaced names are in the unreleased section, so no breaking-change bullet); the technical report's tracking section regenerated from the control runs, with new subsections on the paper's ResNet-18 setting and on the r S⁻¹ damping.
+5. The four GPU control runs, with the reading rule applied and the outcome recorded in the demo docstring, the guide, and the report.
+
+### Status (2026-09-08)
+
+| Item | State                                                                                                                                                                                                                                                                                                                             |
+|---|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| Linear oracle, `error_energy`, oracle and backprop-correspondence tests, analysis script CPU sections, guide and CHANGELOG touch points | shipped on this branch                                                                                                                                                                                                                                                                                                            |
+| `regime_label`, `top_epsilon_eigenvalue`, `--track_lambda_max` | shipped; to be deleted by deliverable 2 above                                                                                                                                                                                                                                                                                     |
+| `epsilon_spectrum`, `Regime`, `RegimeProbe`, `--track_regime`, `--plot_track`, control runs | designed and implemented; deliverables 1 and 2 done, 3 to 5 wait on the `IterContext` PR                                                                                                                                                                                                                                          |
+| 2-epoch sweep, 100-epoch runs, the two tracking CSVs | measured before the 0.5.1 gradient normalization; accepted as recorded, not re-collected. The inference energy is untouched by the normalization, so H_ε and the regime at init are the same under both trainers; the training trajectories are not, and the control runs are the first tracking data from the normalized trainer |
+
+## Appendix: resnet18/CIFAR-10 2-epoch sweep results
+
 epochs/arm: 2  |  trials: 5  |  sPC: 120 steps @ eta 0.1
 sweep epc_eta [0.1, 0.03, 0.01, 0.001, 0.0001]
 report accuracy (2 epochs) and train time over trials
@@ -464,4 +657,4 @@ ePC-64       38.65 +/- 0.35     518.5
 ePC-128      38.34 +/- 0.33     960.7
 ePC-160      38.16 +/- 0.36     1175.5
 
-Interpretation (2026-09-04, `docs/dev_plans/epc_reviewer_response_oracle_and_analysis.md`): across the five tables accuracy declines monotonically with η·T·λ from ePC's small-η·T limit (38.8%; no backprop arm was run, and the 100-epoch demo holds the only measured backprop number, 77.11%) toward the PC equilibrium (31.0% at every η for T ≥ 32), with sPC-120 at 34.6% between them because 120 state-based steps do not reach equilibrium. The regime parameter is η·T·λ_max(H_ε), λ_max the top eigenvalue of the energy's Hessian in error coordinates: each excited mode relaxes by 1 − (1 − ηλ)^T per T steps. A one-eigenvalue fit of the η ≤ 0.01 cells gives λ_eff = 12.0 (rms residual 0.05 in normalized accuracy); power iteration on the resnet18 graph at init gives λ_max = 16.4 (`scripts/epc_analysis.py --resnet18`), so the two agree within a factor of 1.4. The η = 0.1 cells that collapsed at T ≤ 3 sit at η·λ_max = 1.6 at init, overshooting each mode's equilibrium, and cross the stability bound 2/λ_max as soon as the weights grow. The 100-epoch runs (project-root `sweep_eta*_steps*.log`) show the same bound reached late: only η·T ≤ 0.002 survived, the library default (1e-3, 5) collapsed at epoch 20, and 1e-2 collapsed by epoch 10 at every step count.
+Interpretation (2026-09-04, revised 2026-09-08; the mechanism and the diagnostics are under "Review round 2" above): across the five tables accuracy declines monotonically with η·T·λ from ePC's small-η·T limit (38.8%; no backprop arm was run, and the 100-epoch demo holds the only measured backprop number, 77.11%) toward the PC equilibrium (31.0% at every η for T ≥ 32), with sPC-120 at 34.6% between them because 120 state-based steps do not reach equilibrium. The regime parameter is η·T·λ on the excited modes of H_ε, the energy's Hessian in error coordinates: each excited mode relaxes by 1 − (1 − ηλ)^T over T steps. A one-eigenvalue fit of the η ≤ 0.01 cells gives λ_eff = 12.0 (rms residual 0.05 in normalized accuracy), a heuristic; power iteration on the resnet18 graph at init gives λ_max = 16.4 (`scripts/epc_analysis.py --resnet18`), and the two are consistent within a factor of 1.4. At equilibrium the output error is r S⁻¹, which damps the learning signal along each excited mode by its eigenvalue of S; that linear-chain mechanism is consistent with the 31% plateau trailing the 38.8% plateau. The η = 0.1 cells that collapsed at T ≤ 3 sit at η·λ_max = 1.6 at init: at T = 1 the output layer's weight gradient reverses sign on the top mode once η(λ_max − 1) > 1 (1.5 here), while the (0.03, 1) cell at η·λ_max = 0.49 did not collapse. The 100-epoch runs (project-root `sweep_eta*_steps*.log`) reach the bound late: only η·T ≤ 0.002 survived, the library default (1e-3, 5) collapsed at epoch 20, and 1e-2 collapsed by epoch 10 at every step count; λ_max tracked through the default's collapse grew from 16 to 51 over the first ten epochs and then ran away (84, 131, 471, 3508, 12539 at epochs 11 to 15).

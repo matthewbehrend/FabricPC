@@ -27,11 +27,13 @@ whole derived forward — full depth times the unroll degree — reverse-mode
 memory at backprop scale, versus sPC's per-node closures.
 """
 
-from typing import Any, Dict, Tuple
+import math
+from typing import Any, Dict, NamedTuple, Tuple
 
 import jax
 import jax.numpy as jnp
 
+from fabricpc.core.epsilon_spectrum import EpsilonSpectrum, weighted_relaxed_fraction
 from fabricpc.core.inference import InferenceBase, gather_inputs
 from fabricpc.core.scaling import scale_inputs
 from fabricpc.core.state_ops import update_node_in_state
@@ -41,6 +43,80 @@ from fabricpc.core.types import (
     GraphStructure,
     NodeState,
 )
+
+
+class Regime(NamedTuple):
+    """Verdict of ``EPCInference.regime`` on one measured spectrum.
+
+    Every flag is the local quadratic model's prediction at ε = 0 for the
+    solver's (eta_infer, infer_steps) = (η, T) on the spectrum
+    :class:`~fabricpc.core.epsilon_spectrum.EpsilonSpectrum` describes; on
+    a linear graph it is exact.
+
+    Attributes:
+        eta, steps: η and T.
+        eta_lambda_max, eta_T_lambda_max: η·λ_max and η·T·λ_max.
+        unstable: η·λ_max > 2, the top mode's distance grows every step.
+        output_gradient_reverses: at unit precision the output residual
+            after T steps is r_T = (r/λ)·[1 + (λ − 1)(1 − ηλ)^T] along a mode
+            with eigenvalue λ, so the output layer's weight gradient has the
+            wrong sign along the top mode when (1 − ηλ_max)^T < −1/(λ_max − 1)
+            (T = 1: η(λ_max − 1) > 1). Possible only at odd T, since
+            (1 − ηλ)^T ≥ 0 at even T; the hidden errors keep their sign for
+            every ηλ < 2.
+        f_max: f(λ_max) = 1 − (1 − ηλ_max)^T, the fastest mode's relaxed
+            fraction.
+        f_weighted: f̄, the gradient-weighted relaxed fraction over the
+            positive-curvature modes (``weighted_relaxed_fraction``).
+        band: on f̄: "backprop-like" below 0.1, "near PC equilibrium" above
+            0.9, "partially relaxed" between; "no positive curvature" when no
+            positive mode carries gradient weight.
+        negative_weight: fraction of ‖g0‖² on negative-curvature modes.
+        growth_min: (1 + η·max(0, −λ_min))^T, the growth of the most negative
+            mode over T steps (1.0 when λ_min ≥ 0).
+        lambda_max, lambda_min: the spectrum's extremes.
+
+    ``str(regime)`` is the one-line label with precedence: ``unstable``,
+    then ``growth_min > 1.1`` (indefinite), then the band with f̄, f_max, and
+    the reversal note. Negative-curvature modes have no equilibrium to relax
+    toward, so the band never reads them; ``growth_min`` does.
+    """
+
+    eta: float
+    steps: int
+    eta_lambda_max: float
+    eta_T_lambda_max: float
+    unstable: bool
+    output_gradient_reverses: bool
+    f_max: float
+    f_weighted: float
+    band: str
+    negative_weight: float
+    growth_min: float
+    lambda_max: float
+    lambda_min: float
+
+    def __str__(self) -> str:
+        if self.unstable:
+            return f"unstable: eta*lambda_max = {self.eta_lambda_max:.3g} > 2"
+        if self.growth_min > 1.1:
+            return (
+                f"indefinite: negative curvature carrying "
+                f"{100 * self.negative_weight:.0f}% of the gradient grows "
+                f"{self.growth_min:.3g}x over {self.steps} steps "
+                f"(lambda_min = {self.lambda_min:.3g})"
+            )
+        text = (
+            f"eta*T*lambda_max = {self.eta_T_lambda_max:.3g} (gradient-weighted "
+            f"relaxed fraction {self.f_weighted:.2f}, fastest mode "
+            f"{self.f_max:.2f}): {self.band}"
+        )
+        if self.output_gradient_reverses:
+            text += (
+                f"; output-layer gradient reverses on the top mode "
+                f"(eta*(lambda_max - 1) = {self.eta * (self.lambda_max - 1.0):.3g})"
+            )
+        return text
 
 
 class EPCInference(InferenceBase):
@@ -53,9 +129,9 @@ class EPCInference(InferenceBase):
             one node's ε moves every downstream derived latent — so tune it
             like a weight learning rate, not like sPC's local per-node rate.
             Gradient descent on the error-coordinate energy is stable only
-            for eta_infer < 2/λ_max(H_ε), the top eigenvalue of that energy's
-            Hessian; ``fabricpc.utils.linear_pc_oracle.top_epsilon_eigenvalue``
-            measures it on any graph.
+            for eta_infer < 2/λ_max(H_ε), the top excited eigenvalue of that
+            energy's Hessian; ``fabricpc.core.epsilon_spectrum.epsilon_spectrum``
+            measures it on any graph, and ``regime`` reads the verdict.
         infer_steps: Number of inference iterations (default: 5). One
             reverse pass per step reaches every layer, so a few steps replace
             sPC's hundreds on deep DAGs.
@@ -69,25 +145,41 @@ class EPCInference(InferenceBase):
     layer unscaled (Goemaere et al., Theorem C.9, Case 1). The remainder
     comes from a node's input latent being re-derived at the perturbed
     upstream state, so a layer fed only by clamped nodes matches exactly.
-    After T steps
-    each excited error mode with Hessian eigenvalue λ has relaxed toward
-    equilibrium by 1 − (1 − eta_infer·λ)^T, so the regime parameter is
-    eta_infer·T·λ_max: ≪ 1 is backprop-like (Case 2), ≳ 3/λ_min,excited
-    reaches the PC equilibrium, and eta_infer·λ_max < 2 is required for
-    stability at every T, T = 1 included, since one step lands each mode at
-    eta_infer·λ times its equilibrium value. ``regime_label`` names the
-    regime for a measured λ_max. Under Adam the eta_infer scaling of the
-    hidden-layer gradients is normalized away, so 1-step ePC with Adam
-    trains as backprop with Adam.
+    After T steps each excited error mode with Hessian eigenvalue λ has
+    relaxed toward equilibrium by f(λ) = 1 − (1 − eta_infer·λ)^T. The
+    regime is read on the modes that carry the starting gradient, weighted
+    by the fraction of ‖∇_ε E‖² each carries (f̄, ``Regime.f_weighted``):
+    f̄ ≪ 0.1 is backprop-like (Case 2); f̄ > 0.9 is the PC equilibrium, which
+    needs eta_infer·T·λ ≳ 3 on those modes, and on a linear graph they are
+    the eig(S) modes of Innocenti et al.'s Theorem 1 (S = I + JJᵀ, J the map
+    from the hidden errors to the output prediction), so the slowest of them
+    sets T. eta_infer·λ_max < 2 is required for stability at every T. At odd
+    T the output layer is damaged earlier: its weight gradient is
+    proportional to the output residual after T steps, which along the top
+    mode is (1 − eta_infer(λ_max − 1))·r at T = 1 and reverses sign once
+    eta_infer·(λ_max − 1) > 1, while the hidden errors keep their sign for
+    every eta_infer·λ < 2 (``Regime.output_gradient_reverses``).
 
-    Measured on the muPC resnet18 demo (``examples/resnet18_cifar10_demo.py``):
-    the 2-epoch sweep implies an effective excited eigenvalue of order
-    10¹–10² at init, and the defaults (eta_infer·T = 0.005) train as backprop
-    for tens of epochs but collapsed at epoch 20 of a 100-epoch run while
-    infer_steps ∈ {1, 2} survived, consistent with λ_max growing past
-    2/eta_infer as the weights grow. The defaults are kept pending a
-    stability-aware rate; ``scripts/epc_analysis.py`` measures λ_max and
-    tracks it during training.
+    Optimizer. Under Adam the eta_infer scaling of the hidden-layer gradients
+    is normalized away while eta_infer·|g| ≫ Adam's ε (1e-8), so 1-step ePC
+    with Adam trains as backprop with Adam; below that the ε term damps the
+    hidden layers. Without Adam the hidden layers learn eta_infer times
+    slower than the output layer, a 1000× disparity at the default.
+
+    Weight scale. On a chain λ_max = 1 + σ_max(J)² grows with the product of
+    the downstream weights, so it grows during training and a fixed
+    eta_infer can cross 2/λ_max late in a run; normalization layers and
+    weight decay bound it. Goemaere et al. trained ResNet-18 at
+    eta_infer = 1e-3, T = 5 for 50 epochs without instability (batch
+    normalization after every convolution, ReLU, weight decay ≤ 1e-3,
+    standard parameterization). The muPC resnet18 demo
+    (``examples/resnet18_cifar10_demo.py``: no normalization layers, gelu,
+    weight decay 1e-2, a 100-epoch schedule) at the same defaults trained as
+    backprop for tens of epochs and collapsed to chance by epoch 20 while
+    infer_steps ∈ {1, 2} survived; λ_max tracked through the collapse grew
+    from 16 at init past 2/eta_infer. The defaults are kept pending a
+    stability-aware rate; ``fabricpc.training.RegimeProbe`` tracks the
+    spectrum and the regime during any ``train`` run.
     """
 
     def __init__(self, eta_infer=1e-3, infer_steps=5, latent_decay=0.0):
@@ -95,37 +187,45 @@ class EPCInference(InferenceBase):
             eta_infer=eta_infer, infer_steps=infer_steps, latent_decay=latent_decay
         )
 
-    def regime_label(self, lambda_max: float) -> str:
-        """Name the regime of this solver's (eta_infer, infer_steps) on a
-        graph whose error-coordinate Hessian has top eigenvalue
-        ``lambda_max`` (``top_epsilon_eigenvalue`` or the linear oracle).
-
-        The fastest excited mode has relaxed by f_max = 1 − |1 − η·λ_max|^T
-        and the slowest possible mode, at the unit-precision floor λ = 1, by
-        f_min = 1 − (1 − η)^T. Bands on f_max: below 0.1 "backprop-like",
-        0.1 to 0.9 "partially relaxed", above 0.9 "near PC equilibrium".
-        η·λ_max > 2 is "unstable" (the mode diverges, T = 1 included) and
-        1 < η·λ_max ≤ 2 overshoots. λ_max grows with the weights during
-        training, so a label computed at init describes init.
+    def regime(self, spectrum: EpsilonSpectrum) -> Regime:
+        """The verdict of this solver's (eta_infer, infer_steps) on a measured
+        excited spectrum (``epsilon_spectrum`` on any graph, or
+        ``EpsilonSpectrum.from_modes`` on the linear oracle's eigenvalues).
+        λ_max grows with the weights during training, so a verdict at init
+        describes init; ``fabricpc.training.RegimeProbe`` re-measures it.
         """
         eta = float(self.config["eta_infer"])
         steps = int(self.config["infer_steps"])
-        x = eta * float(lambda_max)
-        if x > 2.0:
-            return f"unstable: eta*lambda_max = {x:.3g} > 2"
-        f_max = 1.0 - abs(1.0 - x) ** steps
-        f_min = 1.0 - abs(1.0 - eta) ** steps
-        if f_max < 0.1:
+        lam_max = float(spectrum.lambda_max)
+        lam_min = float(spectrum.lambda_min)
+        x = eta * lam_max
+        contraction = (1.0 - x) ** steps
+        f_max = 1.0 - contraction
+        f_weighted = weighted_relaxed_fraction(spectrum, eta, steps)
+        if math.isnan(f_weighted):
+            band = "no positive curvature"
+        elif f_weighted < 0.1:
             band = "backprop-like"
-        elif f_max <= 0.9:
-            band = "partially relaxed"
-        else:
+        elif f_weighted > 0.9:
             band = "near PC equilibrium"
-        if x > 1.0:
-            band += ", overshooting"
-        return (
-            f"eta*T*lambda_max = {x * steps:.3g} (fastest error mode relaxed "
-            f"{100 * f_max:.0f}%, slowest {100 * f_min:.2g}%): {band}"
+        else:
+            band = "partially relaxed"
+        reverses = lam_max > 1.0 and contraction < -1.0 / (lam_max - 1.0)
+        growth_min = (1.0 + eta * max(0.0, -lam_min)) ** steps
+        return Regime(
+            eta=eta,
+            steps=steps,
+            eta_lambda_max=x,
+            eta_T_lambda_max=x * steps,
+            unstable=x > 2.0,
+            output_gradient_reverses=bool(reverses),
+            f_max=f_max,
+            f_weighted=f_weighted,
+            band=band,
+            negative_weight=float(spectrum.negative_weight),
+            growth_min=growth_min,
+            lambda_max=lam_max,
+            lambda_min=lam_min,
         )
 
     @staticmethod
@@ -200,7 +300,8 @@ class EPCInference(InferenceBase):
         the training loop sums, so equilibria match sPC — a source's ε
         gradient arrives purely through downstream z_mu). One owner of the
         ε-energy for the solver's gradient, Hessian-vector products
-        (``jax.jvp(jax.grad(...))``), and power iteration.
+        (``jax.jvp(jax.grad(...))``), and the Lanczos spectrum estimator
+        (``fabricpc.core.epsilon_spectrum``).
         """
         relaxed = cls._relaxed_errors(structure, clamps)
 

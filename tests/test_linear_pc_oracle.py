@@ -9,8 +9,8 @@ Theorem 1, and explicit Hessian forms. The solver tests then require
 ``EPCInference`` and ``InferenceSGD`` to reach the oracle's equilibrium,
 pin the exact stability bound of each (which fixes the scale of the
 gradient implementations, not only their direction), and check the
-error-coordinate Hessian-vector product and power iteration against the
-oracle's H_ε.
+error-coordinate Hessian-vector product and the Lanczos spectrum estimator
+(``fabricpc.core.epsilon_spectrum``) against the oracle's H_ε.
 """
 
 import jax
@@ -21,6 +21,7 @@ import pytest
 from conftest import inject_biases, with_inference
 from fabricpc.core import EPCInference, InferenceSGD
 from fabricpc.core.activations import IdentityActivation, TanhActivation
+from fabricpc.core.epsilon_spectrum import epsilon_spectrum, weighted_relaxed_fraction
 from fabricpc.core.energy import CrossEntropyEnergy, GaussianEnergy
 from fabricpc.core.initializers import MuPCInitializer, NormalInitializer
 from fabricpc.core.mupc import MuPCConfig
@@ -259,6 +260,30 @@ class TestOracleSelfChecks:
         np.testing.assert_allclose(oracle.latent_hessian(eq.quad), [[10.0]])
         np.testing.assert_allclose(oracle.epsilon_hessian(eq.quad), [[10.0]])
         assert oracle.stability_bound(oracle.epsilon_hessian(eq.quad)) == 0.2
+
+    def test_stability_bound_needs_positive_curvature(self):
+        """An indefinite or negative quadratic has no stable descent rate;
+        2/λ_max would be a negative number presented as a rate."""
+        with pytest.raises(ValueError, match="no positive curvature"):
+            oracle.stability_bound(np.diag([-3.0, -1.0]))
+        with pytest.raises(ValueError, match="no positive curvature"):
+            oracle.stability_bound(np.zeros((2, 2)))
+        assert oracle.stability_bound(np.diag([-3.0, 4.0])) == 0.5
+
+    def test_gradient_weights_and_weighted_fraction(self):
+        """Weights are squared overlaps summed over samples; the weighted
+        fraction averages f over the positive modes only."""
+        H = np.diag([-2.0, 1.0, 4.0])
+        g0 = np.array([[1.0, 0.0], [0.0, 2.0], [1.0, 1.0]])  # (D, batch)
+        eigs, w = oracle.gradient_weights(H, g0)
+        np.testing.assert_allclose(eigs, [-2.0, 1.0, 4.0])
+        np.testing.assert_allclose(w, np.array([1.0, 4.0, 2.0]) / 7.0)
+        f = oracle.relaxed_fraction(0.1, 3, np.array([1.0, 4.0]))
+        expected = (4.0 * f[0] + 2.0 * f[1]) / 6.0
+        assert oracle.weighted_relaxed_fraction(eigs, w, 0.1, 3) == pytest.approx(
+            expected
+        )
+        assert np.isnan(oracle.weighted_relaxed_fraction([-1.0], [1.0], 0.1, 3))
 
     @pytest.mark.parametrize(
         "bunch", CHAINS + ["chain-h2-bias", "chain-h2-precision", "mupc-chain-h3"]
@@ -532,11 +557,18 @@ class TestSPCReachesOracle:
 
 class TestStabilityBracket:
     """The exact bound 2/λ_max pins the scale of each solver's gradient, not
-    only its direction: 0.95× converges to the oracle, 1.05× diverges."""
+    only its direction: 0.95× converges to the oracle, 1.05× diverges.
 
+    On ``mupc-chain-h3`` the identity activations make muPC's top-down scale
+    the exact chain-rule factor (jacobian_gain = 1, self_grad_scale = 1), so
+    the bracket pins sPC+muPC's gradient scale as well; the equilibrium test
+    alone cannot, because a diagonal preconditioner shares the fixed point.
+    """
+
+    @pytest.mark.parametrize("bunch", ["chain-h3", "mupc-chain-h3"])
     @pytest.mark.parametrize("solver", ["epc", "spc"])
-    def test_bracket(self, rng_key, solver):
-        structure, params, clamps, state, eq = _oracle_case("chain-h3", rng_key)
+    def test_bracket(self, rng_key, solver, bunch):
+        structure, params, clamps, state, eq = _oracle_case(bunch, rng_key)
         if solver == "epc":
             H, schedule, make = (
                 oracle.epsilon_hessian(eq.quad),
@@ -592,11 +624,45 @@ class TestEpsilonHVPMatchesOracle:
         for name in hv:
             np.testing.assert_allclose(np.asarray(hv[name]), expected[name], atol=1e-4)
 
-    @pytest.mark.parametrize("bunch", ["fork-merge", "prior-source"])
-    def test_power_iteration_matches_oracle(self, rng_key, bunch):
+    @pytest.mark.parametrize("dtype", ["float32", "float64"])
+    @pytest.mark.parametrize(
+        "bunch", ["fork-merge", "prior-source", "chain-h3-std0.8", "chain-h3"]
+    )
+    def test_lanczos_matches_excited_extremes(self, rng_key, bunch, dtype):
+        """Lanczos from g0 returns the extremes of the excited spectrum, not
+        of the full one, and its gradient-weighted relaxed fraction equals
+        the oracle's. On the chains the Krylov space has dimension d_y = 3,
+        so the relative breakdown guard must stop the recurrence before it
+        wanders onto the unexcited unit-precision floor; ``chain-h3`` in
+        float32 is the near-breakdown case (β_3 about 1e-6·|α| there)."""
         structure, params, clamps, state, eq = _oracle_case(bunch, rng_key)
-        lam = oracle.top_epsilon_eigenvalue(
-            params, state, clamps, structure, iters=300, key=rng_key
-        )
-        expected = np.linalg.eigvalsh(oracle.epsilon_hessian(eq.quad))[-1]
-        np.testing.assert_allclose(lam, expected, rtol=1e-4)
+        H = oracle.epsilon_hessian(eq.quad)
+        g0 = oracle.epsilon_gradient_at_zero(eq.quad)
+        eigs, weights = oracle.gradient_weights(H, g0)
+        excited = oracle.excited_eigenvalues(H, g0)
+        eta, steps = 0.05, 5
+        expected_fbar = oracle.weighted_relaxed_fraction(eigs, weights, eta, steps)
+
+        jax.config.update("jax_enable_x64", dtype == "float64")
+        try:
+            cast = lambda t: jax.tree_util.tree_map(  # noqa: E731
+                lambda x: jnp.asarray(x, getattr(jnp, dtype)), t
+            )
+            params_c, clamps_c = cast(params), cast(clamps)
+            state_c = initialize_graph_state(
+                structure, BATCH, rng_key, clamps_c, params=params_c
+            )
+            spectrum = epsilon_spectrum(
+                params_c, state_c, clamps_c, structure, iters=30, key=rng_key
+            )
+        finally:
+            jax.config.update("jax_enable_x64", False)
+
+        np.testing.assert_allclose(spectrum.lambda_max, eigs[-1], rtol=1e-3)
+        np.testing.assert_allclose(spectrum.lambda_min, excited.min(), rtol=1e-3)
+        fbar = weighted_relaxed_fraction(spectrum, eta, steps)
+        np.testing.assert_allclose(fbar, expected_fbar, atol=1e-3)
+        assert not spectrum.random_start
+        if bunch != "prior-source":
+            # d_y = 3 excited modes: the guard freezes the recurrence early.
+            assert spectrum.k < spectrum.iters, (bunch, dtype, spectrum.k)
