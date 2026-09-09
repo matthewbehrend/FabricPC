@@ -77,10 +77,12 @@ class TrackingConfig:
     track_accuracy: bool = True
     track_error: bool = False
     track_weight_distributions: bool = True
+    track_state: bool = False
     track_state_distributions: bool = False
 
-    # Node-level filtering (empty = no per-node breakdown)
+    # Node-level filtering (empty = no per-node breakdown / no distributions)
     nodes_to_track: List[str] = field(default_factory=list)
+    distribution_nodes: List[str] = field(default_factory=list)
 
     # Frequency controls
     tracking_every_n_batches: int = 50
@@ -97,12 +99,14 @@ class TrackingConfig:
 | `track_energy` | `bool` | `True` | Track energy at both batch and epoch level. |
 | `track_accuracy` | `bool` | `True` | Track accuracy at epoch level. |
 | `track_error` | `bool` | `False` | Track prediction error statistics. |
-| `track_weight_distributions` | `bool` | `True` | Track weight and bias distribution histograms. |
-| `track_state_distributions` | `bool` | `False` | Track full distribution histograms for `z_latent`, `z_mu`, and `energy`. Summary stats (mean, std, norm) are always collected when state tracking fires. |
-| `nodes_to_track` | `List[str]` | `[]` | Nodes for per-node tracking. Empty list disables per-node breakdowns (energy, state, inference dynamics). |
-| `tracking_every_n_batches` | `int` | `50` | How often (in batches) to log weight distributions, state stats/distributions, and inference dynamics. |
-| `tracking_every_n_epochs` | `int` | `1` | How often (in epochs) to log epoch-level metrics such as weight distributions. |
-| `state_tracking_every_n_infer_steps` | `int` | `5` | Within a tracked batch, how often (in inference steps) to log state. |
+| `track_weight_distributions` | `bool` | `True` | Track weight and bias distribution histograms for `distribution_nodes` every `tracking_every_n_batches`. |
+| `track_state` | `bool` | `False` | Track per-node state summary stats (mean, std, L2 norm of `z_latent`, `z_mu`, `energy`) for `distribution_nodes` on every `tracking_every_n_batches`-th batch. |
+| `track_state_distributions` | `bool` | `False` | Also track full distribution histograms for `z_latent`, `z_mu`, and `energy`; implies `track_state`. |
+| `nodes_to_track` | `List[str]` | `[]` | Nodes for per-node breakdowns: batch-level per-node energy and inference dynamics. Empty logs no per-node breakdowns. |
+| `distribution_nodes` | `List[str]` | `[]` | Nodes whose weight/bias and state distributions are logged. Empty logs no distributions, as an empty `nodes_to_track` logs no per-node breakdowns. |
+| `tracking_every_n_batches` | `int` | `50` | How often (in batches) the iteration callback logs weight distributions and state stats/distributions, and custom loops log inference dynamics. |
+| `tracking_every_n_epochs` | `int` | `1` | Reserved; read by nothing. |
+| `state_tracking_every_n_infer_steps` | `int` | `5` | Within a tracked batch, log the state after every this-many inference steps (`0, k, 2k, ...` up to `infer_steps`). |
 | `experiment_name` | `Optional[str]` | `None` | Name of the experiment in Aim. |
 | `run_name` | `Optional[str]` | `None` | Name of this specific run. |
 
@@ -110,22 +114,41 @@ class TrackingConfig:
 
 ### Weight Distributions
 
-Track how weights and biases evolve during training:
+Track how weights and biases evolve during training. The iteration callback
+logs them for the nodes in `distribution_nodes` every
+`tracking_every_n_batches`; an empty `distribution_nodes` logs none:
 
 ```python
 config = TrackingConfig(
     track_weight_distributions=True,
+    distribution_nodes=["h1", "h2"],
     tracking_every_n_batches=100,  # Log every 100 batches
 )
 ```
 
 ### State Distributions
 
-Track `z_latent`, `z_mu`, and `energy` distributions per node. Summary statistics (mean, std, norm) are always collected when state tracking fires; set `track_state_distributions=True` to also log full distribution histograms:
+Set `track_state=True` for per-node summary statistics (mean, std, L2 norm)
+of `z_latent`, `z_mu`, and `energy`, or `track_state_distributions=True` to
+also log their histograms, for the nodes in `distribution_nodes`. On every
+`tracking_every_n_batches`-th batch the iteration callback from
+`create_tracking_callbacks` settles that batch again under the updated
+parameters, initialized from the step's batch key, in one jitted program
+(`make_tracked_settle`), and logs the state after `0, k, 2k, ...` inference
+steps up to `infer_steps`, with `k = state_tracking_every_n_infer_steps`.
+Step 0 is the initialization and, when `infer_steps` is a multiple of `k`,
+the last record is the settled state. This is a fresh settle, not the
+training settle: under `FeedforwardStateInit` the initial latents also come
+from the updated parameters, and the per-node energy logged for the same
+batch (`nodes_to_track`) comes from the training settle. Cost: one jitted
+settle per tracked batch. Under `algorithm="backprop"` there is no settling
+to record; the feedforward state is logged once per tracked batch at
+`infer_step=0`.
 
 ```python
 config = TrackingConfig(
     track_state_distributions=True,
+    distribution_nodes=["h1", "h2"],
     tracking_every_n_batches=50,
     state_tracking_every_n_infer_steps=5,
 )
@@ -143,7 +166,7 @@ config = TrackingConfig(
 
 ## Advanced Usage: Custom Training Loop
 
-For detailed tracking including inference dynamics, use a custom training loop with `train_step_with_history`:
+To record the training settle's own inference history on every batch, without the second inference pass the iteration callback makes on tracked batches, use a custom training loop with `train_step_with_history`, which collects the history inside the jitted step:
 
 ```python
 import jax
@@ -208,44 +231,6 @@ for epoch in range(num_epochs):
 tracker.close()
 ```
 
-### Per-batch state tracking with `make_train_step`
-
-`create_detailed_iter_callback` tracks per-node energy and state
-distributions alongside the batch energy. It consumes the final
-`GraphState`, which only `make_train_step`'s step returns, so it plugs into
-a custom loop — not into `train(iter_callback=...)`:
-
-```python
-import jax
-from fabricpc.training import convert_batch, make_train_step
-from fabricpc.utils.dashboarding import (
-    AimExperimentTracker,
-    TrackingConfig,
-    create_detailed_iter_callback,
-)
-
-tracker = AimExperimentTracker(config=TrackingConfig(experiment_name="detailed"))
-detailed_cb = create_detailed_iter_callback(tracker, structure)
-
-step = make_train_step(structure, optimizer)
-opt_state = optimizer.init(params)
-for epoch in range(num_epochs):
-    epoch_key = jax.random.fold_in(rng_key, epoch)
-    for batch_idx, batch_data in enumerate(train_loader):
-        batch = convert_batch(batch_data)
-        batch_key = jax.random.fold_in(epoch_key, batch_idx)
-        params, opt_state, metrics, final_state = step(
-            params, opt_state, batch, batch_key
-        )
-        detailed_cb(
-            epoch,
-            batch_idx,
-            {k: float(v) for k, v in metrics.items()},
-            final_state,
-        )
-tracker.close()
-```
-
 ## Metric Extractors
 
 Use extractors to get specific metrics from `GraphState` and `GraphParams`:
@@ -294,13 +279,13 @@ else:
 
 ## Best Practices for PC Debugging
 
-1. **Track weight distributions** to detect exploding/vanishing gradients in the Hebbian learning updates.
+1. **Track weight distributions** (`distribution_nodes`) to detect exploding/vanishing gradients in the Hebbian learning updates.
 
 2. **Track per-node energy** (`nodes_to_track`) to identify which layers are contributing most to the total energy.
 
 3. **Track inference dynamics** to verify that the inference loop converges (energy should decrease, gradient norms should approach zero). Use `train_step_with_history` and `summarize_inference_convergence` for detailed analysis.
 
-4. **Monitor state distributions** (`track_state_distributions`) to ensure `z_latent` and `z_mu` values are in the expected range (e.g., [0, 1] for sigmoid).
+4. **Monitor state distributions** (`track_state_distributions` with `distribution_nodes`) to ensure `z_latent` and `z_mu` values are in the expected range (e.g., [0, 1] for sigmoid).
 
 5. **Tune tracking frequency** using `tracking_every_n_batches` and `state_tracking_every_n_infer_steps` to balance detail vs. overhead. Use frequent tracking for debugging and sparser tracking for production runs.
 

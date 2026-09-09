@@ -24,19 +24,28 @@ class TrackingConfig:
     Attributes:
         track_energy: Track energy (batch and epoch level).
         track_accuracy: Track accuracy (epoch level).
-        track_weight_distributions: Track weight distribution histograms.
-        track_state_distributions: Track distribution histograms for z_mu,
-            z_latent, and energy. Summary stats (mean, std, norm) are always
-            collected when state tracking fires.
+        track_weight_distributions: Track weight and bias distribution
+            histograms for ``distribution_nodes`` on every
+            ``tracking_every_n_batches``-th batch.
+        track_state: Track state summary stats (mean, std, L2 norm of
+            z_latent, z_mu, and energy) for ``distribution_nodes`` on every
+            ``tracking_every_n_batches``-th batch.
+        track_state_distributions: Also track full distribution histograms
+            for z_mu, z_latent, and energy; implies ``track_state``.
         track_error: Track prediction error statistics.
-        nodes_to_track: Nodes for per-node tracking. Empty list disables
-            per-node breakdowns (energy, state, inference dynamics).
+        nodes_to_track: Nodes for per-node breakdowns: batch-level per-node
+            energy and inference dynamics. Empty logs no per-node
+            breakdowns.
+        distribution_nodes: Nodes whose weight/bias and state distributions
+            are logged (``track_weight_distributions``, ``track_state``,
+            ``track_state_distributions``). Empty logs no distributions, as
+            an empty ``nodes_to_track`` logs no per-node breakdowns.
         tracking_every_n_batches: How often (in batches) to log weight
             distributions, state stats/distributions, and inference dynamics.
-        tracking_every_n_epochs: How often (in epochs) to log epoch-level
-            metrics such as weight distributions.
-        state_tracking_every_n_infer_steps: Within a tracked batch, how often
-            (in inference steps) to log state. Checked inside track_state().
+        tracking_every_n_epochs: Reserved; read by nothing.
+        state_tracking_every_n_infer_steps: Within a tracked batch, log the
+            state after every this-many inference steps (0, k, 2k, ...).
+            Checked inside track_state().
         experiment_name: Name of the experiment in Aim.
         run_name: Name of this specific run.
     """
@@ -46,9 +55,11 @@ class TrackingConfig:
     track_accuracy: bool = True
     track_error: bool = False
     track_weight_distributions: bool = True
+    track_state: bool = False
     track_state_distributions: bool = False
-    # Node-level filtering (empty = no per-node breakdown)
+    # Node-level filtering (empty = no per-node breakdown / no distributions)
     nodes_to_track: List[str] = field(default_factory=list)
+    distribution_nodes: List[str] = field(default_factory=list)
     # Frequency controls
     tracking_every_n_batches: int = 50
     tracking_every_n_epochs: int = 1
@@ -56,6 +67,15 @@ class TrackingConfig:
     # Naming
     experiment_name: Optional[str] = None
     run_name: Optional[str] = None
+
+    @property
+    def tracks_state(self) -> bool:
+        """True when state tracking has something to log: ``track_state`` or
+        ``track_state_distributions`` is set and ``distribution_nodes`` names
+        at least one node."""
+        return bool(self.distribution_nodes) and (
+            self.track_state or self.track_state_distributions
+        )
 
 
 class AimExperimentTracker:
@@ -67,6 +87,7 @@ class AimExperimentTracker:
     Example:
         tracker = AimExperimentTracker(config=TrackingConfig(
             track_weight_distributions=True,
+            distribution_nodes=["h1", "class"],
             experiment_name="mnist_pcn"
         ))
         tracker.log_hyperparams(train_config)
@@ -74,7 +95,9 @@ class AimExperimentTracker:
         # In training loop:
         tracker.track_batch_energy(energy, epoch=epoch, batch=batch_idx)
         tracker.track_epoch_metrics({"accuracy": acc}, epoch=epoch)
-        tracker.track_weight_distributions(params, structure, epoch=epoch)
+        tracker.track_weight_distributions(
+            params, structure, epoch=epoch, batch=batch_idx
+        )
 
         tracker.close()
     """
@@ -282,22 +305,28 @@ class AimExperimentTracker:
     ) -> None:
         """Track weight distributions using Aim Distribution.
 
+        A no-op unless ``config.track_weight_distributions`` and ``batch`` is
+        a multiple of ``config.tracking_every_n_batches``.
+
         Args:
             params: Current GraphParams.
             structure: GraphStructure.
             epoch: Current epoch.
             batch: Current batch index.
-            nodes: Optional list of nodes to track (default: all).
+            nodes: Nodes to track; defaults to ``config.distribution_nodes``.
+                Empty logs nothing.
         """
         if not self.config.track_weight_distributions:
             return
         if batch % self.config.tracking_every_n_batches != 0:
             return
+        nodes = nodes or self.config.distribution_nodes
+        if not nodes:
+            return
         if not self._ensure_initialized():
             return
 
         aim = get_aim()
-        nodes = nodes or list(params.nodes.keys())
 
         for node_name in nodes:
             node_params = params.nodes[node_name]
@@ -335,28 +364,36 @@ class AimExperimentTracker:
     ) -> None:
         """Track node state summary stats and optional distributions.
 
-        Always logs mean, std, and L2 norm for z_latent, z_mu, and energy.
-        Optionally logs full distribution histograms when
-        ``config.track_state_distributions`` is True.
+        A no-op unless ``config.track_state`` or
+        ``config.track_state_distributions`` is set and there are nodes to
+        log. Logs mean, std, and L2 norm for z_latent, z_mu, and energy; adds
+        full distribution histograms when ``config.track_state_distributions``
+        is True.
 
         Batch-level gating (``tracking_every_n_batches``) is the
         responsibility of the caller.  This method only checks the
         inference-step interval.
 
         Args:
-            state: GraphState after (partial) inference.
+            state: GraphState after ``infer_step`` inference steps.
             epoch: Current epoch.
             batch: Current batch index.
-            infer_step: Current inference step within this batch.
-            nodes: Optional list of nodes to track (default: all).
+            infer_step: Inference steps applied to ``state`` (0 is the
+                initial state).
+            nodes: Nodes to track; defaults to ``config.distribution_nodes``.
+                Empty logs nothing.
         """
+        if not (self.config.track_state or self.config.track_state_distributions):
+            return
         if infer_step % self.config.state_tracking_every_n_infer_steps != 0:
+            return
+        nodes = nodes or self.config.distribution_nodes
+        if not nodes:
             return
         if not self._ensure_initialized():
             return
 
         aim = get_aim()
-        nodes = nodes or list(state.nodes.keys())
 
         state_vars = ("z_latent", "z_mu", "energy")
 

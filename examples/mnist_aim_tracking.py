@@ -138,6 +138,7 @@ if TRACKING_ENABLED:
         track_weight_distributions=True,
         track_state_distributions=True,
         nodes_to_track=["h1", "h2", "h3", "class"],
+        distribution_nodes=["h1", "h2", "h3", "class"],
         tracking_every_n_batches=50,
         state_tracking_every_n_infer_steps=5,
     )

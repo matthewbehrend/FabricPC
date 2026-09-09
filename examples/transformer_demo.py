@@ -40,12 +40,11 @@ M
 """
 
 import argparse
-import math
 import jax
 import jax.numpy as jnp
 import numpy as np
 import time
-from typing import Tuple, Dict, List, Optional, Any
+from typing import Tuple, List
 from tqdm.auto import tqdm
 
 from fabricpc.nodes import (
@@ -69,19 +68,11 @@ from fabricpc.core.initializers import (
 )
 from fabricpc.core.inference import InferenceSGDNormClip
 import optax
-from fabricpc.training import (
-    build_clamps,
-    evaluate,
-    generate,
-    make_train_step,
-)
-from fabricpc.graph_initialization import initialize_graph_state
-from fabricpc.utils.dashboarding.inference_tracking import (
-    run_inference_with_full_history,
-)
+from fabricpc.training import EpochContext, evaluate, generate, train
 from fabricpc.utils.dashboarding import (
     AimExperimentTracker,
     TrackingConfig,
+    create_iter_callback,
     is_aim_available,
 )
 from fabricpc.utils.data import CharDataLoader
@@ -140,6 +131,11 @@ def parse_args():
         help="Peak learning rate (default: 3e-5 for pc, 1e-4 for backprop)",
     )
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
+    parser.add_argument(
+        "--tracking",
+        action="store_true",
+        help="Use Aim tracking for metrics and distributions. Requires Aim installed and running. Run `aim up` in a separate terminal to start the Aim server.",
+    )
     args = parser.parse_args()
     if args.lr is None:
         # Gradients are means per token, so the 0.8 clip no longer normalizes
@@ -296,46 +292,6 @@ def generate_text(
 # --- Main Experiment ---
 
 
-class TrainingProgressBar:
-    """Manage per-epoch tqdm bars during training."""
-
-    def __init__(self, total_batches: int, num_epochs: float, mode_label: str):
-        self.total_batches = total_batches
-        self.num_epochs = num_epochs
-        self.mode_label = mode_label
-        self.current_epoch: Optional[int] = None
-        self._bar: Optional[Any] = None
-
-    def _open_epoch_bar(self, epoch_idx: int):
-        self.close()
-        self.current_epoch = epoch_idx
-        self._bar = tqdm(
-            total=self.total_batches,
-            desc=f"{self.mode_label} Epoch {epoch_idx + 1}/{math.ceil(self.num_epochs)}",
-            dynamic_ncols=True,
-            leave=False,
-        )
-
-    def update(self, epoch_idx: int, metrics: Dict[str, float]):
-        if self.current_epoch != epoch_idx:
-            self._open_epoch_bar(epoch_idx)
-
-        if self._bar is None:
-            return
-
-        self._bar.update(1)
-        formatted_metrics = {
-            key: f"{value:.2f}" if key == "ppl" else f"{value:.4f}"
-            for key, value in metrics.items()
-        }
-        self._bar.set_postfix(formatted_metrics, refresh=False)
-
-    def close(self):
-        if self._bar is not None:
-            self._bar.close()
-            self._bar = None
-
-
 def main(args=None):
     if args is None:
         args = parse_args()
@@ -400,7 +356,7 @@ def main(args=None):
     print(f"Total parameters: {total_params:,}")
 
     # Aim tracking (optional)
-    if is_aim_available():
+    if is_aim_available() and args.tracking:
         tracking_config = TrackingConfig(
             experiment_name="transformer_pc_shakespeare",
             run_name=f"{'PC' if use_pc else 'BP'}_{args.num_blocks}blk_{args.embed_dim}d",
@@ -408,6 +364,7 @@ def main(args=None):
             track_weight_distributions=True,
             track_state_distributions=True,
             nodes_to_track=TRACKED_NODES,
+            distribution_nodes=TRACKED_NODES,
             tracking_every_n_batches=50,
             state_tracking_every_n_infer_steps=5,
         )
@@ -449,15 +406,14 @@ def main(args=None):
     )
     train_config = {"num_epochs": args.num_epochs}
 
-    def eval_callback(epoch_idx, params, structure, config, rng_key):
-        eval_rng = jax.random.fold_in(rng_key, epoch_idx)
+    def epoch_callback(ctx: EpochContext):
         metrics = evaluate(
-            params,
-            structure,
+            ctx.params,
+            ctx.structure,
             test_batches,
             {},
-            eval_rng,
-            algorithm="pc" if use_pc else "backprop",
+            ctx.epoch_key,
+            algorithm=ctx.algorithm,
         )
         tqdm.write(
             f"  Test - Loss: {metrics['cross_entropy']:.4f}, "
@@ -466,137 +422,36 @@ def main(args=None):
         )
         return metrics
 
-    progress_bar = TrainingProgressBar(
-        total_batches=len(train_batches),
-        num_epochs=args.num_epochs,
-        mode_label="PC" if use_pc else "BP",
-    )
-
-    def create_iter_callback(use_pc_mode: bool):
-        if use_pc_mode:
-
-            def iter_callback(epoch_idx, batch_idx, energy):
-                del batch_idx
-                energy_value = float(energy)
-                progress_bar.update(epoch_idx, {"energy": energy_value})
-                return energy_value
-
-        else:
-
-            def iter_callback(epoch_idx, batch_idx, loss):
-                del batch_idx
-                loss_value = float(loss)
-                perplexity = float(np.exp(loss_value))
-                progress_bar.update(epoch_idx, {"loss": loss_value, "ppl": perplexity})
-                return loss_value
-
-        return iter_callback
-
-    iter_callback = create_iter_callback(use_pc)
-
     print(
         f"\nTraining ({'PC' if use_pc else 'Backprop'}, {args.num_epochs} epochs, lr={args.lr})..."
     )
 
     start_time = time.time()
 
-    opt_state = optimizer.init(params)
-
-    num_epochs = train_config["num_epochs"]
-    total_epochs = math.ceil(num_epochs)
-    frac = num_epochs - math.floor(num_epochs)
-
-    # The custom loop (Aim tracking needs the final state) runs on the public
-    # jitted step, which returns it.
-    train_step = make_train_step(
-        structure, optimizer, algorithm="pc" if use_pc else "backprop"
+    # train's tqdm bar shows the per-batch energy: the internal energy per
+    # token under PC, the per-token cross-entropy (target_energy under
+    # CrossEntropyEnergy) under backprop. The tracking callback logs energy,
+    # per-node energy for nodes_to_track, weight distributions for
+    # distribution_nodes and, on tracked batches under PC, the states of a
+    # jitted re-settle every state_tracking_every_n_infer_steps steps, as
+    # tracking_config asks. Per-batch keys follow the trainer's fold_in
+    # stream.
+    result = train(
+        params,
+        structure,
+        train_batches,
+        optimizer,
+        train_config,
+        train_key,
+        algorithm="pc" if use_pc else "backprop",
+        verbose=True,
+        iter_callback=create_iter_callback(tracker) if tracker is not None else None,
+        epoch_callback=epoch_callback,
     )
+    energy_history = result.iter_results
+    eval_results = result.epoch_results
 
-    energy_history = []
-    eval_results = []
-
-    try:
-        for epoch in range(total_epochs):
-            num_batches = len(train_batches)
-            is_last = epoch == total_epochs - 1
-            max_batches = (
-                round(frac * num_batches) if (is_last and frac > 0) else num_batches
-            )
-
-            epoch_rng, train_key = jax.random.split(train_key)
-            batch_keys = jax.random.split(epoch_rng, max_batches)
-
-            batch_energies = []
-            for batch_idx, batch_data in enumerate(train_batches):
-                if batch_idx >= max_batches:
-                    break
-
-                batch = {k: jnp.array(v) for k, v in batch_data.items()}
-
-                params, opt_state, metrics, final_state = train_step(
-                    params, opt_state, batch, batch_keys[batch_idx]
-                )
-                # PC tracks the settling objective (internal energy per
-                # token); backprop tracks the per-token cross-entropy
-                # (target_energy under CrossEntropyEnergy). Both are means
-                # over the batch's B * seq_len prediction positions.
-                loss_val = float(
-                    metrics["energy"] if use_pc else metrics["target_energy"]
-                )
-
-                iter_callback(epoch, batch_idx, loss_val)
-                batch_energies.append(loss_val)
-
-                if tracker is not None:
-                    tracker.track_batch_energy(loss_val, epoch=epoch, batch=batch_idx)
-                    tracker.track_weight_distributions(
-                        params,
-                        structure,
-                        epoch=epoch,
-                        batch=batch_idx,
-                        nodes=TRACKED_NODES,
-                    )
-
-                    should_track_state = (
-                        use_pc
-                        and batch_idx % tracker.config.tracking_every_n_batches == 0
-                    )
-                    if should_track_state:
-                        track_clamps = build_clamps(batch, structure, clamp_target=True)
-                        track_init_state = initialize_graph_state(
-                            structure,
-                            batch["x"].shape[0],
-                            batch_keys[batch_idx],
-                            clamps=track_clamps,
-                            params=params,
-                        )
-                        _, state_history = run_inference_with_full_history(
-                            params, track_init_state, track_clamps, structure
-                        )
-                        for infer_step_idx, step_state in enumerate(state_history):
-                            tracker.track_state(
-                                step_state,
-                                epoch=epoch,
-                                batch=batch_idx,
-                                infer_step=infer_step_idx,
-                                nodes=TRACKED_NODES,
-                            )
-
-            energy_history.append(batch_energies)
-
-            eval_results.append(
-                eval_callback(epoch, params, structure, train_config, train_key)
-            )
-
-            if batch_energies:
-                avg_loss = sum(batch_energies) / len(batch_energies)
-                tqdm.write(
-                    f"  Train Epoch {epoch + 1}/{total_epochs}, Avg loss: {avg_loss:.4f}"
-                )
-    finally:
-        progress_bar.close()
-
-    trained_params = params
+    trained_params = result.params
     train_time = time.time() - start_time
 
     print(
@@ -635,7 +490,7 @@ def main(args=None):
         tracker.close()
 
     # Results
-    print(f"\nFinal train energy: {energy_history[-1][-1]:.4f}")
+    print(f"\nFinal train energy: {energy_history[-1][-1]['energy']:.4f}")
     if eval_results and eval_results[-1]:
         final_eval = eval_results[-1]
         print(

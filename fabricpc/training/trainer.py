@@ -105,10 +105,11 @@ class TrainResult(NamedTuple):
 class EpochContext(NamedTuple):
     """Context passed to ``epoch_callback`` at the end of each epoch.
 
-    Grows by field addition, never by positional breakage — read fields by
-    name. ``metrics`` holds the epoch means of the per-batch training
-    metrics. ``rng_key`` is the base training key; derive per-epoch keys via
-    ``jax.random.fold_in(rng_key, epoch_idx)``.
+    Grows by field addition at the end, never by positional breakage — read
+    fields by name. ``metrics`` holds the epoch means of the per-batch
+    training metrics. ``rng_key`` is the base training key and ``epoch_key``
+    is ``fold_in(rng_key, epoch_idx)``, the key this epoch's batch keys
+    derive from. ``algorithm`` is the ``algorithm`` passed to :func:`train`.
 
     Note: the internal training step donates the params/opt_state buffers,
     so ``params``/``opt_state`` are valid during the callback but must be
@@ -124,6 +125,47 @@ class EpochContext(NamedTuple):
     config: dict
     rng_key: jax.Array
     metrics: Dict[str, float]
+    algorithm: Algorithm
+    epoch_key: jax.Array
+
+
+class IterContext(NamedTuple):
+    """Context passed to ``iter_callback`` after each batch's update.
+
+    A superset of :class:`EpochContext`: its fields first, in its order, then
+    the per-batch ones. Grows by field addition at the end, never by
+    positional breakage — read fields by name.
+
+    ``step`` counts optimizer updates applied in this :func:`train` call,
+    this batch included. ``state`` is the GraphState the step produced for
+    this batch: the settled latents under PC, the feedforward pass under
+    backprop. ``batch`` is the converted batch dict fed to the step
+    (task-mapped keys; under ``mesh`` its arrays carry the ``P("data")``
+    sharding) and ``batch_key`` (``fold_in(epoch_key, batch_idx)``) is the
+    key the step used for latent initialization. ``metrics`` holds this
+    batch's float metrics.
+
+    Buffer lifetimes: ``params``/``opt_state`` are donated by the next step,
+    so copy them if retained past the callback (the ``EpochContext`` caveat).
+    ``state`` and ``batch`` are not donated; the trainer drops its own
+    reference to ``state`` as soon as the callback returns, so retaining it
+    keeps exactly that one GraphState alive and not retaining it frees it.
+    """
+
+    epoch_idx: int
+    step: int
+    params: GraphParams
+    opt_state: optax.OptState
+    structure: GraphStructure
+    config: dict
+    rng_key: jax.Array
+    metrics: Dict[str, float]
+    algorithm: Algorithm
+    epoch_key: jax.Array
+    batch_idx: int
+    state: GraphState
+    batch_key: jax.Array
+    batch: Dict[str, jnp.ndarray]
 
 
 # ---------------------------------------------------------------------------
@@ -395,10 +437,11 @@ def _batch_grads(params, batch, structure, rng_key, *, algorithm):
 def _make_step(structure, optimizer, *, algorithm, with_state, donate):
     """Build the jitted per-batch step.
 
-    ``with_state=True`` returns the final GraphState (public escape hatch);
-    ``donate=True`` donates the params/opt_state buffers
-    (``donate_argnums=(0, 1)``) — used by the internal loop, where
-    ``final_state`` is dropped so donation removes a full extra
+    ``with_state=True`` returns the final GraphState: :func:`make_train_step`
+    always does, and :func:`train` does when an ``iter_callback`` is supplied
+    so the callback's :class:`IterContext` can carry it. ``donate=True``
+    donates the params/opt_state buffers (``donate_argnums=(0, 1)``) — used
+    by the internal loop, where donation removes a full extra
     params+opt_state copy from peak memory.
     """
 
@@ -472,8 +515,8 @@ def train(
     start_epoch: int = 0,
     mesh: Optional[Mesh] = None,
     verbose: bool = True,
-    epoch_callback: Optional[Callable] = None,
-    iter_callback: Optional[Callable] = None,
+    epoch_callback: Optional[Callable[[EpochContext], Any]] = None,
+    iter_callback: Optional[Callable[[IterContext], Any]] = None,
 ) -> TrainResult:
     """Train a FabricPC graph with PC or backprop.
 
@@ -509,10 +552,11 @@ def train(
         epoch_callback: ``(ctx: EpochContext) -> Any``; a non-None return
             replaces that epoch's ``epoch_results`` entry. Exceptions
             propagate (tuner pruning depends on this).
-        iter_callback: ``(epoch_idx, batch_idx, metrics: Dict[str, float])
-            -> Any``; a non-None return replaces that batch's
-            ``iter_results`` entry. Supplying it forces a per-batch device
-            sync. Exceptions propagate.
+        iter_callback: ``(ctx: IterContext) -> Any``; a non-None return
+            replaces that batch's ``iter_results`` entry. Supplying it
+            forces a per-batch device sync and makes the internal step
+            return the batch's GraphState for ``ctx.state``. Exceptions
+            propagate.
 
     Returns:
         :class:`TrainResult` — pass ``result.opt_state`` and
@@ -538,8 +582,11 @@ def train(
         params = jax.device_put(params, replicated)
         opt_state = jax.device_put(opt_state, replicated)
 
+    # The step returns the batch's GraphState only when a callback will read
+    # it; without one the state is dropped inside the step.
+    with_state = iter_callback is not None
     step_fn = _make_step(
-        structure, optimizer, algorithm=algorithm, with_state=False, donate=True
+        structure, optimizer, algorithm=algorithm, with_state=with_state, donate=True
     )
 
     if "num_epochs" not in config:
@@ -603,7 +650,15 @@ def train(
                     continue
                 batch = {k: jax.device_put(v, batch_sharding) for k, v in batch.items()}
             batch_key = jax.random.fold_in(epoch_key, batch_idx)
-            params, opt_state, metrics = step_fn(params, opt_state, batch, batch_key)
+            if with_state:
+                params, opt_state, metrics, state = step_fn(
+                    params, opt_state, batch, batch_key
+                )
+            else:
+                params, opt_state, metrics = step_fn(
+                    params, opt_state, batch, batch_key
+                )
+                state = None
             step += 1
             batches_run += 1
             epoch_sums = (
@@ -621,12 +676,33 @@ def train(
                     )
                 stored: Any = float_metrics
                 if iter_callback is not None:
-                    replaced = iter_callback(epoch_idx, batch_idx, float_metrics)
+                    ctx = IterContext(
+                        epoch_idx=epoch_idx,
+                        batch_idx=batch_idx,
+                        step=step,
+                        params=params,
+                        opt_state=opt_state,
+                        state=state,
+                        structure=structure,
+                        config=config,
+                        algorithm=algorithm,
+                        rng_key=rng_key,
+                        epoch_key=epoch_key,
+                        batch_key=batch_key,
+                        batch=batch,
+                        metrics=float_metrics,
+                    )
+                    replaced = iter_callback(ctx)
                     if replaced is not None:
                         stored = replaced
+                    del ctx
                 batch_metrics.append(stored)
             else:
                 batch_metrics.append(metrics)
+            # The context and this name were the trainer's only references to
+            # the batch's GraphState; dropping both frees its device buffers
+            # unless the callback retained them.
+            del state
             progress.update(1)
 
         # Epoch boundary: materialize device scalars to floats.
@@ -641,17 +717,19 @@ def train(
         )
         entry: Any = epoch_means
         if epoch_callback is not None:
-            ctx = EpochContext(
+            epoch_ctx = EpochContext(
                 epoch_idx=epoch_idx,
                 step=step,
                 params=params,
                 opt_state=opt_state,
                 structure=structure,
                 config=config,
+                algorithm=algorithm,
                 rng_key=rng_key,
+                epoch_key=epoch_key,
                 metrics=epoch_means,
             )
-            replaced = epoch_callback(ctx)
+            replaced = epoch_callback(epoch_ctx)
             if replaced is not None:
                 entry = replaced
         epoch_results.append(entry)

@@ -47,7 +47,7 @@ import argparse
 import jax
 import jax.numpy as jnp
 from fabricpc.graph_initialization import initialize_params
-from fabricpc.training import train, evaluate, generate
+from fabricpc.training import evaluate, generate, IterContext, train
 from fabricpc.core.inference import InferenceSGDNormClip
 from fabricpc.models import create_deep_transformer
 from fabricpc.utils.data import CharDataLoader, BpeDataLoader
@@ -266,11 +266,11 @@ def main(args=None):
     print(f"Vocab Size: {vocab_size}")
     start = time.time()
 
-    def iter_callback(epoch_idx, batch_idx, metrics):
-        if args.verbose and (batch_idx + 1) % 50 == 0:
+    def iter_callback(ctx: IterContext):
+        if args.verbose and (ctx.batch_idx + 1) % 50 == 0:
             print(
-                f"Epoch {epoch_idx + 1} | Batch {batch_idx + 1} | "
-                f"Energy: {metrics['energy']:.4f}"
+                f"Epoch {ctx.epoch_idx + 1} | Batch {ctx.batch_idx + 1} | "
+                f"Energy: {ctx.metrics['energy']:.4f}"
             )
 
     result = train(

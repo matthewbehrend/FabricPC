@@ -4,7 +4,7 @@ This module provides alternative inference and training functions that
 collect intermediate states for detailed tracking and debugging.
 """
 
-from typing import Dict, List, Tuple, cast
+from typing import Callable, Dict, List, Tuple, cast
 import jax
 import jax.numpy as jnp
 import optax
@@ -125,41 +125,62 @@ def _unstack_metrics(
     return history
 
 
-def run_inference_with_full_history(
-    params: GraphParams,
-    initial_state: GraphState,
-    clamps: Dict[str, jnp.ndarray],
-    structure: GraphStructure,
-) -> Tuple[GraphState, List[GraphState]]:
-    """Run inference and collect full GraphState at each step.
+def make_inference_history(
+    structure: GraphStructure, *, every: int = 1
+) -> Callable[
+    [GraphParams, GraphState, Dict[str, jnp.ndarray]], Tuple[GraphState, GraphState]
+]:
+    """Build a jitted settle that also returns the states at inference steps
+    ``0, every, 2*every, ...`` up to ``infer_steps``.
 
-    Warning: This is memory-intensive. Use run_inference_with_history
-    for most tracking needs.
+    Returns ``history(params, initial_state, clamps) -> (final_state,
+    states)``. ``final_state`` is the settle after ``infer_steps`` steps, the
+    same state :func:`fabricpc.core.inference.run_inference` returns.
+    ``states`` is a GraphState pytree whose every leaf carries a new leading
+    axis of length ``infer_steps // every + 1``: index ``i`` is the state
+    after ``i * every`` inference steps, so index 0 is ``initial_state`` and,
+    when ``infer_steps`` is a multiple of ``every``, the last index is
+    ``final_state``. Read step ``i`` with
+    ``jax.tree_util.tree_map(lambda a: a[i], states)``.
 
-    Args:
-        params: Model parameters.
-        initial_state: Initial graph state.
-        clamps: Dictionary of clamped values.
-        structure: Graph structure.
-
-    Returns:
-        Tuple of (final_state, state_history) where state_history
-        is a list of GraphState objects.
+    The loop is a ``lax.scan`` over blocks of ``every`` steps, each block a
+    ``fori_loop``, so the compiled program holds the sampled states only, not
+    one per step, and the whole settle is one XLA program. Build once per
+    structure and reuse the returned function; each factory call compiles
+    anew on its first invocation.
     """
-    # Get infer_steps from structure's inference config
+    if every < 1:
+        raise ValueError(f"every must be >= 1, got {every}")
     inference_obj = structure.config["inference"]
     inference_cls = type(inference_obj)
     config = inference_obj.config
     infer_steps = config["infer_steps"]
+    n_blocks, remainder = divmod(infer_steps, every)
 
-    history: List[GraphState] = []
-    state = initial_state
+    def history(
+        params: GraphParams,
+        initial_state: GraphState,
+        clamps: Dict[str, jnp.ndarray],
+    ) -> Tuple[GraphState, GraphState]:
+        def step(_t, state):
+            return inference_cls.inference_step(
+                params, state, clamps, structure, config
+            )
 
-    for _ in range(infer_steps):
-        state = inference_cls.inference_step(params, state, clamps, structure, config)
-        history.append(state)
+        def block(state, _):
+            state = jax.lax.fori_loop(0, every, step, state)
+            return state, state
 
-    return state, history
+        state, sampled = jax.lax.scan(block, initial_state, xs=None, length=n_blocks)
+        final_state = jax.lax.fori_loop(0, remainder, step, state)
+        states = jax.tree_util.tree_map(
+            lambda first, rest: jnp.concatenate([first[None], rest]),
+            initial_state,
+            sampled,
+        )
+        return final_state, states
+
+    return jax.jit(history)
 
 
 def train_step_with_history(

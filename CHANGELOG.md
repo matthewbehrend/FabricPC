@@ -1,5 +1,41 @@
 # Changelog
 
+## [0.5.2] - 2026-09-08
+
+Per-batch diagnostics run as `train` callbacks instead of custom training
+loops. `iter_callback` now receives one `IterContext` carrying the parameters,
+optimizer state, the batch, its RNG key, and the step's `GraphState`.
+The dashboarding callbacks run on `train`.
+
+### Migration table
+
+| Changed | Replacement |
+|---|---|
+| `iter_callback(epoch_idx, batch_idx, metrics)` | `iter_callback(ctx: IterContext)`; read `ctx.epoch_idx`, `ctx.batch_idx`, `ctx.metrics` |
+| `create_detailed_iter_callback` in a custom loop | `train(..., iter_callback=create_iter_callback(tracker))` with `TrackingConfig(track_state=True, distribution_nodes=[...])` |
+| Weight histograms logged once per epoch for every node | logged every `tracking_every_n_batches` for `distribution_nodes` only. Set it, or no weight or state distributions are logged |
+| `run_inference_with_full_history` | `make_inference_history(structure, every=k)`, jitted |
+| Hand-built `EpochContext(...)` | add `algorithm` and `epoch_key` |
+
+### New
+
+- `IterContext`: superset of the `EpochContext` fields, then `batch_idx`, `state`,
+  `batch_key`, `batch`. `EpochContext` gains `algorithm` and `epoch_key`.
+  New fields are appended; existing positions do not move.
+- `TrackingConfig.distribution_nodes`: the nodes whose weight and state
+  distributions are logged. Empty logs none, as an empty `nodes_to_track`
+  logs no per-node energy.
+- `TrackingConfig.track_state`: state summary statistics on tracked batches;
+  `track_state_distributions` implies it. Under PC the callback re-settles
+  the tracked batch under the updated parameters in one jitted program and
+  logs the state after `0, k, 2k, ...` inference steps
+  (`k = state_tracking_every_n_infer_steps`), the last being the settled
+  state. Under backprop it logs the feedforward state once.
+- `make_inference_history` and `make_tracked_settle` in
+  `fabricpc.utils.dashboarding`: the jitted re-settle, usable from custom
+  loops.
+- `BayesianTuner` passes its progress callback only when `verbose=True`.
+
 ## [0.5.1] - 2026-09-07
 
 Gradients reaching optax are now means per prediction under both algorithms.
