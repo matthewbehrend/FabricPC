@@ -118,27 +118,18 @@ class SkipConnection(NodeBase):
         return NodeParams(weights={}, biases={})
 
     @staticmethod
-    def forward(
+    def predict(
         params: NodeParams,
         inputs: Dict[str, jnp.ndarray],
         state: NodeState,
         node_info: NodeInfo,
-    ) -> NodeState:
+    ) -> Tuple[jnp.ndarray, None]:
         """Sum all inputs from both slots and pass through (no transformation)."""
-        pre_activation = None
+        z_mu = None
         for edge_key, x in inputs.items():
-            if pre_activation is None:
-                pre_activation = x
+            if z_mu is None:
+                z_mu = x
             else:
-                pre_activation = pre_activation + x
-
-        z_mu = pre_activation  # no activation function applied: z_mu = pre_activation
-        error = state.z_latent - z_mu
-        state = state._replace(
-            z_mu=z_mu,
-            error=error,
-        )
-
-        node_class = node_info.node_class
-        state = node_class.energy_functional(state, node_info)
-        return state
+                z_mu = z_mu + x
+        # no activation function applied: z_mu is the plain sum
+        return z_mu, None

@@ -2,6 +2,17 @@
 
 All node types extend `NodeBase` from `fabricpc.nodes.base`.
 
+## The node contract
+
+A node implements two computation methods:
+
+- **`predict(params, inputs, state, node_info) -> (z_mu, aux)`** — all parameterized computation: the prediction `z_mu` (shape `(batch,) + node_info.shape`) plus `aux`, an arbitrary pytree of intermediates for `energy()` (`None` if unused). `predict` must not read `state.z_latent` values (shape/dtype reads are fine): the state-based solvers differentiate through such a read while `EPCInference` evaluates `z_mu` at the carried latent, so the two solver families would minimize different energies.
+- **`energy(params, inputs, state, aux, node_info) -> (batch,)`** — per-sample energy at `(state.z_latent, state.z_mu)`. The default scores the node's energy functional; override to add terms (`StorkeyHopfield`'s attractor term). aux is `None` on source nodes (`predict` never ran); an override must tolerate it — typically by returning the base energy when its extra term needs parameters a source cannot have.
+
+Everything else is base-owned and **not an override point**: the error pair (`pair_error`: `error = z_latent - z_mu`; `pair_latent`: `z_latent = z_mu + error` — one volume-preserving bijection shared by both inference parameterizations) and the assembly templates `forward` (predict → pair → energy), `forward_with_aux` (also surfacing `aux`), and `forward_from_error` (the ePC derive direction). Source nodes (`in_degree == 0`) never reach `predict`: in the sPC direction the templates mirror `z_mu <- z_latent` (cast to `z_mu`'s float dtype) with zero error, while `forward_from_error` derives an unclamped source's `z_latent = z_mu + error` with `z_mu` held fixed.
+
+**The aux pattern.** aux carries intermediates that depend only on `params` and `inputs`: `Linear` returns its `pre_activation` (consumed by `LinearExplicitGrad`'s analytic gradients); `StorkeyHopfield` returns its prepared `(W, strength)`. An energy term that needs the node's own `z_latent` reads `state.z_latent` inside `energy()` — the `StorkeyHopfield` attractor term is the worked example. **The anti-pattern**: an aux entry computed from `state.z_latent` in `predict`. aux is snapshotted at `predict` time — under ePC, before `z_latent` is derived — so such an entry freezes the carried latent into an energy otherwise evaluated at the derived latent, and the two solvers minimize different energies. See the [Writing Custom Nodes guide](06_custom_nodes.md#the-aux-pattern).
+
 ## Linear
 
 `fabricpc.nodes.Linear`
@@ -247,7 +258,7 @@ conv1 = ConvNode(
 | `shape` | `Tuple[int, ...]` | required | Output shape excluding batch: `(spatial..., C_out)` |
 | `name` | `str` | required | Node name |
 | `kernel_size` | `Tuple[int, ...]` | required | Window extent per spatial axis |
-| `stride` | `Tuple[int, ...]` | all ones | Step per spatial axis |
+| `stride` | `Tuple[int, ...]` | `None` | Step per spatial axis; `None` means 1 on every spatial axis |
 | `padding` | `str` or pairs | `"SAME"` | `"SAME"`, `"VALID"`, or explicit `(low, high)` pairs per spatial axis |
 | `activation` | `ActivationBase` | `ReLUActivation()` | Activation function |
 | `energy` | `EnergyFunctional` | `GaussianEnergy()` | Energy functional |
@@ -289,7 +300,7 @@ pool1 = MaxPool(
 | `shape` | `Tuple[int, ...]` | required | Output shape excluding batch: `(spatial..., C)` |
 | `name` | `str` | required | Node name |
 | `window_shape` | `Tuple[int, ...]` | required | Window extent per spatial axis |
-| `stride` | `Tuple[int, ...]` | `window_shape` | Step per spatial axis; the default gives non-overlapping windows |
+| `stride` | `Tuple[int, ...]` | `None` | Step per spatial axis; `None` uses `window_shape` (non-overlapping windows) |
 | `padding` | `str` or pairs | `"VALID"` | `"SAME"`, `"VALID"`, or explicit `(low, high)` pairs. Note: default differs from ConvNode's `"SAME"` |
 | `activation` | `ActivationBase` | `IdentityActivation()` | Activation function |
 | `energy` | `EnergyFunctional` | `GaussianEnergy()` | Energy functional |
@@ -324,7 +335,7 @@ avgpool = AvgPool(shape=(256,), name="avgpool", global_pool=True)
 | `shape` | `Tuple[int, ...]` | required | Output shape excluding batch. Rank-1 `(C,)` required when `global_pool=True`; construction raises `ValueError` otherwise |
 | `name` | `str` | required | Node name |
 | `window_shape` | `Tuple[int, ...]` | `None` | Window extent per spatial axis (windowed mode) |
-| `stride` | `Tuple[int, ...]` | `window_shape` | Step per spatial axis |
+| `stride` | `Tuple[int, ...]` | `None` | Step per spatial axis; `None` uses `window_shape` (non-overlapping windows) |
 | `padding` | `str` or pairs | `"VALID"` | `"SAME"`, `"VALID"`, or explicit `(low, high)` pairs |
 | `global_pool` | `bool` | `False` | Average over all spatial axes instead of windows |
 | `count_include_pad` | `bool` | `True` | Divide by the full window volume; `False` divides by the count of real (non-padding) elements |
@@ -365,7 +376,7 @@ block = TransformerBlock(
 | `energy` | `EnergyFunctional` | `GaussianEnergy()` | Energy functional |
 | `internal_activation` | `ActivationBase` | `GeluActivation()` | FFN internal activation |
 | `num_heads` | `int` | `8` | Number of attention heads |
-| `ff_dim` | `int` | `4 * embed_dim` | Feedforward hidden dimension |
+| `ff_dim` | `int` | `None` | Feedforward hidden dimension; `None` means `4 * embed_dim` |
 | `dropout_rate` | `float` | `0.0` | Dropout rate (currently unused) |
 | `pre_norm` | `bool` | `True` | Use pre-norm architecture |
 | `use_rope` | `bool` | `True` | Use Rotary Position Embeddings |

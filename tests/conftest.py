@@ -31,10 +31,25 @@ def rng_key():
     return jax.random.PRNGKey(42)
 
 
-def with_inference(structure, **kwargs):
-    """Return structure with modified inference config for testing."""
+def total_energy(state, structure):
+    """Total energy over in_degree > 0 nodes (the set the training loop sums)."""
+    return sum(
+        jnp.sum(state.nodes[name].energy)
+        for name in structure.nodes
+        if structure.nodes[name].node_info.in_degree > 0
+    )
+
+
+def with_inference(structure, inference=None, **kwargs):
+    """Return structure with modified inference config for testing.
+
+    Pass an ``InferenceBase`` object via ``inference``, or keyword arguments
+    to construct an ``InferenceSGD``.
+    """
     new_config = dict(structure.config)
-    new_config["inference"] = InferenceSGD(**kwargs)
+    new_config["inference"] = (
+        inference if inference is not None else InferenceSGD(**kwargs)
+    )
     return structure._replace(config=new_config)
 
 
@@ -84,3 +99,23 @@ def make_classification_structure(
         inference=InferenceSGD(eta_infer=0.05, infer_steps=10),
         graph_state_initializer=state_initializer,
     )
+
+
+def inject_biases(params, key, std=0.5):
+    """Return ``params`` with every ``"b"`` bias drawn from N(0, std²).
+
+    ``Linear.initialize_params`` zero-fills biases (``nodes/linear.py:191``),
+    so ``use_bias=True`` alone exercises no bias path; tests that need
+    nonzero biases draw them here.
+    """
+    from fabricpc.core.types import GraphParams, NodeParams
+
+    nodes = {}
+    for i, (name, node_params) in enumerate(params.nodes.items()):
+        biases = dict(node_params.biases)
+        if "b" in biases and biases["b"].size > 0:
+            biases["b"] = std * jax.random.normal(
+                jax.random.fold_in(key, i), biases["b"].shape
+            )
+        nodes[name] = NodeParams(weights=node_params.weights, biases=biases)
+    return GraphParams(nodes=nodes)

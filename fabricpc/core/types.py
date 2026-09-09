@@ -115,16 +115,21 @@ class NodeState(NamedTuple):
     Attributes:
         z_latent: Latent states (what the network infers)
         z_mu: Predicted expectations (what the network predicts)
-        error: Prediction errors (z_latent - z_mu)
+        error: Prediction errors (z_latent - z_mu); under ``EPCInference``
+            the first-class relaxed variable ε, with z_latent derived as
+            z_mu + ε
         energy: Energy
-        latent_grad: Gradients w.r.t. latent states for inference updates
+        latent_grad: Gradient accumulator for inference updates — under
+            state-based solvers the one-hop accumulated dE/dz_latent; under
+            ``EPCInference`` the gradient of the total energy w.r.t. ε
+            through the full derived forward
     """
 
     z_latent: jnp.ndarray
     z_mu: jnp.ndarray
     error: jnp.ndarray
     energy: jnp.ndarray  # per-sample energy, shape (batch_size,)
-    latent_grad: jnp.ndarray  # For local gradient accumulation
+    latent_grad: jnp.ndarray  # accumulator: sPC dE/dz_latent, ePC dE/depsilon
 
 
 class GraphState(NamedTuple):
@@ -156,14 +161,17 @@ class GraphStructure(NamedTuple):
         nodes: Dictionary mapping node names to NodeBase instances (with node_info attribute)
         edges: Dictionary mapping edge keys to EdgeInfo
         task_map: Dictionary mapping task names to node names
-        node_order: Topological order for forward pass
+        node_order: Unique topological node order — first_occurrence_order(schedule)
+        schedule: Full node visit schedule; on cyclic graphs built with
+            graph(..., unroll=U), cycle members repeat U times
         config: Graph configuration
     """
 
     nodes: Dict[str, Any]  # Dict[str, NodeBase] - node instances with node_info
     edges: Dict[str, EdgeInfo]
     task_map: Dict[str, str]
-    node_order: Tuple[str, ...]  # Topological sort for inference
+    node_order: Tuple[str, ...]  # Unique node order (one entry per node)
+    schedule: Tuple[str, ...]  # Visit schedule (cycle members may repeat)
     config: Dict[str, Any]  # Graph configuration
 
     def __repr__(self) -> str:
@@ -212,6 +220,11 @@ tree_util.register_pytree_node(
 # GraphStructure is static, so we register it as having no dynamic components
 tree_util.register_pytree_node(
     GraphStructure,
-    lambda gs: ((), (gs.nodes, gs.edges, gs.task_map, gs.node_order, gs.config)),
+    # Aux tuple order must match the NamedTuple field order: the unflatten
+    # below rebuilds positionally.
+    lambda gs: (
+        (),
+        (gs.nodes, gs.edges, gs.task_map, gs.node_order, gs.schedule, gs.config),
+    ),
     lambda aux, _: GraphStructure(*aux),  # Reconstruct from aux data
 )

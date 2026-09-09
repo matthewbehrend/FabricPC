@@ -57,9 +57,7 @@ def _force_self_grad_scale(structure, scale=_NONUNITY_SELF_GRAD_SCALE):
     """Return a new GraphStructure where every non-input node has a
     MuPCScalingFactors with ``self_grad_scale = scale`` and unit forward /
     topdown / weight scaling. This isolates the order-dependent bug from
-    muPC's hard-coded ``self_grad_scale = 1.0`` (which masks it) and from
-    cyclic-graph cases where compute_mupc_scalings returns None for
-    non-orderable nodes.
+    muPC's hard-coded ``self_grad_scale = 1.0`` (which masks it).
     """
     new_nodes = {}
     for name, node in structure.nodes.items():
@@ -102,7 +100,7 @@ def _build_chain(insertion_order, scaling=None):
     )
 
 
-def _build_cycle(insertion_order, scaling=None):
+def _build_cycle(insertion_order, scaling=None, unroll=1):
     """Build x -> a <-> b -> y with a 2-node cycle in the middle."""
     w_init = NormalInitializer(std=0.1)
     x = IdentityNode(shape=(6,), name="x")
@@ -123,6 +121,7 @@ def _build_cycle(insertion_order, scaling=None):
         task_map=TaskMap(x=x, y=y),
         inference=InferenceSGD(eta_infer=0.05, infer_steps=1),
         scaling=scaling,
+        unroll=unroll,
     )
 
 

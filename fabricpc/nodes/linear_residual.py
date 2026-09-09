@@ -149,14 +149,14 @@ class LinearResidual(FlattenInputMixin, NodeBase):
         return NodeParams(weights=weights_dict, biases={"b": b} if use_bias else {})
 
     @staticmethod
-    def forward(
+    def predict(
         params: NodeParams,
         inputs: Dict[str, jnp.ndarray],
         state: NodeState,
         node_info: NodeInfo,
-    ) -> NodeState:
+    ) -> Tuple[jnp.ndarray, None]:
         """
-        Forward pass: z_mu = activation(W @ x_in + b) + x_skip
+        Prediction: z_mu = activation(W @ x_in + b) + x_skip
         """
         # Separate inputs by slot
         in_inputs = {k: v for k, v in inputs.items() if ":in" in k}
@@ -194,9 +194,4 @@ class LinearResidual(FlattenInputMixin, NodeBase):
         # Residual sum
         z_mu = transformed + skip_sum if skip_sum is not None else transformed
 
-        error = state.z_latent - z_mu
-        state = state._replace(z_mu=z_mu, error=error)
-
-        node_class = node_info.node_class
-        state = node_class.energy_functional(state, node_info)
-        return state
+        return z_mu, None

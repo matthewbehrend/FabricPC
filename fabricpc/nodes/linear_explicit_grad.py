@@ -6,7 +6,7 @@ from fabricpc.core.types import NodeParams, NodeState, NodeInfo
 from fabricpc.core.activations import IdentityActivation
 from fabricpc.core.energy import GaussianEnergy
 from fabricpc.core.initializers import NormalInitializer
-from fabricpc.nodes.base import FlattenInputMixin
+from fabricpc.nodes.base import FlattenInputMixin, NodeBase
 from fabricpc.core.activations import ActivationBase
 from fabricpc.core.energy import EnergyFunctional
 from fabricpc.core.initializers import InitializerBase
@@ -62,9 +62,18 @@ class LinearExplicitGrad(Linear):
         """
         node_class = node_info.node_class
 
-        # Single forward computing energy, state, and pre_activation together.
+        # Source semantics and the zero-grad short-circuit are base-owned;
+        # the analytic path below needs the pre_activation aux, which only
+        # exists when predict() runs (in_degree > 0).
+        if node_info.in_degree == 0:
+            return NodeBase.forward_and_latent_grads(
+                params, inputs, state, node_info, is_clamped
+            )
+
+        # Single forward computing energy, state, and pre_activation together
+        # (Linear.predict returns pre_activation as its aux).
         # pre_activation feeds the explicit gain-modulated error below.
-        state, pre_activation = Linear._forward_with_preact(
+        state, pre_activation = node_class.forward_with_aux(
             params, inputs, state, node_info
         )
 
@@ -124,8 +133,9 @@ class LinearExplicitGrad(Linear):
         """
         node_class = node_info.node_class
 
-        # Single forward computing energy, state, and pre_activation together.
-        state, pre_activation = Linear._forward_with_preact(
+        # Single forward computing energy, state, and pre_activation together
+        # (Linear.predict returns pre_activation as its aux).
+        state, pre_activation = node_class.forward_with_aux(
             params, inputs, state, node_info
         )
         flatten_input = node_info.node_config.get("flatten_input", False)

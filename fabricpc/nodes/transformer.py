@@ -296,13 +296,13 @@ class TransformerBlock(NodeBase):
         )
 
     @staticmethod
-    def forward(
+    def predict(
         params: NodeParams,
         inputs: Dict[str, jnp.ndarray],
         state: NodeState,
         node_info: NodeInfo,
-    ) -> NodeState:
-        """Forward pass for the Transformer Block."""
+    ) -> Tuple[jnp.ndarray, None]:
+        """Prediction for the Transformer Block."""
         config = node_info.node_config
         num_heads = config.get("num_heads", 8)
 
@@ -387,18 +387,7 @@ class TransformerBlock(NodeBase):
         # Residual connection 2
         z_mu = inv_sqrt2 * (x_res1 + ff_output)
 
-        error = state.z_latent - z_mu
-
-        state = state._replace(
-            z_mu=z_mu,
-            error=error,
-        )
-
-        # Compute energy, accumulate the self-latent gradient
-        node_class = node_info.node_class
-        state = node_class.energy_functional(state, node_info)
-
-        return state
+        return z_mu, None
 
     @staticmethod
     def forward_and_weight_grads(

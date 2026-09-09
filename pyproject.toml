@@ -162,3 +162,8 @@ extend-exclude = [".git", ".venv", "build", "dist"]
 # flag every `= GaussianEnergy()` / `= KaimingInitializer()` signature default,
 # which is exactly the pattern being standardized on.
 extend-select = ["B006"]
+
+[tool.pytest.ini_options]
+markers = [
+    "slow: long-running convergence tests (deselect with -m 'not slow')",
+]

@@ -44,8 +44,16 @@ from fabricpc.core.inference import (
     InferenceBase,
     InferenceSGD,
     InferenceSGDNormClip,
+    InferenceSchedule,
     gather_inputs,
     run_inference,
+)
+from fabricpc.core.inference_epc import EPCInference, Regime
+from fabricpc.core.epsilon_spectrum import (
+    EpsilonSpectrum,
+    epsilon_spectrum,
+    make_epsilon_spectrum,
+    weighted_relaxed_fraction,
 )
 
 # Initializers
@@ -96,6 +104,13 @@ __all__ = [
     "InferenceBase",
     "InferenceSGD",
     "InferenceSGDNormClip",
+    "EPCInference",
+    "Regime",
+    "EpsilonSpectrum",
+    "epsilon_spectrum",
+    "make_epsilon_spectrum",
+    "weighted_relaxed_fraction",
+    "InferenceSchedule",
     "gather_inputs",
     "run_inference",
     # Initializers

@@ -103,7 +103,7 @@ class MuPCScalingFactors:
         forward_scale: Per-edge forward scaling factor (a_l).
             Applied to inputs before the node's forward() call.
         self_grad_scale: Scalar scaling for the node's self-gradient (dE/dz_self).
-            Applied in energy_functional().
+            Applied by the inference loop to the autodiff self-gradient.
         topdown_grad_scale: Per-edge scaling for the top-down gradient to
             presynaptic nodes. Equals a * jacobian_gain, combining chain rule
             correction (a) with Jacobian compensation (jacobian_gain) for
@@ -214,7 +214,17 @@ def _count_skip_connections_depth(
 
     The caller uses max(skip_depth, 1) as L in the scaling formula so that
     pure chains degenerate to a = gain/sqrt(fan_in * K) (no depth factor).
+
+    node_order must be the unique node order (structure.node_order), not an
+    unrolled visit schedule: depth models one merge-sum energy term per
+    merge node regardless of visit count, and back edges contribute depth 0
+    naturally (a later-ordered source reads skip_counts.get(source, 0)).
     """
+    if len(set(node_order)) != len(node_order):
+        raise ValueError(
+            "node_order contains duplicate entries; pass the unique node "
+            "order (structure.node_order), not the unrolled visit schedule."
+        )
     skip_counts: Dict[str, int] = {}
 
     for node_name in node_order:
@@ -292,6 +302,11 @@ def compute_mupc_scalings(
 
     # Use topological order if provided, otherwise iterate dict order
     iteration_order = node_order if node_order is not None else list(nodes.keys())
+    if len(set(iteration_order)) != len(iteration_order):
+        raise ValueError(
+            "node_order contains duplicate entries; pass the unique node "
+            "order (structure.node_order), not the unrolled visit schedule."
+        )
 
     # Compute residual depth: number of nodes with connected
     # is_skip_connection slots along the longest path. For pure chains
@@ -407,7 +422,7 @@ def compute_mupc_scalings(
             weight_grad_scale[edge_key] = 1.0
 
         # Self-gradient scaling: 1.0
-        # The self-gradient (dE/dz from energy_functional) is already O(1)
+        # The self-gradient (dE/dz from the node's energy) is already O(1)
         # when the forward scaling maintains O(1) activations.
         self_grad_scale = 1.0
 

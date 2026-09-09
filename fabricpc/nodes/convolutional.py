@@ -207,15 +207,14 @@ class ConvNode(NodeBase):
         return NodeParams(weights=weights_dict, biases={})
 
     @staticmethod
-    def forward(
+    def predict(
         params: NodeParams,
         inputs: Dict[str, jnp.ndarray],
         state: NodeState,
         node_info: NodeInfo,
-    ) -> NodeState:
+    ) -> Tuple[jnp.ndarray, None]:
         """
-        Standard NodeBase forward contract:
-        conv sum → bias → activation → error → energy_functional.
+        Standard NodeBase predict contract: conv sum → bias → activation.
         """
         config = node_info.node_config
         dim_numbers = ConvNode._DIM_NUMBERS[len(node_info.shape) - 1]
@@ -235,7 +234,4 @@ class ConvNode(NodeBase):
 
         activation = node_info.activation
         z_mu = type(activation).forward(pre_activation, activation.config)
-        error = state.z_latent - z_mu
-        state = state._replace(z_mu=z_mu, error=error)
-        state = node_info.node_class.energy_functional(state, node_info)
-        return state
+        return z_mu, None

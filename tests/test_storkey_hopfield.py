@@ -101,6 +101,48 @@ class TestShapes:
 class TestEnergy:
     """Verify energy behavior during inference."""
 
+    def test_attractor_energy_formula(self, rng_key):
+        """Value-pin the attractor term: energy() minus the base PC term
+        equals s * (1/2D) z^T (W^2 - W) z computed independently, where W is
+        the prepared (symmetrized) weight matrix and s the effective
+        (softplus'd) strength."""
+        D = 8
+        structure = _build_hopfield_graph_1d(D=D)
+        params = initialize_params(structure, rng_key)
+        info = structure.nodes["hopfield"].node_info
+        hop_params = params.nodes["hopfield"]
+
+        batch_size = 3
+        probe = jax.random.normal(jax.random.PRNGKey(2), (batch_size, D))
+        inputs = {info.in_edges[0]: probe}
+        from fabricpc.core.types import NodeState
+
+        z = jax.random.normal(jax.random.PRNGKey(3), (batch_size, D))
+        state = NodeState(
+            z_latent=z,
+            z_mu=jnp.zeros((batch_size, D)),
+            error=jnp.zeros((batch_size, D)),
+            energy=jnp.zeros((batch_size,)),
+            latent_grad=jnp.zeros((batch_size, D)),
+        )
+        new_state, _ = StorkeyHopfield.forward_with_aux(hop_params, inputs, state, info)
+
+        energy_obj = info.energy
+        pc_term = type(energy_obj).energy(
+            new_state.z_latent, new_state.z_mu, energy_obj.config
+        )
+        edge_key = info.in_edges[0]
+        W = StorkeyHopfield._prepare_W(hop_params.weights[edge_key], info.node_config)
+        s = jax.nn.softplus(hop_params.biases["hopfield_strength"])
+        # (1/2D) z^T (W^2 - W) z, written as its quadratic forms.
+        expected_attractor = (0.5 / D) * (
+            jnp.einsum("bi,ij,jk,bk->b", z, W, W, z)
+            - jnp.einsum("bi,ij,bj->b", z, W, z)
+        )
+        assert jnp.allclose(
+            new_state.energy - pc_term, s * expected_attractor, atol=1e-5
+        )
+
     def test_energy_decreases_during_inference(self, rng_key):
         """Energy should decrease (or not increase) over more inference steps."""
         D = 16

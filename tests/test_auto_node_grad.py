@@ -312,10 +312,10 @@ class TestLinearAutoGradNode:
         )
 
         # Run inference
-        state_linear = type(structure_linear.config["inference"]).run_inference(
+        state_linear = structure_linear.config["inference"].run_inference(
             params_linear, state_linear, clamps, structure_linear
         )
-        state_autograd = type(structure_autograd.config["inference"]).run_inference(
+        state_autograd = structure_autograd.config["inference"].run_inference(
             params_autograd, state_autograd, clamps, structure_autograd
         )
 

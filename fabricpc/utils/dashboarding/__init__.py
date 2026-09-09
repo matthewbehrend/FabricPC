@@ -34,6 +34,7 @@ from fabricpc.utils.dashboarding.extractors import (
 from fabricpc.utils.dashboarding.inference_tracking import (
     extract_history_for_plotting,
     make_inference_history,
+    make_tracked_probe,
     run_inference_with_history,
     summarize_inference_convergence,
     train_step_with_history,
@@ -71,6 +72,7 @@ __all__ = [
     "extract_all_distributions",
     "flatten_for_distribution",
     # Inference tracking
+    "make_tracked_probe",
     "run_inference_with_history",
     "make_inference_history",
     "train_step_with_history",

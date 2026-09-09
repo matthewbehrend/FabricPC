@@ -114,17 +114,17 @@ class IdentityNode(NodeBase):
         return NodeParams(weights={}, biases={})
 
     @staticmethod
-    def forward(
+    def predict(
         params: NodeParams,
         inputs: Dict[str, jnp.ndarray],
         state: NodeState,
         node_info: NodeInfo,
-    ) -> NodeState:
+    ) -> Tuple[jnp.ndarray, None]:
         """
-        Identity forward pass: sum inputs and pass through.
+        Identity prediction: sum inputs and pass through.
 
-        For terminal input nodes (in_degree=0), z_mu equals z_latent.
-        For nodes with inputs, z_mu is the sum of all inputs.
+        Never called on a terminal source node (in_degree=0) — the base
+        templates own source semantics (z_mu mirrors z_latent).
 
         Args:
             params: Node parameters (empty for identity node)
@@ -133,7 +133,7 @@ class IdentityNode(NodeBase):
             node_info: NodeInfo object
 
         Returns:
-            NodeState
+            Tuple of (z_mu, None).
         """
         # Sum all inputs
         z_mu = None
@@ -147,17 +147,4 @@ class IdentityNode(NodeBase):
             z_mu * node_info.node_config["scale"]
         )  # Apply fixed scaling factor (default is 1.0)
 
-        # Compute prediction error
-        error = state.z_latent - z_mu
-
-        # Update node state
-        state = state._replace(
-            z_mu=z_mu,
-            error=error,
-        )
-
-        # Compute energy using the energy functional
-        node_class = node_info.node_class
-        state = node_class.energy_functional(state, node_info)
-
-        return state
+        return z_mu, None

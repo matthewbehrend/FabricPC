@@ -62,21 +62,108 @@ def _build_slots(node: NodeBase, in_edges: Dict[str, EdgeInfo]) -> Dict[str, Slo
     return slots
 
 
-def _topological_sort(
+class GraphCycleError(ValueError):
+    """Raised when a graph contains cycles and no unroll degree was given."""
+
+
+def first_occurrence_order(schedule: Tuple[str, ...]) -> Tuple[str, ...]:
+    """Deduplicate a visit schedule, keeping first occurrences (the unique node order)."""
+    seen = set()
+    order = []
+    for name in schedule:
+        if name not in seen:
+            seen.add(name)
+            order.append(name)
+    return tuple(order)
+
+
+def _tarjan_sccs(
     nodes: Dict[str, NodeBase], edges: Dict[str, EdgeInfo]
+) -> List[List[str]]:
+    """
+    Iterative Tarjan strongly-connected-components decomposition.
+
+    Roots iterate in dict order and successors in out_edges order, so the
+    result is deterministic for a given node/edge insertion order.
+    """
+    index_counter = 0
+    index: Dict[str, int] = {}
+    lowlink: Dict[str, int] = {}
+    on_stack: Dict[str, bool] = {}
+    stack: List[str] = []
+    sccs: List[List[str]] = []
+
+    for start in nodes:
+        if start in index:
+            continue
+        work = [(start, 0)]  # (node, next-successor pointer)
+        while work:
+            v, pointer = work[-1]
+            if pointer == 0:
+                index[v] = index_counter
+                lowlink[v] = index_counter
+                index_counter += 1
+                stack.append(v)
+                on_stack[v] = True
+            successors = [edges[k].target for k in nodes[v].node_info.out_edges]
+            descended = False
+            for i in range(pointer, len(successors)):
+                w = successors[i]
+                if w not in index:
+                    work[-1] = (v, i + 1)
+                    work.append((w, 0))
+                    descended = True
+                    break
+                if on_stack.get(w, False):
+                    lowlink[v] = min(lowlink[v], index[w])
+            if descended:
+                continue
+            if lowlink[v] == index[v]:
+                scc = []
+                while True:
+                    w = stack.pop()
+                    on_stack[w] = False
+                    scc.append(w)
+                    if w == v:
+                        break
+                sccs.append(scc)
+            work.pop()
+            if work:
+                parent = work[-1][0]
+                lowlink[parent] = min(lowlink[parent], lowlink[v])
+
+    return sccs
+
+
+def _topological_sort(
+    nodes: Dict[str, NodeBase],
+    edges: Dict[str, EdgeInfo],
+    unroll: Optional[int] = None,
 ) -> Tuple[str, ...]:
     """
-    BFS-based topological sort. Feedforward traversal for initialization uses this topological ordering of nodes.
+    Node visit schedule for forward traversal (initialization and ePC
+    state derivation).
+
+    On a DAG this is the BFS/Kahn topological order, one visit per node,
+    whatever ``unroll`` is. On a cyclic graph an explicit ``unroll=U ≥ 1``
+    is required: strongly connected components collapse to a condensation
+    DAG, Kahn orders the condensation with the same seeding/successor
+    rules, and each nontrivial component's members are emitted U times in
+    BFS order from the component's entry nodes (members with an in-edge
+    from outside the component; the first member in dict order if none).
 
     Args:
         nodes: Dictionary of NodeBase instances (access in_degree/out_edges via node.node_info)
         edges: Dictionary of EdgeInfo instances
+        unroll: Number of traversals of each cycle. None (default) means the
+            graph must be acyclic.
 
     Returns:
-        Tuple of node names in topological order
+        Tuple of node names; cycle members may repeat; every node appears
+        at least once.
 
-    Note:
-        If the graph contains cycles, some nodes may be omitted from the order.
+    Raises:
+        GraphCycleError: The graph contains cycles and ``unroll`` is None.
     """
     # Count in-degrees from node.node_info
     in_degree = {name: node.node_info.in_degree for name, node in nodes.items()}
@@ -99,10 +186,80 @@ def _topological_sort(
                 # Dependencies have been processed, now add next node to the queue
                 queue.append(target_name)
 
-    if len(result) != len(nodes):
-        print("Warning: Graph contains cycles, using partial topological order")
+    if len(result) == len(nodes):
+        # Acyclic: the plain Kahn order, one visit per node.
+        return tuple(result)
 
-    return tuple(result)
+    ordered = set(result)
+    unordered = [name for name in nodes if name not in ordered]
+    if unroll is None:
+        raise GraphCycleError(
+            f"Graph contains cycles; nodes {unordered} cannot be "
+            f"topologically ordered. Pass graph(..., unroll=U) with U >= 1 "
+            f"to unroll each cycle into U traversals (U=1 visits each cycle "
+            f"member once)."
+        )
+
+    # Cyclic with an explicit unroll degree: order the condensation DAG.
+    sccs = _tarjan_sccs(nodes, edges)
+    # Identify each SCC by its first member in dict order; process SCCs in
+    # that order for deterministic seeding.
+    node_position = {name: i for i, name in enumerate(nodes)}
+    for scc in sccs:
+        scc.sort(key=lambda n: node_position[n])
+    sccs.sort(key=lambda scc: node_position[scc[0]])
+    scc_of = {name: i for i, scc in enumerate(sccs) for name in scc}
+
+    # Condensation in-degrees and successor lists (edge multiplicity kept:
+    # Kahn decrements once per edge, mirroring the node-level loop).
+    cond_in_degree = [0] * len(sccs)
+    cond_successors: List[List[int]] = [[] for _ in sccs]
+    for scc_id, scc in enumerate(sccs):
+        for member in scc:
+            for out_edge_key in nodes[member].node_info.out_edges:
+                target_scc = scc_of[edges[out_edge_key].target]
+                if target_scc != scc_id:
+                    cond_successors[scc_id].append(target_scc)
+                    cond_in_degree[target_scc] += 1
+
+    def scc_visit_order(scc_id: int) -> List[str]:
+        members = sccs[scc_id]
+        if len(members) == 1:
+            return members
+        member_set = set(members)
+        entries = [
+            name
+            for name in members
+            if any(
+                edges[k].source not in member_set
+                for k in nodes[name].node_info.in_edges
+            )
+        ]
+        bfs_queue = entries or [members[0]]
+        visited = set(bfs_queue)
+        order = []
+        while bfs_queue:
+            name = bfs_queue.pop(0)
+            order.append(name)
+            for out_edge_key in nodes[name].node_info.out_edges:
+                target = edges[out_edge_key].target
+                if target in member_set and target not in visited:
+                    visited.add(target)
+                    bfs_queue.append(target)
+        return order
+
+    scc_queue = [i for i, deg in enumerate(cond_in_degree) if deg == 0]
+    schedule: List[str] = []
+    while scc_queue:
+        scc_id = scc_queue.pop(0)
+        repeats = unroll if len(sccs[scc_id]) > 1 else 1
+        schedule.extend(scc_visit_order(scc_id) * repeats)
+        for target_scc in cond_successors[scc_id]:
+            cond_in_degree[target_scc] -= 1
+            if cond_in_degree[target_scc] == 0:
+                scc_queue.append(target_scc)
+
+    return tuple(schedule)
 
 
 def graph(
@@ -112,6 +269,7 @@ def graph(
     inference: InferenceBase,
     graph_state_initializer: Optional[StateInitBase] = None,
     scaling=None,
+    unroll: Optional[int] = None,
 ) -> GraphStructure:
     """
     Build a GraphStructure from node objects, edge objects, and a task map.
@@ -129,10 +287,21 @@ def graph(
         scaling: Optional MuPCConfig instance for muPC parameterization.
             When provided, per-node scaling factors are computed from graph
             topology and attached to each NodeInfo.scaling_config.
+        unroll: Required for cyclic graphs: the number of traversals of each
+            cycle in the visit schedule (``structure.schedule``), used by
+            feedforward initialization and ePC state derivation. ``unroll=1``
+            visits each cycle member once. Ignored on acyclic graphs.
 
     Returns:
         GraphStructure with finalized nodes, edges, and topology
+
+    Raises:
+        GraphCycleError: The graph contains cycles and ``unroll`` was not given.
     """
+    if unroll is not None and (
+        isinstance(unroll, bool) or not isinstance(unroll, int) or unroll < 1
+    ):
+        raise ValueError(f"unroll must be an int >= 1, got {unroll!r}")
     # 1. Build EdgeInfo objects from Edge objects
     edge_infos = {}
     for edge in edges:
@@ -212,8 +381,14 @@ def graph(
         )
         finalized_nodes[name] = node._with_graph_info(node_info)
 
-    # 5. Topological sort
-    node_order = _topological_sort(finalized_nodes, edge_infos)
+    # 5. Topological visit schedule and unique node order
+    schedule = _topological_sort(finalized_nodes, edge_infos, unroll)
+    node_order = first_occurrence_order(schedule)
+    if set(node_order) != set(finalized_nodes):
+        raise ValueError(
+            f"Internal error: schedule omits nodes "
+            f"{sorted(set(finalized_nodes) - set(node_order))}"
+        )
 
     # 5b. Compute and attach muPC scalings if requested
     if scaling is not None:
@@ -249,6 +424,7 @@ def graph(
     gs_config = {
         "graph_state_initializer": graph_state_initializer or FeedforwardStateInit(),
         "inference": inference,
+        "unroll": unroll,
     }
 
     return GraphStructure(
@@ -256,5 +432,6 @@ def graph(
         edges=edge_infos,
         task_map=task_map_dict,
         node_order=node_order,
+        schedule=schedule,
         config=gs_config,
     )

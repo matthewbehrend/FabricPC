@@ -27,7 +27,7 @@ Users can create custom nodes by extending NodeBase:
             ...
 
         @staticmethod
-        def forward(params, inputs, state, node_info):
+        def predict(params, inputs, state, node_info):
             ...
 
 Place the default activation/energy/initializer objects directly in the
@@ -164,9 +164,12 @@ class NodeBase(ABC):
     graph() builder which attaches topology info via copy-on-finalize.
 
     Subclasses implement three static methods: ``get_slots`` (the input slots),
-    ``initialize_params`` (the weights and biases), and ``forward`` (the
-    prediction and energy). ``forward`` is the core computation; the required
-    steps every implementation must perform are documented in its docstring.
+    ``initialize_params`` (the weights and biases), and ``predict`` (the
+    prediction z_mu plus any aux intermediates). Nodes with extra energy terms
+    additionally override ``energy``. The error pair (error = z_latent - z_mu
+    and its inverse z_latent = z_mu + error) and the assembly templates
+    (``forward``, ``forward_with_aux``, ``forward_from_error``) are base-owned
+    and are not override points.
 
     Subclasses set concrete default instances for activation, energy, latent_init,
     and weight_init directly in their ``__init__`` parameter defaults. Those
@@ -327,44 +330,39 @@ class NodeBase(ABC):
 
     @staticmethod
     @abstractmethod
-    def forward(
+    def predict(
         params: NodeParams,
         inputs: Dict[str, jnp.ndarray],  # keyed on EdgeInfo.key -> inputs data
         state: NodeState,
         node_info: NodeInfo,
-    ) -> NodeState:
+    ) -> Tuple[jnp.ndarray, Any]:
         """
-        Predict this node's latent state and report the resulting energy.
+        All parameterized computation: predict z_mu from the in-edge inputs.
 
-        ``forward`` is a pure function: it has no side effects and expresses its
-        dependence on ``params``, ``inputs``, and ``state.z_latent`` entirely
-        through JAX operations. It is differentiated under ``jax.value_and_grad``
-        by ``forward_and_latent_grads`` (w.r.t. inputs and z_latent) and
-        ``forward_and_weight_grads`` (w.r.t. params).
+        ``predict`` is a pure function: it has no side effects and expresses
+        its dependence on ``params``, ``inputs``, and ``state`` entirely
+        through JAX operations. The base templates differentiate through it
+        (w.r.t. inputs and z_latent in ``forward_and_latent_grads``, w.r.t.
+        params in ``forward_and_weight_grads``, and w.r.t. the relaxed errors
+        in ePC's global energy gradient).
 
         How the prediction is produced is intentionally unconstrained: Linear
         does a matmul, IdentityNode sums its inputs, TransformerBlock runs an
-        attention pipeline, StorkeyHopfield blends a probe with a learned weight
-        matrix. Every implementation must, however, perform these five steps in
-        order:
+        attention pipeline, StorkeyHopfield blends a probe with a learned
+        weight matrix. The pair (error = z_latent - z_mu) and the energy call
+        are applied by the base templates; do not compute them here.
 
-        1. Predict ``z_mu``: this node's prediction of its own latent, with shape
-           ``(batch,) + node_info.shape``.
-        2. Compute the error: ``error = state.z_latent - z_mu``. The energy
-           functionals assume this sign (latent minus prediction).
-        3. Write the fields back:
-           ``state = state._replace(z_mu=..., error=...)``.
-           NodeState is a fixed-schema NamedTuple; no other fields may be added.
-        4. Populate energy:
-           ``state = node_info.node_class.energy_functional(state, node_info)``.
-           This sets ``state.energy`` from ``energy(z_latent, z_mu)``, so ``z_mu``
-           must already be set. Additional energy terms (e.g. the Hopfield
-           attractor term in StorkeyHopfield) are added by replacing
-           ``state.energy`` after this call.
-        5. Return ``state``: the updated state
+        ``predict`` must not read ``state.z_latent`` values (shape/dtype
+        reads like ``state.z_latent.shape[0]`` are fine). The state-based
+        solvers differentiate through such a read —
+        ``forward_and_latent_grads`` re-binds z_latent and differentiates
+        the whole forward — while ``EPCInference.derive_states`` evaluates
+        z_mu at the carried latent, so a z_latent-dependent prediction makes
+        the two solver families minimize different energies. An energy term
+        that needs the node's own latent belongs in ``energy()``.
 
-        muPC scaling is NOT applied here; the inference/learning callsite applies
-        it. Do not scale inputs or gradients inside this method.
+        muPC scaling is NOT applied here; the inference/learning callsite
+        applies it. Do not scale inputs or gradients inside this method.
 
         See ``Linear`` (linear.py), ``IdentityNode`` (identity.py), and
         ``StorkeyHopfield`` (storkey_hopfield.py) for worked examples, and
@@ -377,9 +375,178 @@ class NodeBase(ABC):
             node_info: NodeInfo object (contains activation, energy, etc.)
 
         Returns:
-            NodeState: updated node state (z_mu, error, energy)
+            Tuple of (z_mu, aux):
+                - z_mu: prediction of this node's latent, shape
+                  ``(batch,) + node_info.shape``.
+                - aux: arbitrary pytree of intermediates for ``energy()``
+                  (None if unused). aux must depend only on params and inputs
+                  (e.g. Linear's pre_activation, StorkeyHopfield's
+                  (W, strength)). aux is snapshotted when ``predict`` runs —
+                  under ePC, before z_latent is derived — so an aux entry
+                  computed from ``state.z_latent`` would freeze the carried
+                  latent into an energy otherwise evaluated at the derived
+                  latent, making sPC and ePC minimize different energies. An
+                  energy term that needs the node's own latent reads
+                  ``state.z_latent`` inside ``energy()`` instead.
         """
         pass
+
+    @staticmethod
+    def energy(
+        params: NodeParams,
+        inputs: Dict[str, jnp.ndarray],
+        state: NodeState,
+        aux: Any,
+        node_info: NodeInfo,
+    ) -> jnp.ndarray:
+        """
+        Per-sample energy (shape (batch,)) at (state.z_latent, state.z_mu).
+
+        The default scores the node's energy functional. Override to add
+        terms (StorkeyHopfield's attractor; ScaledSumNode's weighting in the
+        external-node tests). A z_latent-dependent term must read
+        ``state.z_latent`` here — never an aux entry computed from it: aux is
+        snapshotted at ``predict`` time, which under ePC is before z_latent
+        is derived, so such an entry would evaluate the energy at two
+        different latents (see ``predict``).
+
+        aux is None on the ``in_degree == 0`` path (``predict`` never runs
+        and the param initializer assigns sources empty params), so an
+        override must tolerate ``aux=None`` — typically by returning the
+        base energy when its extra term needs parameters a source cannot
+        have (see StorkeyHopfield).
+
+        Args:
+            params: Node parameters (weights, biases)
+            inputs: Dictionary mapping edge keys to input tensors
+            state: NodeState with z_latent and the freshly assigned z_mu/error
+            aux: The intermediates ``predict`` returned (None on source nodes)
+            node_info: NodeInfo object (contains the energy functional)
+
+        Returns:
+            Per-sample energy, shape (batch,).
+        """
+        energy_obj = node_info.energy
+        return type(energy_obj).energy(state.z_latent, state.z_mu, energy_obj.config)
+
+    # =========================================================================
+    # Base-owned pair and assembly templates — NOT node override points.
+    # The ePC <-> sPC equivalence requires one volume-preserving bijection
+    # between error and z_latent shared by every node; tests audit that no
+    # registered node overrides these.
+    # =========================================================================
+
+    @staticmethod
+    def pair_error(z_latent: jnp.ndarray, z_mu: jnp.ndarray) -> jnp.ndarray:
+        """sPC direction of the pair: error = z_latent - z_mu."""
+        return z_latent - z_mu
+
+    @staticmethod
+    def pair_latent(z_mu: jnp.ndarray, error: jnp.ndarray) -> jnp.ndarray:
+        """ePC direction of the pair — the inverse: z_latent = z_mu + error."""
+        return z_mu + error
+
+    @staticmethod
+    def forward_with_aux(
+        params: NodeParams,
+        inputs: Dict[str, jnp.ndarray],
+        state: NodeState,
+        node_info: NodeInfo,
+    ) -> Tuple[NodeState, Any]:
+        """
+        One predict -> pair -> energy pass, also surfacing predict's aux.
+
+        Owns source semantics: an ``in_degree == 0`` node has no in-edges to
+        project a z_mu, so z_mu mirrors z_latent (cast — a source z_latent
+        may carry an int clamp dtype) with zero error, and ``predict`` is
+        never called.
+        """
+        node_class = node_info.node_class
+        if node_info.in_degree == 0:
+            new_state = state._replace(
+                z_mu=state.z_latent.astype(state.z_mu.dtype),
+                error=jnp.zeros_like(state.error),
+            )
+            return (
+                new_state._replace(
+                    energy=node_class.energy(params, inputs, new_state, None, node_info)
+                ),
+                None,
+            )
+        z_mu, aux = node_class.predict(params, inputs, state, node_info)
+        new_state = state._replace(
+            z_mu=z_mu, error=node_class.pair_error(state.z_latent, z_mu)
+        )
+        return (
+            new_state._replace(
+                energy=node_class.energy(params, inputs, new_state, aux, node_info)
+            ),
+            aux,
+        )
+
+    @staticmethod
+    def forward(
+        params: NodeParams,
+        inputs: Dict[str, jnp.ndarray],
+        state: NodeState,
+        node_info: NodeInfo,
+    ) -> NodeState:
+        """
+        Predict this node's latent state and report the resulting energy.
+
+        sPC-direction template: z_mu from ``predict``, error =
+        ``pair_error(z_latent, z_mu)``, energy from ``energy()``. Signature
+        and semantics match the pre-split per-node ``forward`` bodies.
+        """
+        new_state, _ = node_info.node_class.forward_with_aux(
+            params, inputs, state, node_info
+        )
+        return new_state
+
+    @staticmethod
+    def forward_from_error(
+        params: NodeParams,
+        inputs: Dict[str, jnp.ndarray],
+        state: NodeState,
+        node_info: NodeInfo,
+        is_clamped: bool,
+    ) -> NodeState:
+        """
+        ePC state derivation: ``state.error`` is the relaxed variable ε and
+        z_latent is derived as ``pair_latent(z_mu, ε)`` — one ``predict`` per
+        visit. Runs inside EPCInference's global ``jax.grad`` and is
+        differentiable w.r.t. inputs and ``state.error``. Never writes
+        ``latent_grad``.
+
+        The clamp decides which side of the pair is free:
+        - Unclamped: ε is relaxed; z_latent := z_mu + ε. This holds for every
+          degree — top-down priors (in_degree == 0, whose z_mu is the constant
+          fixed by the segment's ``begin_segment`` resync) and readouts
+          (out_degree == 0) included.
+        - Clamped: z_latent stays the clamp and ε is derived — with in-edges
+          the sPC-direction template recomputes error = pair_error(clamp, z_mu)
+          and energy(clamp, z_mu), the output loss; a clamped source keeps its
+          init state (z_mu = clamp, error = 0) with nothing to recompute.
+        """
+        node_class = node_info.node_class
+        if node_info.in_degree == 0:
+            if is_clamped:
+                return state  # clamp fixed at init; nothing to recompute
+            # top-down prior: z_mu is the constant assigned at initialization
+            return state._replace(
+                z_latent=node_class.pair_latent(state.z_mu, state.error)
+            )
+        if is_clamped:
+            new_state, _ = node_class.forward_with_aux(params, inputs, state, node_info)
+            return new_state
+        z_mu, aux = node_class.predict(params, inputs, state, node_info)
+        eps = state.error  # the relaxed variable, written back bit-exact
+        new_state = state._replace(
+            z_latent=node_class.pair_latent(z_mu, eps), z_mu=z_mu, error=eps
+        )
+        return new_state._replace(
+            energy=node_class.energy(params, inputs, new_state, aux, node_info)
+        )
 
     # =========================================================================
     # muPC variance factor for scaling — override per node type
@@ -447,14 +614,14 @@ class NodeBase(ABC):
         Called in the inference phase of predictive coding.
 
         Contract:
-        1. In-degree-0 nodes are handled specially, without calling
-           ``forward()``: z_mu <- z_latent (cast to z_mu's dtype); error and
-           all gradients are zero; energy is E(z_latent, z_latent) from the
-           node's energy functional.
-        2. Every node with in-degree > 0 goes through ``node_class.forward()``.
-           For unclamped out-degree-0 nodes the forward's z_mu is kept and
-           written into z_latent (outputs track predictions in evaluation
-           mode); error, energy, and all gradients are zeroed.
+        1. In-degree-0 nodes short-circuit the gradient computation: the
+           state comes from the template ``forward()`` (whose source guard
+           mirrors z_mu <- z_latent with zero error) and all gradients are
+           zero — the source's latent still moves via the contributions its
+           downstream successors accumulate into its ``latent_grad``.
+        2. Every node with in-degree > 0 — unclamped readouts included —
+           takes the autodiff path: error = z_latent - z_mu, energy as
+           ``forward()`` assigns, z_latent relaxed like any other node.
         3. The per-sample ``state.energy`` (shape (batch,)) is summed over
            the batch dimension to a scalar.
         4. ``jax.value_and_grad`` differentiates that scalar w.r.t. the
@@ -478,7 +645,9 @@ class NodeBase(ABC):
                 (already muPC-scaled by the callsite when scaling is active)
             state: NodeState for this node
             node_info: NodeInfo object
-            is_clamped: Whether this node is clamped to data
+            is_clamped: Whether this node is clamped to data. The base body
+                no longer branches on it (kept for overrides, e.g.
+                EmbeddingNode, and for solver-side gating).
 
         Returns:
             Tuple of (NodeState, input_grads, self_grad):
@@ -491,45 +660,21 @@ class NodeBase(ABC):
         """
         node_class = node_info.node_class
 
-        # Handle terminal nodes
+        # Terminal source nodes: gradient short-circuit. The state comes from
+        # the template forward(), whose in_degree == 0 guard owns source
+        # semantics (z_mu <- z_latent cast to z_mu's dtype, zero error).
+        # A source has no inputs and contributes no self-gradient; its latent
+        # still moves via contributions accumulated by downstream successors.
         if node_info.in_degree == 0:
-            # No inputs!
-            # This is a terminal input node of the graph. It might be clamped to data, or it might be a source of top-down predictions. Either way, the gradients are zero.
-
-            # Update z_mu <-- z_latent, so error is zero. Cast to z_mu's dtype:
-            # source-node z_latent may be an integer clamp (e.g. token indices),
-            # but the rest of the NodeState stays float for the inference carry.
-            new_state = state._replace(
-                z_mu=state.z_latent.astype(state.z_mu.dtype),
-                error=jnp.zeros_like(state.error),
-            )
-            # Energy from the node's energy functional evaluated at z_mu = z_latent
-            new_state = node_class.energy_functional(new_state, node_info)
-            # No inputs, no contribution to latent_grad of self or upstream
+            new_state = node_class.forward(params, inputs, state, node_info)
             input_grads = {
                 edge_key: jnp.zeros_like(inputs[edge_key]) for edge_key in inputs
             }
             self_grad = jnp.zeros_like(state.latent_grad)
 
-        elif node_info.out_degree == 0 and not is_clamped:
-            # No post-synaptic targets and no clamped data!
-            # This happens for output nodes when the model is run in inference/evaluation mode (not training)
-            # Compute its projection (z_mu) but no gradient since it doesn't contribute to any error.
-            new_state = node_class.forward(params, inputs, state, node_info)
-            # Update keeping the projection, but zero error.
-            new_state = new_state._replace(
-                z_latent=new_state.z_mu,
-                error=jnp.zeros_like(new_state.error),
-                energy=jnp.zeros_like(new_state.energy),
-                latent_grad=jnp.zeros_like(new_state.latent_grad),
-            )
-            input_grads = {
-                edge_key: jnp.zeros_like(inputs[edge_key]) for edge_key in inputs
-            }
-            self_grad = jnp.zeros_like(state.z_latent)
-
         else:
-            # Internal or clamped output node: autodiff for input AND self-latent gradients.
+            # Every node with in-edges — unclamped readouts included:
+            # autodiff for input AND self-latent gradients.
             # Extract z_latent as a separate differentiable argument via closure.
             def energy_fn(input_args, z_latent):
                 s = state._replace(z_latent=z_latent)
@@ -592,29 +737,6 @@ class NodeBase(ABC):
         )(params)
 
         return new_state, params_grad
-
-    @staticmethod
-    def energy_functional(state: NodeState, node_info: NodeInfo) -> NodeState:
-        """
-        Compute energy E(z_latent, z_mu) and update state.
-
-        The self-latent gradient (dE/dz_latent) is NOT computed here — it
-        is obtained via autodiff in forward_and_latent_grads(). For explicit
-        gradient overrides, use ``energy.grad_latent()`` directly.
-
-        Args:
-            state: NodeState object (contains z_latent, z_mu, etc.)
-            node_info: NodeInfo object (contains energy instance)
-
-        Returns:
-            Updated NodeState with energy field set
-        """
-        energy_obj = node_info.energy
-        energy_cls = type(energy_obj)
-        config = energy_obj.config
-
-        energy = energy_cls.energy(state.z_latent, state.z_mu, config)
-        return state._replace(energy=energy)
 
 
 def compute_windowed_output_shape(

@@ -247,7 +247,7 @@ class FCInputNode(NodeBase):
         return NodeParams(weights=weights_dict, biases={})
 
     @staticmethod
-    def forward(params, inputs, state, node_info):
+    def predict(params, inputs, state, node_info):
         config = node_info.node_config
         scale = config.get("scale", 1.0)
         batch_size = state.z_latent.shape[0]
@@ -259,13 +259,7 @@ class FCInputNode(NodeBase):
         # z_mu = scale * (x @ W)
         W = params.weights[edge_key]
         z_mu = scale * jnp.matmul(x_flat, W)
-
-        error = state.z_latent - z_mu
-        state = state._replace(z_mu=z_mu, error=error)
-
-        node_class = node_info.node_class
-        state = node_class.energy_functional(state, node_info)
-        return state
+        return z_mu, None
 
 
 class PreActResBlock(NodeBase):
@@ -336,7 +330,7 @@ class PreActResBlock(NodeBase):
         return NodeParams(weights=weights_dict, biases={})
 
     @staticmethod
-    def forward(params, inputs, state, node_info):
+    def predict(params, inputs, state, node_info):
         config = node_info.node_config
         scale = config.get("scale", 1.0)
         skip_scale = config.get("skip_scale", 1.0)
@@ -353,13 +347,7 @@ class PreActResBlock(NodeBase):
         # scale = gain/sqrt(fan_in*K) for the linear path
         # skip_scale = 1/sqrt(K) for the identity skip path (K = in_degree)
         z_mu = scale * jnp.matmul(act_x, W) + skip_scale * x
-
-        error = state.z_latent - z_mu
-        state = state._replace(z_mu=z_mu, error=error)
-
-        node_class = node_info.node_class
-        state = node_class.energy_functional(state, node_info)
-        return state
+        return z_mu, None
 
 
 class PreActReadout(NodeBase):
@@ -417,7 +405,7 @@ class PreActReadout(NodeBase):
         return NodeParams(weights=weights_dict, biases={})
 
     @staticmethod
-    def forward(params, inputs, state, node_info):
+    def predict(params, inputs, state, node_info):
         config = node_info.node_config
         scale = config.get("scale", 1.0)
         activation = node_info.activation
@@ -431,13 +419,7 @@ class PreActReadout(NodeBase):
 
         # z_mu = scale * (act(x) @ W)   (no skip connection)
         z_mu = scale * jnp.matmul(act_x, W)
-
-        error = state.z_latent - z_mu
-        state = state._replace(z_mu=z_mu, error=error)
-
-        node_class = node_info.node_class
-        state = node_class.energy_functional(state, node_info)
-        return state
+        return z_mu, None
 
 
 # =============================================================================

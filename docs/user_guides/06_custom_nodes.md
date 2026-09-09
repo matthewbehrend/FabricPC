@@ -26,14 +26,18 @@ All nodes inherit from `NodeBase` and must implement three static methods:
 
 1. **`get_slots()`**: Define input slots (the connection interface)
 2. **`initialize_params()`**: Allocate and initialize weights and biases
-3. **`forward()`**: Compute predictions, errors, and energy
+3. **`predict()`**: Compute the prediction `z_mu` (plus optional `aux` intermediates)
+
+Nodes with extra energy terms additionally override a fourth:
+
+4. **`energy()`** (optional): Per-sample energy at `(state.z_latent, state.z_mu)`. The default scores the node's energy functional; override it to add terms (see [Custom Energy Terms](#custom-energy-terms)).
 
 These methods are static because FabricPC uses a functional JAX-based design. Node instances hold configuration; the static methods define pure functional transformations.
 
-`forward()` is where the node does its real work, and its body is intentionally unconstrained: how you turn inputs into a prediction is up to you. But a fixed set of steps must happen inside it for the node to participate in inference and learning — these are spelled out in [Implement Forward Computation](#step-5-implement-forward-computation) below. The split is:
+`predict()` is where the node does its real work, and its body is intentionally unconstrained: how you turn inputs into a prediction is up to you — a matmul in `Linear`, an attention pipeline in `TransformerBlock`, an embedding lookup in `EmbeddingNode`. Everything around the prediction is **base-owned and not a node override point**:
 
-- **Required (every node):** produce `z_mu`, compute `error`, write those fields back, populate the per-sample `energy` via the energy functional, and return the updated `NodeState`.
-- **Flexible (per node):** how inputs are combined (sum, matmul, attention, embedding lookup), whether weights/biases exist, whether and which activation applies, any internal sub-structure (LayerNorm, attention, residual paths), and any extra energy terms.
+- The error pair — `error = z_latent - z_mu` (`pair_error`) and its inverse `z_latent = z_mu + error` (`pair_latent`) — lives on `NodeBase`. State-based inference relaxes `z_latent` and derives `error`; the error-parameterized solver (`EPCInference`) relaxes `error` and derives `z_latent`. Both directions share one bijection, which is why nodes cannot override it.
+- The assembly templates `forward()` (predict → pair → energy), `forward_with_aux()` (the same, surfacing `aux`), and `forward_from_error()` (the ePC derive direction) live on `NodeBase`. Source semantics (`in_degree == 0`) also live there — `predict()` is never called on a source node: in the sPC direction (`forward`/`forward_with_aux`) a source's `z_mu` mirrors its `z_latent` with zero error, while in the ePC direction (`forward_from_error`) an unclamped source derives `z_latent = z_mu + error` with `z_mu` held fixed.
 
 ## Step-by-Step: Conv2D Node
 
@@ -184,13 +188,13 @@ Key points:
 - Use the `initialize()` helper function with the provided `weight_init` initializer
 - Return `NodeParams` with dicts of weights and biases
 
-### Step 5: Implement Forward Computation
+### Step 5: Implement the Prediction
 
 ```python
 @staticmethod
-def forward(params, inputs, state, node_info):
+def predict(params, inputs, state, node_info):
     """
-    Forward pass: compute convolution, activation, error, and energy.
+    Prediction: compute convolution, bias, and activation.
 
     Args:
         params: NodeParams with weights and biases dicts
@@ -199,7 +203,7 @@ def forward(params, inputs, state, node_info):
         node_info: NodeInfo with configuration
 
     Returns:
-        Updated NodeState
+        Tuple of (z_mu, aux). aux is None here; see the aux pattern below.
     """
     # Extract config
     kernel_size = node_info.node_config.get("kernel_size", (1, 1))
@@ -234,38 +238,20 @@ def forward(params, inputs, state, node_info):
     # Apply activation function
     z_mu = type(activation).forward(pre_activation, activation.config)
 
-    # Compute prediction error
-    error = state.z_latent - z_mu
-
-    # Update state
-    state = state._replace(
-        z_mu=z_mu,
-        error=error,
-    )
-
-    # Compute energy using the energy functional
-    node_class = node_info.node_class
-    state = node_class.energy_functional(state, node_info)
-
-    # Return the updated state
-    return state
+    return z_mu, None
 ```
 
-> **Note (`pre_activation` is transient):** `pre_activation` is a local variable inside `forward()` — not a `NodeState` field. Compute it locally, pass it to the activation, and let it go out of scope. The `NodeState` fields you can write back via `_replace()` are `z_latent`, `z_mu`, `error`, `energy`, and `latent_grad`.
+`predict()` is a **pure function**. It must have no side effects and must express its dependence on `params`, `inputs`, and `state` entirely through JAX operations, because the framework differentiates through it — `forward_and_latent_grads` with respect to inputs and `z_latent`, `forward_and_weight_grads` with respect to `params`, and `EPCInference`'s global energy gradient with respect to the relaxed errors. Side effects or Python-level control flow on traced values produce wrong gradients during inference and learning.
 
-`forward()` is a **pure function**. It must have no side effects and must express its dependence on `params`, `inputs`, and `state.z_latent` entirely through JAX operations, because the framework differentiates it under `jax.value_and_grad` — `forward_and_latent_grads` differentiates it with respect to inputs and `z_latent`, and `forward_and_weight_grads` with respect to `params`. Side effects or Python-level control flow on traced values produce wrong gradients during inference and learning.
+The contract:
 
-Within that constraint, every `forward()` must perform these five steps in order:
+1. **Return `z_mu`**: the node's prediction of its own latent, with shape `(batch,) + node_info.shape`. *How* is up to the node — a convolution here, a matmul in `Linear`, an attention pipeline in `TransformerBlock`.
+2. **Return `aux`**: an arbitrary pytree of intermediates for `energy()`, or `None` if unused. See [the aux pattern](#the-aux-pattern) — aux must depend only on `params` and `inputs`.
+3. **Do not compute the error or the energy.** The base templates apply `error = z_latent - z_mu` and call `energy()`; a node body that repeats them breaks the error-parameterized solver, which derives `z_latent` from the error instead.
 
-1. **Predict `z_mu`**: produce the node's prediction of its own latent, with shape `(batch,) + node_info.shape`. *How* is up to the node — a convolution here, a matmul in `Linear`, an attention pipeline in `TransformerBlock`.
-2. **Compute the error**: `error = state.z_latent - z_mu`. The energy functionals assume this sign (latent minus prediction).
-3. **Write the fields back**: `state = state._replace(z_mu=..., error=...)`. `NodeState` is a fixed-schema NamedTuple (`z_latent, z_mu, error, energy, latent_grad`); no other fields exist or may be added.
-4. **Populate energy**: `node_class = node_info.node_class; state = node_class.energy_functional(state, node_info)`. This sets `state.energy` from `energy(z_latent, z_mu)`, so `z_mu` must already be set. Extra energy terms (for example the Hopfield attractor term in `StorkeyHopfield`) are added by replacing `state.energy` after this call.
-5. **Return**: the updated `NodeState`. The `energy` field stays per-sample (shape `(batch,)`); summation over the batch dimension is owned by `forward_and_latent_grads()`/`forward_and_weight_grads()`, which need the resulting scalar for autodiff. The weight gradients therefore leave the node batch-summed; the trainer's `pc_weight_gradients` divides them once by the prediction count (`grad_denominator`) before they reach the optimizer.
+`predict()` must not read `state.z_latent` values (shape/dtype reads like `state.z_latent.shape[0]` are fine). The state-based solvers differentiate through such a read — `forward_and_latent_grads` re-binds `z_latent` and differentiates the whole forward — while `EPCInference` evaluates `z_mu` at the carried latent, so a `z_latent`-dependent prediction makes the two solver families minimize different energies. An energy term that needs the node's own latent belongs in `energy()`.
 
-The steps *between* predicting `z_mu` and writing it back are free: input aggregation, weights and biases, the choice of activation, and any internal sub-structure are all node-specific.
-
-> **muPC scaling is not applied inside `forward()`.** The inference and learning callsites scale inputs and gradients; doing so again here double-scales them. See the [Initialization and Scaling guide](05_initialization_and_scaling.md).
+> **muPC scaling is not applied inside `predict()`.** The inference and learning callsites scale inputs and gradients; doing so again here double-scales them. See the [Initialization and Scaling guide](05_initialization_and_scaling.md).
 
 ### Step 6: Use the Custom Node
 
@@ -312,6 +298,37 @@ structure = graph(
 )
 ```
 
+## Custom Energy Terms
+
+The default `energy()` scores the node's energy functional at `(state.z_latent, state.z_mu)`. Override it to add terms on top. `StorkeyHopfield` is the worked example — its attractor term reads `state.z_latent` inside `energy()` while its aux carries only `(W, strength)`, which come from params:
+
+```python
+@staticmethod
+def energy(params, inputs, state, aux, node_info):
+    """Combined energy: the functional default plus the attractor term."""
+    if aux is None:                        # source node: predict() never ran and
+        return NodeBase.energy(params, inputs, state, aux, node_info)  # no W exists
+
+    W, strength = aux                      # params-derived, snapshotted at predict time
+    energy = NodeBase.energy(params, inputs, state, aux, node_info)
+
+    z = state.z_latent                     # read the latent HERE, not via aux
+    wz = z @ W
+    D = z.shape[-1]
+    E_hopfield = (0.5 / D) * jnp.sum(wz * (wz - z), axis=-1)
+    return energy + strength * E_hopfield
+```
+
+The returned energy stays per-sample (shape `(batch,)`); summation over the batch dimension is owned by the gradient templates, which need the resulting scalar for autodiff.
+
+An override must tolerate `aux=None`: on the `in_degree == 0` path `predict()` never runs (and the param initializer gives sources empty params), so an extra term whose inputs a source cannot have falls back to the base energy, as above.
+
+### The aux pattern
+
+`aux` carries intermediates that `predict()` already computed and `energy()` wants to reuse — `Linear` returns its `pre_activation` (consumed by `LinearExplicitGrad`'s analytic gradients); `StorkeyHopfield` returns its prepared `(W, strength)`. The rule: **aux entries may depend only on `params` and `inputs`**, which don't change between `predict` and `energy`.
+
+**The anti-pattern**: an aux entry computed from `state.z_latent` in `predict`. aux is snapshotted when `predict` runs — under `EPCInference`, *before* `z_latent` is derived as `z_mu + error`. Under state-based inference that's harmless (z_latent doesn't change within the call), but under ePC anything in aux computed from `state.z_latent` is frozen at the carried latent while the rest of the energy uses the derived one. Concretely: a `predict` that stashes `gate = sigmoid(state.z_latent)` in aux and an `energy` returning `gate * ||z_latent - z_mu||**2` gives sPC the one-point energy `sigmoid(z)*||z - mu||**2` but gives ePC `sigmoid(z_old)*||z - mu||**2` — a function of two different latents. The two solvers then minimize different energies and no longer share equilibria. An energy term that needs the node's own latent reads `state.z_latent` inside `energy()`, as the Hopfield attractor term above does.
+
 ## Useful Patterns
 
 ### FlattenInputMixin
@@ -323,7 +340,7 @@ from fabricpc.nodes.base import FlattenInputMixin
 
 class MyDenseNode(FlattenInputMixin, NodeBase):
     @staticmethod
-    def forward(params, inputs, state, node_info):
+    def predict(params, inputs, state, node_info):
         batch_size = state.z_latent.shape[0]
         out_shape = node_info.shape
 
@@ -341,7 +358,7 @@ class MyDenseNode(FlattenInputMixin, NodeBase):
             pre_activation, node_info.activation.config
         )
 
-        # ... then compute error, update state, populate energy, and return state
+        return z_mu, None
 ```
 
 The mixin provides:
@@ -353,8 +370,8 @@ The mixin provides:
 
 `forward_and_latent_grads(params, inputs, state, node_info, is_clamped)` drives the inference phase. The base implementation's responsibilities:
 
-1. **In-degree-0 nodes are handled specially**, without calling `forward()`: `z_mu <- z_latent` (cast to `z_mu`'s dtype); error and all gradients are zero; energy is `E(z_latent, z_latent)` from the node's energy functional.
-2. **Every node with in-degree > 0 goes through `forward()`**. For unclamped out-degree-0 nodes the forward's `z_mu` is kept and written into `z_latent` (outputs track predictions in evaluation mode); error, energy, and all gradients are zeroed.
+1. **In-degree-0 nodes short-circuit the gradient computation**: the state comes from the template `forward()` (whose source guard mirrors `z_mu <- z_latent`, cast to `z_mu`'s dtype, with zero error) and all gradients are zero — the source's latent still moves via the contributions its downstream successors accumulate into its `latent_grad`.
+2. **Every node with in-degree > 0 — unclamped readouts included — takes the autodiff path**: error = `z_latent - z_mu`, energy as `forward()` assigns, `z_latent` relaxed like any other node. A Hopfield readout therefore settles onto its attractor.
 3. **The per-sample `state.energy` (shape `(batch,)`) is summed over the batch dimension** to a scalar. The resulting weight gradients are batch sums; `fabricpc.training.pc_weight_gradients` divides them once by the prediction count so the optimizer sees means per prediction.
 4. **`jax.value_and_grad` differentiates that scalar** w.r.t. the input tensors and `z_latent`.
 
@@ -362,13 +379,15 @@ It returns `(NodeState, input_grads, self_grad)`: the updated state, gradients w
 
 ### Explicit Gradients
 
-By default, FabricPC computes gradients with JAX autodiff: it differentiates your `forward()` to obtain both the latent gradients (inference) and the weight gradients (learning). For hand-coded gradients (e.g. for efficiency or control), override `forward_and_latent_grads()` and `forward_and_weight_grads()`. These return gradients alongside the updated state, so their signatures differ from `forward()`:
+By default, FabricPC computes gradients with JAX autodiff: it differentiates through your `predict()` to obtain both the latent gradients (inference) and the weight gradients (learning). For hand-coded gradients (e.g. for efficiency or control), override `forward_and_latent_grads()` and `forward_and_weight_grads()`. These return gradients alongside the updated state:
 
 ```python
 class MyNode(NodeBase):
     @staticmethod
     def forward_and_latent_grads(params, inputs, state, node_info, is_clamped):
-        # Run forward() for the updated state, then compute gradients analytically.
+        # Run the template forward() for the updated state, then compute
+        # gradients analytically. forward_with_aux() also surfaces predict's
+        # aux (LinearExplicitGrad reads pre_activation this way).
         node_class = node_info.node_class
         state = node_class.forward(params, inputs, state, node_info)
 
@@ -409,7 +428,7 @@ def get_slots():
     }
 
 @staticmethod
-def forward(params, inputs, state, node_info):
+def predict(params, inputs, state, node_info):
     # Access inputs by slot
     data_inputs = {k: v for k, v in inputs.items() if k.endswith(":in")}
     mask_inputs = {k: v for k, v in inputs.items() if k.endswith(":mask")}
@@ -431,7 +450,7 @@ class NodeState(NamedTuple):
     latent_grad: jnp.ndarray    # gradient accumulator for inference updates
 ```
 
-You cannot add custom fields to it. `state._replace(...)` only updates these existing fields, so there is no place to stash arbitrary per-step memory (such as an RNN hidden vector) on the `NodeState`.
+You cannot add custom fields to it. `state._replace(...)` only updates these existing fields, so there is no place to stash arbitrary per-step memory (such as an RNN hidden vector) on the `NodeState`. `aux` does not help here either: it is created and consumed within one forward trace, never stored.
 
 If your node needs additional state, route it through what already exists:
 
@@ -500,10 +519,11 @@ Creating custom nodes involves:
 1. **Subclass `NodeBase`**: Define your node class
 2. **Implement `get_slots()`**: Specify input slots
 3. **Implement `initialize_params()`**: Allocate and initialize weights/biases
-4. **Implement `forward()`**: Compute predictions, errors, and energy
+4. **Implement `predict()`**: Compute the prediction `z_mu`, returning `(z_mu, aux)`
 5. **Optional overrides**:
+   - `energy()`: For extra energy terms (read `state.z_latent` there, never via aux)
    - `get_variance_factor()`: For correct muPC scaling
    - `forward_and_latent_grads()` / `forward_and_weight_grads()`: For explicit gradients
 6. **Test**: Verify shapes, energy convergence, and gradient flow
 
-With these methods in place, your custom node integrates seamlessly with the rest of FabricPC's infrastructure: graph building, inference, learning, and scaling.
+The base templates (`forward`, `forward_with_aux`, `forward_from_error`) and the error pair (`pair_error`/`pair_latent`) are not override points. With the methods above in place, your custom node integrates with the rest of FabricPC's infrastructure: graph building, both inference parameterizations, learning, and scaling.
