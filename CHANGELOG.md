@@ -2,60 +2,39 @@
 
 ## [0.5.2] - 2026-09-08
 
-`iter_callback` receives one `IterContext` argument, a superset of
-`EpochContext` that carries the batch's parameters, optimizer state,
-`GraphState`, the batch, and its key, so per-update diagnostics (stability
-probes, state tracking) run as `train` callbacks instead of re-implementing
-the loop over `make_train_step`. Both contexts also carry `algorithm` and
-every RNG key the trainer derived at or above their level. The dashboarding
-iteration callback reads everything it logs from the context and
-`TrackingConfig` decides what it logs, so state tracking works through
-`create_tracking_callbacks`; `examples/transformer_demo.py` runs on `train`.
+Per-batch diagnostics run as `train` callbacks instead of custom training
+loops. `iter_callback` now receives one `IterContext` carrying the parameters,
+optimizer state, the batch, its RNG key, and the step's `GraphState`.
+The dashboarding callbacks run on `train`.
 
 ### Migration table
 
 | Changed | Replacement |
 |---|---|
-| `iter_callback(epoch_idx, batch_idx, metrics)` | `iter_callback(ctx: IterContext)` — read `ctx.epoch_idx`, `ctx.batch_idx`, `ctx.metrics`; `ctx.params`, `ctx.opt_state`, `ctx.state`, `ctx.step`, `ctx.batch`, `ctx.batch_key` are new |
-| `create_detailed_iter_callback(tracker, structure)` in a custom loop over `make_train_step` | removed — `train(..., iter_callback=create_iter_callback(tracker))` with `TrackingConfig(track_state=True, distribution_nodes=[...])` (summary stats) or `track_state_distributions=True` (histograms too) |
-| `create_epoch_callback` logging weight distributions once per epoch for every node | the iteration callback logs them every `tracking_every_n_batches` for `distribution_nodes`. An empty `distribution_nodes` (the default) logs no weight or state distributions, so set it to keep weight histograms |
-| `AimExperimentTracker.track_weight_distributions(...)` / `track_state(...)` called without `nodes` | `nodes` defaults to `config.distribution_nodes` instead of every node; empty logs nothing |
-| `run_inference_with_full_history(params, init, clamps, structure)` (unjitted Python loop, one `GraphState` per step) | `make_inference_history(structure, every=k)(params, init, clamps)` — jitted; returns `(final_state, states)` with `states` stacked on a leading axis at steps `0, k, 2k, ...` up to `infer_steps` |
-| `EpochContext(...)` constructed by hand (test fakes) | add `algorithm` and `epoch_key`, appended after `metrics`; the pre-0.5.2 field positions are unchanged |
+| `iter_callback(epoch_idx, batch_idx, metrics)` | `iter_callback(ctx: IterContext)`; read `ctx.epoch_idx`, `ctx.batch_idx`, `ctx.metrics` |
+| `create_detailed_iter_callback` in a custom loop | `train(..., iter_callback=create_iter_callback(tracker))` with `TrackingConfig(track_state=True, distribution_nodes=[...])` |
+| Weight histograms logged once per epoch for every node | logged every `tracking_every_n_batches` for `distribution_nodes` only. Set it, or no weight or state distributions are logged |
+| `run_inference_with_full_history` | `make_inference_history(structure, every=k)`, jitted |
+| Hand-built `EpochContext(...)` | add `algorithm` and `epoch_key` |
 
 ### New
 
-- `fabricpc.training.IterContext`: the `EpochContext` fields in their order,
-  then `batch_idx`, `state`, `batch_key`, `batch`. The internal step returns
-  the `GraphState` only when an `iter_callback` is supplied, and the trainer
-  drops its reference after the callback returns, so the no-callback path is
-  unchanged and a callback that does not retain `ctx.state` adds no device
-  memory.
-- `EpochContext.algorithm` and `EpochContext.epoch_key`
-  (`fold_in(rng_key, epoch_idx)`).
-- `TrackingConfig.distribution_nodes`: the nodes whose weight/bias and state
-  distributions are logged. `nodes_to_track` keeps its meaning: per-node
-  energy and inference-dynamics breakdowns.
-- `TrackingConfig.track_state`: per-node state summary statistics for
-  `distribution_nodes` on every `tracking_every_n_batches`-th batch;
-  `track_state_distributions` implies it. On a tracked batch under PC the
-  iteration callback settles the batch again under the updated parameters,
-  initialized from the step's batch key, in one jitted program, and logs the
-  state after `0, k, 2k, ...` inference steps up to `infer_steps` with
-  `k = state_tracking_every_n_infer_steps`: step 0 is the initialization
-  and, when `infer_steps` is a multiple of `k`, the last record is the
-  settled state. Cost: one jitted settle per tracked batch. Under backprop
-  it logs the feedforward state once. Previously
-  `track_state_distributions`, `state_tracking_every_n_infer_steps`, and
-  state tracking had no effect through `create_tracking_callbacks`.
-- `fabricpc.utils.dashboarding.make_inference_history(structure, every=k)`
-  and `make_tracked_settle(structure, every=k)` (clamps, latent
-  initialization, and history in one jitted program; the callback's
-  re-settle, usable from custom loops).
-- `train`'s callback parameters are annotated
-  `Callable[[EpochContext], Any]` and `Callable[[IterContext], Any]`.
-- `BayesianTuner` passes its progress `iter_callback` only when
-  `verbose=True`, so a quiet trial no longer syncs per batch.
+- `IterContext`: superset of the `EpochContext` fields, then `batch_idx`, `state`,
+  `batch_key`, `batch`. `EpochContext` gains `algorithm` and `epoch_key`.
+  New fields are appended; existing positions do not move.
+- `TrackingConfig.distribution_nodes`: the nodes whose weight and state
+  distributions are logged. Empty logs none, as an empty `nodes_to_track`
+  logs no per-node energy.
+- `TrackingConfig.track_state`: state summary statistics on tracked batches;
+  `track_state_distributions` implies it. Under PC the callback re-settles
+  the tracked batch under the updated parameters in one jitted program and
+  logs the state after `0, k, 2k, ...` inference steps
+  (`k = state_tracking_every_n_infer_steps`), the last being the settled
+  state. Under backprop it logs the feedforward state once.
+- `make_inference_history` and `make_tracked_settle` in
+  `fabricpc.utils.dashboarding`: the jitted re-settle, usable from custom
+  loops.
+- `BayesianTuner` passes its progress callback only when `verbose=True`.
 
 ## [0.5.1] - 2026-09-07
 

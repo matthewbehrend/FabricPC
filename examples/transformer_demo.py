@@ -131,6 +131,11 @@ def parse_args():
         help="Peak learning rate (default: 3e-5 for pc, 1e-4 for backprop)",
     )
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
+    parser.add_argument(
+        "--tracking",
+        action="store_true",
+        help="Use Aim tracking for metrics and distributions. Requires Aim installed and running. Run `aim up` in a separate terminal to start the Aim server.",
+    )
     args = parser.parse_args()
     if args.lr is None:
         # Gradients are means per token, so the 0.8 clip no longer normalizes
@@ -351,7 +356,7 @@ def main(args=None):
     print(f"Total parameters: {total_params:,}")
 
     # Aim tracking (optional)
-    if is_aim_available():
+    if is_aim_available() and args.tracking:
         tracking_config = TrackingConfig(
             experiment_name="transformer_pc_shakespeare",
             run_name=f"{'PC' if use_pc else 'BP'}_{args.num_blocks}blk_{args.embed_dim}d",
