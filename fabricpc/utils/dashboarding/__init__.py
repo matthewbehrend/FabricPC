@@ -17,6 +17,7 @@ from fabricpc.utils.dashboarding.callbacks import (
     create_epoch_callback,
     create_iter_callback,
     create_tracking_callbacks,
+    make_tracked_settle,
 )
 from fabricpc.utils.dashboarding.extractors import (
     extract_activation_statistics,
@@ -32,7 +33,7 @@ from fabricpc.utils.dashboarding.extractors import (
 )
 from fabricpc.utils.dashboarding.inference_tracking import (
     extract_history_for_plotting,
-    run_inference_with_full_history,
+    make_inference_history,
     run_inference_with_history,
     summarize_inference_convergence,
     train_step_with_history,
@@ -57,6 +58,7 @@ __all__ = [
     "create_iter_callback",
     "create_epoch_callback",
     "create_tracking_callbacks",
+    "make_tracked_settle",
     # Extractors
     "extract_node_energies",
     "extract_total_energy",
@@ -70,7 +72,7 @@ __all__ = [
     "flatten_for_distribution",
     # Inference tracking
     "run_inference_with_history",
-    "run_inference_with_full_history",
+    "make_inference_history",
     "train_step_with_history",
     "unstack_inference_history",
     "extract_history_for_plotting",

@@ -1329,6 +1329,10 @@ def test_iter_context_fields_and_callback_replacement(rng_key, algorithm):
     params_key, train_key = jax.random.split(rng_key)
     params = initialize_params(structure, params_key)
     loader = make_batches(rng_key, n_batches=2)
+    optimizer = optax.adam(1e-3)
+    # Public step on the same inputs; train copies params before donating, so
+    # the caller's arrays stay valid for the replay.
+    replay = make_train_step(structure, optimizer, algorithm=algorithm)
     calls = []
 
     def iter_callback(ctx: IterContext):
@@ -1347,6 +1351,19 @@ def test_iter_context_fields_and_callback_replacement(rng_key, algorithm):
         assert jnp.array_equal(
             ctx.batch_key, jax.random.fold_in(epoch_key, ctx.batch_idx)
         )
+        if ctx.step == 1:
+            # ctx.state and ctx.params are the state and update this batch's
+            # step produced, not some other batch's.
+            p1, _, _, s1 = replay(
+                params, optimizer.init(params), ctx.batch, ctx.batch_key
+            )
+            assert max_param_diff(ctx.params, p1) < PARITY_TOL
+            for name in structure.nodes:
+                assert jnp.allclose(
+                    ctx.state.nodes[name].z_latent,
+                    s1.nodes[name].z_latent,
+                    atol=PARITY_TOL,
+                )
         calls.append((ctx.epoch_idx, ctx.batch_idx, ctx.step))
         return ctx.batch_idx  # replaces the stored entry
 
@@ -1354,7 +1371,7 @@ def test_iter_context_fields_and_callback_replacement(rng_key, algorithm):
         params,
         structure,
         loader,
-        optax.adam(1e-3),
+        optimizer,
         {"num_epochs": 2},
         train_key,
         algorithm=algorithm,

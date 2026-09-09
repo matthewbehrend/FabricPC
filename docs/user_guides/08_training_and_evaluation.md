@@ -129,9 +129,10 @@ supplied — both force a per-batch device sync):
 ## Callbacks
 
 **Iteration callback** — called after each batch with a single `IterContext`
-argument (fields: `epoch_idx`, `batch_idx`, `step`, `params`, `opt_state`,
-`state`, `structure`, `config`, `algorithm`, `rng_key`, `epoch_key`,
-`batch_key`, `batch`, `metrics`). `metrics` holds this batch's float
+argument (fields, in order: the `EpochContext` fields `epoch_idx`, `step`,
+`params`, `opt_state`, `structure`, `config`, `rng_key`, `metrics`,
+`algorithm`, `epoch_key`, then `batch_idx`, `state`, `batch_key`, `batch`;
+new fields are appended). `metrics` holds this batch's float
 metrics; `state` is the batch's `GraphState` (settled under PC, the
 feedforward pass under backprop); `batch` is the converted batch dict and
 `batch_key` the key the step used for latent initialization; `step` counts
@@ -149,8 +150,9 @@ result = train(..., iter_callback=my_iter_callback)
 
 **Epoch callback** — called after each epoch with a single `EpochContext`
 argument (fields: `epoch_idx`, `step`, `params`, `opt_state`, `structure`,
-`config`, `algorithm`, `rng_key`, `epoch_key`, `metrics`; `epoch_key` is
-`fold_in(rng_key, epoch_idx)`, the key the epoch's batch keys derive from):
+`config`, `rng_key`, `metrics`, `algorithm`, `epoch_key`; new fields are
+appended; `epoch_key` is `fold_in(rng_key, epoch_idx)`, the key the epoch's
+batch keys derive from):
 
 ```python
 from fabricpc.training import EpochContext, evaluate

@@ -302,3 +302,33 @@ def test_iter_callback_prints_progress_when_verbose(tmp_path, monkeypatch, capsy
     t = _run_one(tuner, config)
     assert t.state == optuna.trial.TrialState.COMPLETE
     assert "Batch 50 | Energy: 100.0000" in capsys.readouterr().out
+
+
+def test_iter_callback_omitted_unless_verbose(tmp_path, monkeypatch):
+    """With verbose=False the tuner passes no iter_callback, so train neither
+    syncs per batch nor returns the step's GraphState."""
+    seen = {}
+    inner = _fake_train([100.0], [2.0])
+
+    def recording_train(*args, **kwargs):
+        seen["iter_callback"] = kwargs.get("iter_callback")
+        return inner(*args, **kwargs)
+
+    tuner = _make_tuner(tmp_path)
+    monkeypatch.setattr(tuner_mod, "train", recording_train)
+    monkeypatch.setattr(
+        tuner_mod,
+        "evaluate",
+        lambda *a, **k: {"perplexity": 7.0, "cross_entropy": 1.95, "accuracy": 0.1},
+    )
+    config = {
+        **tuner.base_config,
+        "depth": 1,
+        "eta_infer": 0.1,
+        "infer_steps": 3,
+        "lr": 1e-3,
+        "weight_init_std": 0.02,
+    }
+    t = _run_one(tuner, config)
+    assert t.state == optuna.trial.TrialState.COMPLETE
+    assert seen["iter_callback"] is None

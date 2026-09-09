@@ -105,11 +105,11 @@ class TrainResult(NamedTuple):
 class EpochContext(NamedTuple):
     """Context passed to ``epoch_callback`` at the end of each epoch.
 
-    Grows by field addition, never by positional breakage — read fields by
-    name. ``metrics`` holds the epoch means of the per-batch training
-    metrics. ``rng_key`` is the base training key and ``epoch_key`` is
-    ``fold_in(rng_key, epoch_idx)``, the key this epoch's batch keys derive
-    from. ``algorithm`` is the ``algorithm`` passed to :func:`train`.
+    Grows by field addition at the end, never by positional breakage — read
+    fields by name. ``metrics`` holds the epoch means of the per-batch
+    training metrics. ``rng_key`` is the base training key and ``epoch_key``
+    is ``fold_in(rng_key, epoch_idx)``, the key this epoch's batch keys
+    derive from. ``algorithm`` is the ``algorithm`` passed to :func:`train`.
 
     Note: the internal training step donates the params/opt_state buffers,
     so ``params``/``opt_state`` are valid during the callback but must be
@@ -123,18 +123,18 @@ class EpochContext(NamedTuple):
     opt_state: optax.OptState
     structure: GraphStructure
     config: dict
-    algorithm: Algorithm
     rng_key: jax.Array
-    epoch_key: jax.Array
     metrics: Dict[str, float]
+    algorithm: Algorithm
+    epoch_key: jax.Array
 
 
 class IterContext(NamedTuple):
     """Context passed to ``iter_callback`` after each batch's update.
 
-    A superset of :class:`EpochContext`: every field there, plus the
-    per-batch ones. Grows by field addition, never by positional breakage —
-    read fields by name.
+    A superset of :class:`EpochContext`: its fields first, in its order, then
+    the per-batch ones. Grows by field addition at the end, never by
+    positional breakage — read fields by name.
 
     ``step`` counts optimizer updates applied in this :func:`train` call,
     this batch included. ``state`` is the GraphState the step produced for
@@ -153,19 +153,19 @@ class IterContext(NamedTuple):
     """
 
     epoch_idx: int
-    batch_idx: int
     step: int
     params: GraphParams
     opt_state: optax.OptState
-    state: GraphState
     structure: GraphStructure
     config: dict
-    algorithm: Algorithm
     rng_key: jax.Array
+    metrics: Dict[str, float]
+    algorithm: Algorithm
     epoch_key: jax.Array
+    batch_idx: int
+    state: GraphState
     batch_key: jax.Array
     batch: Dict[str, jnp.ndarray]
-    metrics: Dict[str, float]
 
 
 # ---------------------------------------------------------------------------
@@ -695,12 +695,13 @@ def train(
                     replaced = iter_callback(ctx)
                     if replaced is not None:
                         stored = replaced
-                    # Drop the trainer's references so the state's device
-                    # buffers free unless the callback retained them.
                     del ctx
                 batch_metrics.append(stored)
             else:
                 batch_metrics.append(metrics)
+            # The context and this name were the trainer's only references to
+            # the batch's GraphState; dropping both frees its device buffers
+            # unless the callback retained them.
             del state
             progress.update(1)
 

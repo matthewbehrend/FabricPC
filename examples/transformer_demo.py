@@ -359,6 +359,7 @@ def main(args=None):
             track_weight_distributions=True,
             track_state_distributions=True,
             nodes_to_track=TRACKED_NODES,
+            distribution_nodes=TRACKED_NODES,
             tracking_every_n_batches=50,
             state_tracking_every_n_infer_steps=5,
         )
@@ -425,9 +426,11 @@ def main(args=None):
     # train's tqdm bar shows the per-batch energy: the internal energy per
     # token under PC, the per-token cross-entropy (target_energy under
     # CrossEntropyEnergy) under backprop. The tracking callback logs energy,
-    # weight distributions, per-node energy and, on tracked batches under PC,
-    # the inference history, as tracking_config asks. Per-batch keys follow
-    # the trainer's fold_in stream.
+    # per-node energy for nodes_to_track, weight distributions for
+    # distribution_nodes and, on tracked batches under PC, the states of a
+    # jitted re-settle every state_tracking_every_n_infer_steps steps, as
+    # tracking_config asks. Per-batch keys follow the trainer's fold_in
+    # stream.
     result = train(
         params,
         structure,

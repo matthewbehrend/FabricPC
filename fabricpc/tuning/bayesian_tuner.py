@@ -196,7 +196,10 @@ class BayesianTuner:
                 train_key,
                 algorithm=self.algorithm,
                 verbose=False,
-                iter_callback=iter_callback,
+                # Supplying an iter_callback forces a per-batch device sync
+                # and the step's GraphState return; only the verbose print
+                # needs either.
+                iter_callback=iter_callback if self.verbose else None,
                 epoch_callback=epoch_callback,
             )
             trained_params = result.params
