@@ -12,7 +12,7 @@ FabricPC ships two inference solvers for predictive coding (PC). The state-based
 
 1. It builds an exact oracle for linear-Gaussian networks. On such a network the PC energy is a quadratic, its minimizer is a least-squares solution, and Innocenti et al. (2024, Theorem 1) give a closed form on chains that cross-checks the oracle. Both solvers are verified against it, including their exact stability bounds.
 2. It shows that ePC's regime is set by the curvature the starting gradient excites, not by η·T alone. Here η is the error learning rate `eta_infer`, T the step count `infer_steps`, λ an eigenvalue of the energy's Hessian in error coordinates, and λ_max the largest one the starting gradient excites. Small η·T·λ on the modes that carry the gradient makes ePC backprop with rescaled gradients (Goemaere et al, 2026, Theorem C.9); η·λ_max < 2 is required for stability at every T; and at odd T the output layer's weight gradient reverses sign along the top mode once (1 − ηλ_max)^T < −1/(λ_max − 1), at T = 1 once η(λ_max − 1) > 1, before the iteration bound.
-3. It measures the excited spectrum on the muPC ResNet-18 demo. At init λ_max = 16.4 and the 2-epoch accuracy sweep is fitted by a single eigenvalue of 12.0; the Hessian is indefinite at init (λ_min = −0.42, 1.2% of the gradient weight on negative curvature), and most of the gradient weight sits near the precision floor (f̄ = 0.010 against f_max = 0.080 at the defaults), so the accuracy transition follows the top modes' relaxation. Four 30-epoch control runs on the normalized trainer (Section 5.9) separate the two candidate causes of that growth: λ_max drifts from 22 to 24 under backprop and to 29 under ePC at (1e-3, 1), both of which reach 68 to 69% accuracy, while at the defaults (1e-3, 5) it goes from 27 at epoch 8 to 31,000 at epoch 15 and the run collapses to chance, and the Frobenius norm of every convolution weight falls on the same weight-decay schedule in all four runs. The growth is driven by ePC's relaxation, not by the weight scale, and the output-gradient reversal flag fires one probe before the stability crossing in both collapsing cells.
+3. It measures the excited spectrum on the muPC ResNet-18 demo. At init λ_max = 16.4 and the 2-epoch accuracy sweep is fitted by a single eigenvalue of 12.0; the Hessian is indefinite at init (λ_min = −0.42, 1.2% of the gradient weight on negative curvature), and most of the gradient weight sits near the precision floor (f̄ = 0.010 against f_max = 0.080 at the defaults), so the accuracy transition follows the top modes' relaxation. Five 30-epoch control runs on the normalized trainer (Section 5.9) separate the two candidate causes of that growth: λ_max drifts from 22 to 24 under backprop, to 29 under ePC at (1e-3, 1), and to 34 under ePC at the demo's defaults (3e-4, 5), all three of which reach 68 to 69% accuracy, while at the library defaults (1e-3, 5) it goes from 27 at epoch 8 to 31,000 at epoch 15 and the run collapses to chance, and the Frobenius norm of every convolution weight falls on the same weight-decay schedule in all five runs. The growth is driven by ePC's relaxation, not by the weight scale, and the output-gradient reversal flag fires one probe before the stability crossing in both collapsing cells.
 
 | Quantity | Value | Source |
 |---|---|---|
@@ -26,10 +26,11 @@ FabricPC ships two inference solvers for predictive coding (PC). The state-based
 | Control run (1e-3, 5), normalized trainer, probed every 50 updates | reversal flag at update 2,700 (epoch 14), η·λ_max > 2 at 2,750 (epoch 15), chance at epoch 15; λ_max 22 → 31,000 | `docs/reports/data/epc_regime_track__pc_eta0.001_T5.csv` |
 | Control run (1e-3, 1) | 67.7% at epoch 30; λ_max 22 → 29; no flag | `docs/reports/data/epc_regime_track__pc_eta0.001_T1.csv` |
 | Control run, backprop trainer | 69.0% at epoch 30; λ_max 22 → 24 | `docs/reports/data/epc_regime_track__backprop.csv` |
+| Control run (3e-4, 5), the demo's defaults | 67.8% at epoch 30; λ_max 22 → 34; no flag | `docs/reports/data/epc_regime_track__pc_eta0.0003_T5.csv` |
 | Control run (1e-2, 1) | reversal at update 1,150 (epoch 6), crossing at 1,200 (epoch 7), chance at epoch 7; λ_max = 6,132 and λ_min = −354 at update 1,200 | `docs/reports/data/epc_regime_track__pc_eta0.01_T1.csv` |
 | Steps to contract by 1e-3, linear chain, depth 20 | sPC 30,343, ePC 75 | `--section convergence_spectra` |
 | Lanczos vs oracle, depth-5 chain: λ_max, excited λ_min, f̄ | relative errors 1.9e-7, 4.3e-8, 2.8e-9 | `--section stability` |
-| Test suite at the final commit of this work (2026-09-09) | 654 passed, 6 skipped | `python -m pytest tests/` |
+| Test suite at the final commit of this work (2026-09-09) | 658 passed, 6 skipped | `python -m pytest tests/` |
 
 ## 2. Background
 
@@ -124,7 +125,7 @@ Section 5.8 shows that on the ResNet-18 the accuracy transition follows f_max, n
 | Solver hook | `EPCInference.error_energy` | the ε-energy closure, one owner for the solver's gradient, the HVP, and the Lanczos estimator                                                                                                                                              |
 | Regime verdict | `EPCInference.regime(spectrum) -> Regime` | `unstable`, `output_gradient_reverses`, `f_weighted`, `f_max`, `band`, `negative_weight`, `growth_min`; `str()` is the one-line label the demos print at init; replaces `regime_label`                                                     |
 | Regime probe | `fabricpc.training.RegimeProbe` | a `train` callback recording the spectrum, the regime flags, and every weight's Frobenius norm every N updates, plus the test accuracy per epoch, to a CSV; `first_reversal`, `first_crossing`, `first_chance`, `growth_phases`, `summary` |
-| Tests | `tests/test_linear_pc_oracle.py`, `tests/test_epsilon_spectrum.py`, `tests/test_inference_epc.py`, `tests/test_regime_probe.py` | 129 tests across the four files (69, 14, 38, 8), all passing at the final commit; each results section ends with the command that reproduces it                                                                                            |
+| Tests | `tests/test_linear_pc_oracle.py`, `tests/test_epsilon_spectrum.py`, `tests/test_inference_epc.py`, `tests/test_regime_probe.py` | 133 tests across the four files (73, 14, 38, 8), all passing at the final commit; each results section ends with the command that reproduces it                                                                                            |
 | Analysis script | `scripts/epc_analysis.py` | four CPU sections (about 20 s), `--resnet18` (GPU), `--plot_track`                                                                                                                                                                         |
 | Demo output | `examples/resnet18_cifar10_demo.py` | prints the regime and the spectrum at init; `--track_regime N` runs the probe; docstring records the 100-epoch outcomes and the control-run table                                                                                          |
 
@@ -132,20 +133,24 @@ Section 5.8 shows that on the ResNet-18 the accuracy transition follows f_max, n
 
 ### 5.1 The oracle against itself
 
-| Check                                                                                             | Fixtures | Tolerance | Result |
-|---------------------------------------------------------------------------------------------------|---|---|---|
-| Hand-computed scalar chain (Section 2.2)                                                          | 1 | exact | pass |
-| Innocenti (2024) Theorem 1 closed form = least squares                                            | chains of depth 1–4, with biases, with precisions (2.0, 0.5), muPC | rtol 1e-10 | pass |
-| Precision-weighted pull-back p_l·ε_l* = p_y·ε_y*·P_lᵀ                                             | chains | atol 1e-10 | pass |
-| Unclamped readout: E* = 0, z* = feedforward                                                       | 1 | atol 1e-12 | pass |
-| Normal equations Aᵀ(Az* − c) = 0                                                                  | fork-merge, prior source, clamped internal node | 1e-10 relative | pass |
-| H_ε = diag(p) + Σ_clamped p_t J_tᵀJ_t, det M = 1, B strictly lower-triangular                     | 3 graphs | atol 1e-10 | pass |
-| Eigenvalue floor: λ_min(H_ε) ≥ min precision on chains; < 1 with an unclamped source              | 6 + 1 | — | pass |
-| Validator rejects tanh, cross-entropy, flattened input, StorkeyHopfield, cycles at unroll 1 and 2 | 6 | raises | pass |
+| Check                                                                                                                                                            | Fixtures | Tolerance | Result |
+|------------------------------------------------------------------------------------------------------------------------------------------------------------------|---|---|---|
+| Hand-computed scalar chain (Section 2.2)                                                                                                                         | 1 | rtol 1e-7 | pass |
+| Innocenti (2024) Theorem 1 closed form = least squares                                                                                                           | chains of depth 1–4, the stiff chain (weight std 0.8), with biases, with precisions (2.0, 0.5), muPC | rtol 1e-10 | pass |
+| Precision-weighted pull-back p_l·ε_l* = p_y·ε_y*·P_lᵀ on every hidden node                                                                                        | 7 chains | atol 1e-10 | pass |
+| Readouts against the residual: ε_t* = the row block of A z* − c for node t, divided by √p_t, on every node with in-degree > 0; E* = ½‖A z* − c‖² per sample         | fork-merge, prior source, clamped internal node, chain with biases, chain with precisions | atol 1e-12 | pass |
+| Unclamped readout: E* = 0, z* = feedforward                                                                                                                      | 1 | atol 1e-12 | pass |
+| Normal equations Aᵀ(A z* − c) = 0                                                                                                                                | fork-merge, prior source, clamped internal node | 1e-10 relative | pass |
+| H_ε = diag(p) + Σ_clamped p_t J_tᵀJ_t, det M = 1, B strictly lower-triangular                                                                                    | 3 graphs | atol 1e-10 | pass |
+| Eigenvalue floor: λ_min(H_ε) ≥ min precision on chains; < 1 with an unclamped source                                                                             | 7 + 1 | 1e-10 | pass |
+| Stability bound 2/λ_max: raises when the Hessian has no positive eigenvalue; reads the largest positive eigenvalue when negative ones are present                 | 3 hand-built matrices | exact; raises | pass |
+| Gradient weights w_k = squared overlap of g0 with eigenvector k, summed over the batch and normalized; f̄ averages f over the positive modes only, NaN with none | 1 hand-built Hessian and g0 | rtol 1e-7 (w_k), 1e-6 (f̄) | pass |
+| Relaxed fraction f(λ) = 1 − (1 − η·λ)^T; steps to contract every mode below a tolerance; raises when η exceeds 2/λ_max                                            | 1 hand-built spectrum | rtol 1e-7; exact; raises | pass |
+| Validator rejects tanh, cross-entropy, flattened input, StorkeyHopfield, cycles at unroll 1 and 2                                                                | 6 | raises | pass |
 
 The cycle check matters: a cycle unrolled once visits each member once, so the schedule length equals the node count, and only a back-edge test against `node_order` detects it (`tests/test_topological_schedule.py:121-124` pins the schedule).
 
-Reproduce: `python -m pytest tests/test_linear_pc_oracle.py::TestOracleSelfChecks -v` (31 tests; all passed on 2026-09-09).
+Reproduce: `python -m pytest tests/test_linear_pc_oracle.py::TestOracleSelfChecks -v` (35 tests; all passed on 2026-09-09).
 
 ### 5.2 Both solvers reach the oracle
 
@@ -162,7 +167,7 @@ Twelve graphs: chains of depth 1–4 (input 5, hidden 4, output 3, weight std 0.
 
 The muPC chain under sPC confirms a design fact: with identity activations the muPC top-down scale equals the chain-rule factor of the pre-scaled input (`jacobian_gain` = 1) and the self-gradient scale is 1, so sPC with muPC is plain gradient descent on the input-scaled energy. The equilibrium test alone cannot pin that, because a diagonal preconditioner shares the fixed point; the muPC stability bracket does, and since revision (b) it runs. The stability brackets pin the scale of each gradient implementation, not only its direction: a gradient off by a constant factor would pass every equilibrium test and fail the bracket.
 
-Reproduce: `python -m pytest tests/test_linear_pc_oracle.py -v` runs every row of Sections 5.1 and 5.2 (69 tests: 31 self-checks, 12 + 12 equilibria, 4 stability brackets, 2 Hessian-vector products, 8 Lanczos cases; 69 passed, 0 failed, 0 skipped on 2026-09-09).
+Reproduce: `python -m pytest tests/test_linear_pc_oracle.py -v` runs every row of Sections 5.1 and 5.2 (73 tests: 35 self-checks, 12 + 12 equilibria, 4 stability brackets, 2 Hessian-vector products, 8 Lanczos cases; 73 passed, 0 failed, 0 skipped on 2026-09-09).
 
 ### 5.3 One ePC step is backprop
 
@@ -347,11 +352,11 @@ Reproduce: the spectrum at init with `python scripts/epc_analysis.py --resnet18`
 
 ### 5.9 Control runs
 
-Both tracked cells of Section 5.8 collapsed, so "η·λ_max crossed 2 before the collapse" is an ordering. The design plan fixed four runs and a reading rule in advance, each the first 30 epochs of the 100-epoch schedule at seed 42 with the normalized trainer of release 0.5.1, probed every 50 updates on the same 64-sample test batch by `RegimeProbe` (the spectrum's two extremes, the gradient weight on negative curvature, f̄, the reversal and crossing flags, the Frobenius norm of every weight, the test accuracy per epoch), run on 2026-09-08 on the RTX 3090 (23, 14, 7, and 14 minutes):
+Both tracked cells of Section 5.8 collapsed, so "η·λ_max crossed 2 before the collapse" is an ordering. The design plan fixed four runs and a reading rule in advance, each the first 30 epochs of the 100-epoch schedule at seed 42 with the normalized trainer of release 0.5.1, probed every 50 updates on the same 64-sample test batch by `RegimeProbe` (the spectrum's two extremes, the gradient weight on negative curvature, f̄, the reversal and crossing flags, the Frobenius norm of every weight, the test accuracy per epoch), run on 2026-09-08 on the RTX 3090 (23, 14, 7, and 14 minutes), plus a fifth run at the demo's defaults (3e-4, 5) added on 2026-09-09 (23 minutes):
 
 ```
 python examples/resnet18_cifar10_demo.py --num_epochs 30 --schedule_epochs 100 --augment --activation gelu \
-    --track_regime 50 --eval_every 1 [--eta_infer 1e-3 --infer_steps 5 | --eta_infer 1e-3 --infer_steps 1 | --trainer backprop | --eta_infer 1e-2 --infer_steps 1]
+    --track_regime 50 --eval_every 1 [--eta_infer 1e-3 --infer_steps 5 | --eta_infer 1e-3 --infer_steps 1 | --trainer backprop | --eta_infer 1e-2 --infer_steps 1 | --eta_infer 3e-4 --infer_steps 5]
 ```
 
 Reading rule, fixed in advance. If λ_max and the weight norms grow at a comparable rate in the backprop and (1e-3, 1) runs as in the collapsing cells, the growth is a weight-scale effect of this parameterization (no normalization layers, weight decay 1e-2) and the remedy is a rate that follows λ_max or weight-norm control; if they grow only in the collapsing cells, ePC's relaxation feeds the growth.
@@ -376,15 +381,16 @@ Growth phases from `probe.summary()`: λ_max between 16 and 27 through epoch 8 (
 
 **The weight norms.** The total Frobenius norm falls monotonically from 1,670 to 1,641 through epoch 14, while λ_max grows 74×; it rises only in the collapse epoch (1,641 → 1,656) and falls again after it. Per weight, every convolution kernel's norm fell by 1.5 to 1.7% between epochs 1 and 14 (for example `s4b1_conv_a->s4b1_conv_b:in` 768 → 754) and only the output layer's grew (4.51 → 6.07, +35%). Weight decay at 1e-2 keeps the weight scale shrinking through the entire growth of λ_max. λ_max = 1 + σ_max(J)² is a spectral quantity, and J is a product of the weights' actions on the gelu derivatives along the network, so it grows through alignment of the weights and the activation pattern along one direction, not through their norms. Frobenius-norm control would not have bounded it.
 
-**The controls.** The survivor (1e-3, 1) and the backprop trainer have the same weight-norm trajectory as the defaults (1,670 → 1,597 and 1,670 → 1,601 over 30 epochs, falling every epoch) and no runaway:
+**The controls.** The survivors (1e-3, 1) and (3e-4, 5) and the backprop trainer have the same weight-norm trajectory as the defaults (1,670 → 1,597, 1,670 → 1,598, and 1,670 → 1,601 over 30 epochs, falling every epoch) and no runaway:
 
 | run | accuracy at epochs 8, 12, 15, 30 | λ_max at epochs 1, 8, 12, 15, 30 | λ_min range | negative weight | flags |
 |---|---|---|---|---|---|
 | (1e-3, 1) | 49.0, 56.4, 59.2, 67.7% | 22.0, 17.0, 19.6, 20.9, 29.2 (max 30.2 at epoch 29) | −0.03 to −0.95 | ≤ 0.005 | none |
+| (3e-4, 5) | 49.3, 56.7, 59.6, 67.8% | 22.0, 17.8, 21.0, 23.4, 33.8 (max 34.6 at epoch 29) | −0.03 to −1.20 | ≤ 0.006 | none |
 | backprop | 50.3, 57.9, 60.9, 69.0% | 21.9, 16.3, 17.8, 19.1, 24.1 (max 24.9 at epoch 29) | −0.04 to −1.15 | ≤ 0.008 | none |
 | (1e-3, 5) | 50.2, 55.8, 10.0, 9.9% | 22.0, 27.3, 102.8, 31,060, 1.0 | −0.05 to −1,960 | ≤ 0.10 | reversal 2,700, crossing 2,750 |
 
-Over epochs 9 to 12, where the defaults' λ_max went 38 → 103, the survivor's went 18 → 20 and backprop's 17 → 18. The generic drift is about 1.01× per epoch in both controls (22 → 24 and 22 → 29 over 30 epochs, with epoch-to-epoch ratios between 0.86 and 1.16). The Hessian is indefinite at init in every run (λ_min = −0.37) and stays mildly indefinite in the controls, with under 1% of the gradient weight on negative curvature.
+Over epochs 9 to 12, where the defaults' λ_max went 38 → 103, the (1e-3, 1) survivor's went 18 → 20, the (3e-4, 5) survivor's 19 → 21, and backprop's 17 → 18. The generic drift is about 1.01× per epoch in the two controls of the plan (22 → 24 and 22 → 29 over 30 epochs, with epoch-to-epoch ratios between 0.86 and 1.16) and 1.015× per epoch at (3e-4, 5) (22 → 34, ratios between 0.93 and 1.17 from epoch 3). The (3e-4, 5) and (1e-3, 1) runs share the seed and the data order, and the (3e-4, 5) λ_max sits above the other's in every epoch from 2 onward. The Hessian is indefinite at init in every run (λ_min = −0.37) and stays mildly indefinite in the controls, with under 1% of the gradient weight on negative curvature.
 
 **η = 1e-2, T = 1** (`docs/reports/data/epc_regime_track__pc_eta0.01_T1.csv`). Accuracy 44.46% at epoch 5, 43.79% at epoch 6, 10.12% at epoch 7. λ_max 22 → 27.8 (epoch 4) → 38.4 (5) → 166.9 (6) → 6,132 (7) → 1.0 from epoch 8. Probes across the collapse:
 
@@ -397,9 +403,9 @@ Over epochs 9 to 12, where the defaults' λ_max went 38 → 103, the survivor's 
 
 The plan predicted the reversal flag at update 1,100; it fired at 1,150, one probe later, because η(λ_max − 1) was 0.85 at 1,100 on this trainer. Update 1,200 reports λ_max = 6,132 with λ_min = −354: the Hessian is strongly indefinite as the network dies, and revision (a)'s power iteration, which converges to the eigenvalue of largest magnitude, returned a negative number here (−9,399 on the batch-summed trainer) where Lanczos reports both extremes. Accuracy fell in the epoch of the reversal and was at chance one epoch later, as in the batch-summed run.
 
-**Reading.** The second case of the rule: λ_max and the weight norms do not grow in the runs that do not collapse (the norms fall in every run, the backprop λ_max drift is 1.01× per epoch), and the runaway occurs only in the two ePC cells with the larger η·T. ePC's relaxation feeds the growth. The remedy the rule assigns is therefore not weight-norm control but keeping the solver in the regime where its weight gradients are backprop's, or a rate that follows λ_max (Section 6.4). Why a run whose regime at init reads backprop-like on both f̄ (0.010) and f_max (0.080) still drives λ_max up is not settled by these runs: over epochs 9 to 12 the defaults' f_max rose from 0.17 to 0.42 (λ_max 38 → 103) while accuracy was still climbing, so the departure from backprop's gradient and the growth of λ_max reinforce each other once λ_max has drifted enough for η·T·λ_max to leave the backprop regime, and the survivor at T = 1 sits five times lower on η·T at the same η.
+**Reading.** The second case of the rule: λ_max and the weight norms do not grow in the runs that do not collapse (the norms fall in every run, the backprop λ_max drift is 1.01× per epoch), and the runaway occurs only in the two ePC cells with the larger η·T. ePC's relaxation feeds the growth. The remedy the rule assigns is therefore not weight-norm control but keeping the solver in the regime where its weight gradients are backprop's, or a rate that follows λ_max (Section 6.4). Why a run whose regime at init reads backprop-like on both f̄ (0.010) and f_max (0.080) still drives λ_max up is not settled by these runs: over epochs 9 to 12 the defaults' f_max rose from 0.17 to 0.42 (λ_max 38 → 103) while accuracy was still climbing, so the departure from backprop's gradient and the growth of λ_max reinforce each other once λ_max has drifted enough for η·T·λ_max to leave the backprop regime, and the survivor at T = 1 sits five times lower on η·T at the same η. The (3e-4, 5) survivor sits 3.3 times lower on η·T at the same T, so at fixed T lowering η by that factor removes the runaway within 30 epochs; its λ_max still ends above the T = 1 run's (34 against 29) at a similar η·T (1.5e-3 against 1e-3).
 
-**What the two relaxed fractions signal during training.** In the defaults run f̄ (last probe of each epoch) went 0.027, 0.052 (epoch 8), 0.065, 0.076, 0.110 (epoch 11), 0.151, 0.271, 0.815 (epoch 14, the reversal probe): it crossed the 0.1 band edge in epoch 11, three epochs before the reversal and one before the accuracy peak. f_max crossed 0.1 in epoch 5 (0.10) and stood at 0.33 in epoch 11, while accuracy climbed for seven more epochs. In the (1e-2, 1) run f̄ went 0.055, 0.066, 0.077, 0.103 (epoch 4), 0.133, 0.585 (epoch 6, the reversal), two epochs of warning, while f_max was already 0.18 in epoch 1 and that run trained to 44% before collapsing. In the survivor f̄ stayed between 0.005 and 0.009 and f_max at 0.02 for 30 epochs. So the two measures answer different questions: f_max at init predicts the 2-epoch accuracy penalty of a fixed (η, T) (Section 5.8), and f̄ rising through 0.1 during training is the early sign that the gradient-carrying bulk has started to relax and λ_max is about to run away. That division is the reason the probe's band stays on f̄ with f_max beside it.
+**What the two relaxed fractions signal during training.** In the defaults run f̄ (last probe of each epoch) went 0.027, 0.052 (epoch 8), 0.065, 0.076, 0.110 (epoch 11), 0.151, 0.271, 0.815 (epoch 14, the reversal probe): it crossed the 0.1 band edge in epoch 11, three epochs before the reversal and one before the accuracy peak. f_max crossed 0.1 in epoch 5 (0.10) and stood at 0.33 in epoch 11, while accuracy climbed for seven more epochs. In the (1e-2, 1) run f̄ went 0.055, 0.066, 0.077, 0.103 (epoch 4), 0.133, 0.585 (epoch 6, the reversal), two epochs of warning, while f_max was already 0.18 in epoch 1 and that run trained to 44% before collapsing. In the survivor f̄ stayed between 0.005 and 0.009 and f_max at 0.02 for 30 epochs. In the (3e-4, 5) survivor f̄ rose from 0.008 to 0.020 and f_max from 0.027 to 0.050 over 30 epochs, both under the 0.1 band edge throughout. So the two measures answer different questions: f_max at init predicts the 2-epoch accuracy penalty of a fixed (η, T) (Section 5.8), and f̄ rising through 0.1 during training is the early sign that the gradient-carrying bulk has started to relax and λ_max is about to run away. That division is the reason the probe's band stays on f̄ with f_max beside it.
 
 Reproduce: the four demo commands of Section 7 write the CSVs in `docs/reports/data/`; `python scripts/epc_analysis.py --plot_track docs/reports/data/epc_regime_track__*.csv` renders them; `python -m pytest tests/test_regime_probe.py -v` checks the probe (8 tests: 6 on the recorded rows and the CSV round-trip, 2 running it as `train` callbacks under `pc` and `backprop`; all passed on 2026-09-09).
 
@@ -459,7 +465,7 @@ The reading rule selected the solver-side remedy: a stability-aware rate that fo
 
 All commands run from the repository root at the final commit of this work on branch `matthew_cedric/epc`, inside the project environment (`.venv/bin/python`). Each results section in Section 5 ends with the exact test class or script section that reproduces it.
 
-Tests (CPU; the four files of this work take about 50 s and hold 129 tests: `test_linear_pc_oracle.py` 69, `test_inference_epc.py` 38, `test_epsilon_spectrum.py` 14, `test_regime_probe.py` 8, all passed and none skipped on 2026-09-09; the full suite takes about three and a half minutes, 654 passed and 6 skipped, none of the skips belonging to this work):
+Tests (CPU; the four files of this work take about 50 s and hold 133 tests: `test_linear_pc_oracle.py` 73, `test_inference_epc.py` 38, `test_epsilon_spectrum.py` 14, `test_regime_probe.py` 8, all passed and none skipped on 2026-09-09; the full suite takes about three and a half minutes, 658 passed and 6 skipped on 2026-09-09, none of the skips belonging to this work):
 
 ```
 python -m pytest tests/test_linear_pc_oracle.py tests/test_epsilon_spectrum.py tests/test_inference_epc.py tests/test_regime_probe.py -q
@@ -479,17 +485,17 @@ The excited spectrum at init on the muPC ResNet-18 (GPU, CIFAR-10 via tensorflow
 python scripts/epc_analysis.py --resnet18
 ```
 
-The spectrum during training (Section 5.9's control runs, 23, 14, 7, and 14 minutes on the RTX 3090; each writes `epc_regime_track__pc_eta{eta}_T{T}.csv` or `docs/reports/data/epc_regime_track__backprop.csv`, rendered by `--plot_track`):
+The spectrum during training (Section 5.9's control runs, 23, 14, 7, 14, and 23 minutes on the RTX 3090; each writes `epc_regime_track__pc_eta{eta}_T{T}.csv` or `docs/reports/data/epc_regime_track__backprop.csv`, rendered by `--plot_track`):
 
 ```
-for cell in "--eta_infer 1e-3 --infer_steps 5" "--eta_infer 1e-3 --infer_steps 1" "--trainer backprop" "--eta_infer 1e-2 --infer_steps 1"; do
+for cell in "--eta_infer 1e-3 --infer_steps 5" "--eta_infer 1e-3 --infer_steps 1" "--trainer backprop" "--eta_infer 1e-2 --infer_steps 1" "--eta_infer 3e-4 --infer_steps 5"; do
   python examples/resnet18_cifar10_demo.py --num_epochs 30 --schedule_epochs 100 --augment --activation gelu \
       --track_regime 50 --eval_every 1 $cell 2>&1 | tee "epc_regime_track_${cell// /_}.log"
 done
 python scripts/epc_analysis.py --plot_track docs/reports/data/epc_regime_track__*.csv
 ```
 
-The control runs of Section 5.9 wrote `epc_regime_track__pc_eta0.001_T5.{csv,html,png,log}`, `epc_regime_track__pc_eta0.001_T1.*`, `epc_regime_track__backprop.*`, and `epc_regime_track__pc_eta0.01_T1.*` in the project root; the CSVs were moved to `docs/reports/data/`. The revision (a) tracking files `docs/reports/data/epc_lambda_track__eta0.001_T5.csv` and `docs/reports/data/epc_lambda_track__eta0.01_T1.csv` were written by the deleted `--track_lambda_max` section with the power-iteration estimator and the batch-summed trainer; they are kept as data and are not reproducible from the current script.
+The control runs of Section 5.9 wrote `epc_regime_track__pc_eta0.001_T5.{csv,html,png,log}`, `epc_regime_track__pc_eta0.001_T1.*`, `epc_regime_track__backprop.*`, and `epc_regime_track__pc_eta0.01_T1.*` in the project root, and the 2026-09-09 run wrote `epc_regime_track__pc_eta0.0003_T5.csv`; the CSVs were moved to `docs/reports/data/`. The revision (a) tracking files `docs/reports/data/epc_lambda_track__eta0.001_T5.csv` and `docs/reports/data/epc_lambda_track__eta0.01_T1.csv` were written by the deleted `--track_lambda_max` section with the power-iteration estimator and the batch-summed trainer; they are kept as data and are not reproducible from the current script.
 
 The 100-epoch runs behind Section 5.8 (about 20 to 45 minutes each on the RTX 3090):
 

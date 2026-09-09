@@ -1,64 +1,128 @@
 """
-ePC analysis: the backprop regime, equilibrium energy profiles, convergence
-spectra, and stability, answering the reviewer's bullets on the resnet18
-ePC-vs-sPC convergence figure (``examples/epc_spc_resnet18_compare.py``).
+Diagnostics for the error-based predictive-coding solver (ePC, ``EPCInference``).
 
-Everything on linear graphs is exact, from ``fabricpc.utils.linear_pc_oracle``;
-the same diagnostics run on nonlinear graphs through
-``EPCInference.error_energy`` (Hessian-vector products, the Lanczos estimator
-``fabricpc.core.epsilon_spectrum``).
+ePC relaxes a network's prediction errors by gradient descent for T steps at
+rate eta, then computes the weight gradients from the relaxed errors. Its
+behavior is set by the curvature of the energy in error coordinates: when
+eta*T*lambda is small on every excited mode, one ePC step reproduces backprop;
+when eta*T is large, the errors reach the predictive-coding equilibrium; and
+for eta above 2/lambda_max the iteration diverges. This script measures those
+quantities where an exact answer exists (linear networks, through
+``fabricpc.utils.linear_pc_oracle``) and on the muPC ResNet-18 of
+``examples/resnet18_cifar10_demo.py`` (through Hessian-vector products of
+``EPCInference.error_energy`` and the Lanczos estimator
+``fabricpc.core.epsilon_spectrum``), and it renders the training-time regime
+probe. The measurements and their interpretation are collected in
+``docs/reports/epc_regime_and_stability_report.md``.
 
-Sections (``--section``; the default set runs on CPU in about a minute):
+Usage
+-----
 
-  backprop_regime      bullet 5. 1-step ePC weight gradients approach
-                       eta * backprop (hidden) and backprop (output) at first
-                       order in eta, both sides means per prediction through
-                       the trainer's normalization; Adam removes the eta
-                       scaling; the 2-epoch resnet18 sweep is fitted by one
-                       effective error-Hessian eigenvalue lambda_eff through
-                       the relaxed fraction 1 - (1 - eta*lambda)^T (a
-                       heuristic); the formula is validated against the
-                       solver on a linear chain.
-  equilibrium_profile  bullets 2, 3. Per-layer equilibrium energies of linear
-                       chains: the spread across layers and its slope follow
-                       the downstream gain (eps_l* = eps_y* P_l^T); the sPC
-                       transient is top-heavy early and approaches the oracle
-                       late; ePC moves every layer at once. The equilibrium
-                       output error r S^-1 damps the learning signal along
-                       mode lambda_S by 1/lambda_S (Innocenti et al. 2024,
-                       Theorem 1), tabulated per depth and init.
-  convergence_spectra  bullets 1, 7. lambda_max / lambda_min of H_z and of the
-                       excited H_eps versus depth, and the steps each solver
-                       needs to contract by 1e-3 at eta = 1/lambda_max, with
-                       two depths measured.
-  stability            bullets 4, 6. lambda_max(H_eps) and the bound
-                       2/lambda_max versus weight scale and depth (the
-                       mechanism behind horizon-dependent collapse); the
-                       Lanczos spectrum agrees with the oracle's excited
-                       extremes and gradient-weighted relaxed fraction; on a
-                       gelu MLP ePC descends at 0.9 eta_max and grows at
-                       1.1 eta_max.
+    python scripts/epc_analysis.py            # four CPU sections; tables to stdout
+    python scripts/epc_analysis.py --section stability convergence_spectra
+    python scripts/epc_analysis.py --plot     # also write the charts named below
+    python scripts/epc_analysis.py --resnet18 # GPU: spectrum at init on the ResNet-18
+    python scripts/epc_analysis.py --plot_track epc_regime_track__pc_eta0.001_T5.csv
 
-GPU, opt-in (CIFAR-10 via tfds, the demo's muPC resnet18):
+CPU sections
+------------
 
-  --resnet18           the excited spectrum at init on one CIFAR batch
-                       (lambda_max, lambda_min, the gradient weight on
-                       negative curvature, the Ritz residuals) -> eta_max and
-                       the regime of the defaults, compared with the sweep's
-                       fitted lambda_eff; the predicted gradient-weighted
-                       relaxed fraction and regime letter per recorded sweep
-                       cell beside its measured accuracy.
+Selected with ``--section``; the default runs all four in about twenty seconds
+on CPU. Each prints tables and, with ``--plot``, writes one chart into the
+current directory (``.html`` always, ``.png`` when kaleido is installed).
+
+backprop_regime -- Is one ePC step backprop?
+    On a tanh chain with a softmax-plus-cross-entropy output, compares the
+    weight gradients after one ePC step with backprop's under the trainer's
+    per-prediction normalization: the hidden layers' gradients are eta times
+    backprop's and the output layer's equals backprop's, to first order in
+    eta (Adam removes the eta factor). Then fits one effective eigenvalue
+    lambda_eff to the recorded 2-epoch ResNet-18 accuracy sweep through the
+    relaxed fraction f(lambda) defined below (a heuristic), and checks
+    f(lambda) against the solver on a linear chain.
+    Chart: ``epc_analysis_sweep_fit``.
+
+equilibrium_profile -- What sets the equilibrium energy spacing across layers?
+    Per-layer equilibrium energies of linear chains from the oracle at weight
+    std 0.5, 1.0, 1.5 and under muPC. The spread across layers and its slope
+    follow the downstream gain, because each hidden error is the output error
+    pulled back through the downstream weights, eps_l* = eps_y* P_l^T. The
+    sPC transient is top-heavy early and reaches the oracle late; ePC moves
+    every layer at once. The equilibrium output error r S^-1 damps the
+    learning signal along each mode of S by that mode's eigenvalue (Innocenti
+    et al. 2024, Theorem 1), tabulated per depth and init.
+    Chart: ``epc_analysis_equilibrium_profile``.
+
+convergence_spectra -- Why does sPC struggle with depth; how many steps does each need?
+    lambda_max and lambda_min of H_z (the state-based solver's Hessian) and of
+    the excited part of H_eps (ePC's) for chains of depth 2 to 20, plain and
+    muPC, and the steps each solver needs to contract every mode by 1e-3 at
+    eta = 1/lambda_max, with measured runs at two depths.
+    Chart: ``epc_analysis_spectra``.
+
+stability -- The largest stable eta; why do runs collapse only after many epochs?
+    lambda_max(H_eps) = 1 + sigma_max(J)^2 and the bound 2/lambda_max against
+    weight scale and depth: a fixed eta crosses the bound as the weights grow
+    during training. At odd T the output layer's weight gradient reverses sign
+    earlier, once eta*(lambda_max - 1) > 1. Checks that Lanczos through
+    ``error_energy`` reproduces the oracle's excited extremes and
+    gradient-weighted relaxed fraction, and shows on a gelu MLP that ePC
+    descends at 0.9*eta_max and grows at 1.1*eta_max. No chart.
+
+GPU section
+-----------
+
+``--resnet18`` runs only this section. It imports the demo module, builds its
+muPC ResNet-18 with the demo's key split for ``--seed`` (default 42, the
+demo's first trial) and ``--activation`` (default gelu), loads one CIFAR-10
+test batch of ``--probe_batch`` images (default 64) through tfds, and runs
+``--lanczos_iters`` Lanczos steps (default 30) on the error energy. It prints
+lambda_max, lambda_min, the gradient weight on negative curvature, and the
+Ritz residuals; eta_max = 2/lambda_max; the regime of the solver defaults;
+lambda_max beside the sweep's fitted lambda_eff; and, for every recorded
+sweep cell, the predicted relaxed fractions and regime letter beside the
+measured accuracy.
+
+Rendering the regime probe
+--------------------------
 
 Tracking the spectrum during training is the demo's job:
 ``examples/resnet18_cifar10_demo.py --track_regime N`` runs
-``fabricpc.training.RegimeProbe`` and writes ``epc_regime_track__*.csv``;
-``--plot_track CSV...`` here renders those files (four panels: the extremes
-against 2/eta, the relaxed fraction and the negative weight, the weight norms,
-the test accuracy).
+``fabricpc.training.RegimeProbe`` every N weight updates and writes
+``epc_regime_track__*.csv``. ``--plot_track CSV...`` here renders each file as
+four stacked panels (lambda_max and |lambda_min| against 2/eta; f_bar with the
+negative-curvature weight; every weight's Frobenius norm; test accuracy per
+epoch), writes ``.html`` and ``.png`` next to the CSV, and exits.
 
-Sweep numbers are the recorded 2-epoch tables in
-``docs/dev_plans_archive/epc_inference_solver.md``; the 100-epoch outcomes are
-the six ``sweep_eta*_steps*.log`` files in the project root. Both predate
+Symbols
+-------
+
+eta, T          ``EPCInference(eta_infer, infer_steps)``: the error learning
+                rate and the number of error updates per weight update.
+eps_t, eps*     node t's prediction error z_t - mu_t, and its equilibrium value.
+H_z, H_eps      Hessians of the energy in latent coordinates (descended by the
+                state-based solver) and in error coordinates (descended by
+                ePC). The excited modes are the eigenvectors along which the
+                starting gradient has a component; only they move from eps = 0.
+lambda_max/min  extreme eigenvalues of a Hessian; ePC is stable for
+                eta < 2/lambda_max(H_eps), and eta_max = 2/lambda_max.
+J               the map from the stacked errors to the output prediction;
+                lambda_max(H_eps) = 1 + sigma_max(J)^2.
+P_l, S, r       on a chain: the product of the weights downstream of hidden
+                layer l; S = I + sum_l P_l^T P_l; the feedforward output
+                residual r = y - mu_y.
+f(lambda)       relaxed fraction 1 - (1 - eta*lambda)^T of a mode after T steps.
+f_bar           f averaged over the excited modes, weighted by the share of the
+                starting gradient each carries (``Regime.f_weighted``).
+lambda_eff      one eigenvalue fitted to the 2-epoch sweep through f.
+
+Recorded data
+-------------
+
+``SWEEP_ACC`` and ``HUNDRED_EPOCH`` below are hard-coded results of earlier
+ResNet-18 runs: the 2-epoch accuracy sweep over (eta, T) (mean of five trials;
+full tables in the report's Appendix A) and the six 100-epoch runs
+(``sweep_eta*_steps*.log`` in the project root, not committed). Both predate
 release 0.5.1's per-prediction gradient normalization.
 """
 
@@ -147,10 +211,10 @@ SEQUENTIAL_BLUE = ["#86b6ef", "#5598e7", "#2a78d6", "#184f95"]
 # =============================================================================
 
 
-def header(title, bullet=None):
+def header(title, question=None):
     print()
     print("=" * 78)
-    print(title if bullet is None else f"{title}   [reviewer bullet {bullet}]")
+    print(title if question is None else f"{title}   [{question}]")
     print("=" * 78)
 
 
@@ -367,7 +431,10 @@ def print_sweep_regime_table(spectrum, title):
 
 
 def section_backprop_regime(args):
-    header("backprop_regime: 1-step ePC against backprop", bullet=5)
+    header(
+        "backprop_regime: 1-step ePC against backprop",
+        question="Is one ePC step backprop?",
+    )
     key = jax.random.PRNGKey(0)
     batch = 8
     structure = build_chain(
@@ -506,7 +573,10 @@ def per_layer_log_energy(eq, structure):
 
 
 def section_equilibrium_profile(args):
-    header("equilibrium_profile: per-layer equilibrium energies", bullet="2, 3")
+    header(
+        "equilibrium_profile: per-layer equilibrium energies",
+        question="What sets the equilibrium energy spacing across layers?",
+    )
     key = jax.random.PRNGKey(1)
     batch = 8
     width, d_in, d_out = 32, 32, 10
@@ -636,7 +706,10 @@ def section_equilibrium_profile(args):
 
 
 def section_convergence_spectra(args):
-    header("convergence_spectra: Hessian spectra and steps to contract", bullet="1, 7")
+    header(
+        "convergence_spectra: Hessian spectra and steps to contract",
+        question="Why does sPC struggle with depth; how many steps does each need?",
+    )
     key = jax.random.PRNGKey(2)
     batch = 8
     width, d_in, d_out = 16, 16, 4
@@ -733,7 +806,10 @@ def section_convergence_spectra(args):
 
 
 def section_stability(args):
-    header("stability: the bound 2/lambda_max(H_eps)", bullet="4, 6")
+    header(
+        "stability: the bound 2/lambda_max(H_eps)",
+        question="The largest stable eta; why do runs collapse only after many epochs?",
+    )
     key = jax.random.PRNGKey(3)
     batch = 8
     width, d_in, d_out = 32, 32, 10

@@ -35,8 +35,9 @@ Includes cosine LR schedule with warmup and optional data augmentation
 
 --inference selects the PC solver: epc (EPCInference, error-parameterized,
 default) or spc (state-based InferenceSGDNormClip). Unset --eta_infer and
---infer_steps fall back to EPCInference's defaults for epc and to this
-demo's spc settings.
+--infer_steps fall back to this demo's settings: eta_infer 3e-4 and
+infer_steps 5 for epc, the point that stays stable and backprop-like over
+the 100-epoch runs below; eta_infer 0.2 and infer_steps 120 for spc.
 
 --trainer backprop trains the identical graph (muPC init and edge scaling
 included) with end-to-end autodiff instead of iterative PC inference;
@@ -57,14 +58,18 @@ Usage:
 
 Results (RTX 3090, CUDA 13, JAX 0.10.2)
 ---------------------------------------
-ePC trains >40X faster per epoch than sPC (11 s vs 487 s) and reaches higher
-accuracy at 100 epochs. At these settings ePC is in its backprop regime: one
-step from zero error leaves each error at -eta_infer times the backprop
-activation gradient, so the local weight gradients are backprop's scaled by
-eta_infer on hidden layers and unscaled on the output, and AdamW normalizes
-the scaling away; the --infer_steps 1 run below matches the backprop trainer
-on the same graph (76.73% vs 77.11%). sPC's error signal decays with depth,
-so its deep layers learn slowly within 120 steps.
+ePC at this demo's defaults (eta_infer 3e-4, infer_steps 5) trains stably
+through the 100-epoch schedule to 75.85%, against 77.11% for the backprop
+trainer on the same graph and 50.17% for sPC. At these settings ePC is in
+its backprop regime (f_bar 0.003 at init, defined below): one step from zero
+error leaves each error at -eta_infer times the backprop activation
+gradient, so the local weight gradients are backprop's scaled by eta_infer
+on hidden layers and unscaled on the output, and AdamW normalizes the
+scaling away; the --infer_steps 1 run below matches the backprop trainer
+(76.73% vs 77.11%). Settings that relax the errors further toward the PC
+equilibrium (larger eta_infer or infer_steps) collapse partway through long
+runs; see the sweep and the control runs below. sPC's error signal decays
+with depth, so its deep layers learn slowly within 120 steps.
 
 Choosing eta_infer and infer_steps
 ---------------------------------
@@ -87,7 +92,8 @@ on a fixed 64-sample test batch; also scripts/epc_analysis.py --resnet18):
 
 At init on this graph: lambda_max = 16.4, so eta_infer < 0.12; lambda_min =
 -0.42, an indefinite Hessian with 1.2% of the gradient on negative curvature;
-the defaults (1e-3, 5) read f_bar 0.01 and f_max 0.08, backprop-like.
+the defaults (3e-4, 5) read f_bar 0.003 and f_max 0.02, and EPCInference's
+own defaults (1e-3, 5) read f_bar 0.01 and f_max 0.08, both backprop-like.
 lambda_max = 1 + sigma_max(J)^2, J the map from the hidden errors to the
 output prediction, grows during training, so a fixed eta_infer can cross the
 bound late in a run. The 100-epoch sweep (sweep_eta*_steps*.log; batch-summed
@@ -96,10 +102,14 @@ weight gradients, before release 0.5.1's per-prediction normalization):
     eta_infer  infer_steps  final accuracy
     0.001      1            76.73%   (backprop trainer on the same graph: 77.11%)
     0.001      2            75.76%
-    0.001      5 (default)   9.75%   (54.76% at epoch 10, at chance by epoch 20)
+    0.001      5             9.75%   (EPCInference's defaults; 54.76% at epoch 10, at chance by epoch 20)
     0.01       1             9.92%   (at chance by epoch 10)
     0.01       2             9.88%
     0.01       5            10.13%
+
+Under the normalized trainer this demo's defaults (3e-4, 5) hold the backprop
+regime through the full schedule and reach 75.85% (the run below), while
+(1e-3, 5) still collapses (the control runs below).
 
 At 2 epochs even eta_infer*infer_steps = 0.16 still trains (the sweep tables
 of examples/epc_spc_resnet18_compare.py, in
@@ -120,8 +130,8 @@ accuracy per epoch, to epc_regime_track__{trainer}_eta{eta}_T{T}.csv
 probe.summary(). scripts/epc_analysis.py --plot_track CSV renders the file.
 Supplying the probe forces a device sync on every batch, probed or not.
 
-Four control runs, each the first 30 epochs of the 100-epoch schedule at seed
-42, probed every 50 updates (2026-09-08, the normalized trainer):
+Five control runs, each the first 30 epochs of the 100-epoch schedule at seed
+42, probed every 50 updates (2026-09-08 and 2026-09-09, the normalized trainer):
 
     python examples/resnet18_cifar10_demo.py --num_epochs 30 --schedule_epochs 100 \
         --augment --activation gelu --track_regime 50 --eval_every 1 [cell]
@@ -129,31 +139,36 @@ Four control runs, each the first 30 epochs of the 100-epoch schedule at seed
     cell                               acc. ep 30  lambda_max at epochs 1/8/12/15/30  flags (epoch)
     --eta_infer 1e-3 --infer_steps 5    9.9%       22 / 27 / 103 / 31060 / 1          reversal 14, unstable 15, chance 15
     --eta_infer 1e-3 --infer_steps 1   67.7%       22 / 17 / 20 / 21 / 29             none
+    --eta_infer 3e-4 --infer_steps 5   67.8%       22 / 18 / 21 / 23 / 34             none
     --trainer backprop                 69.0%       22 / 16 / 18 / 19 / 24             none
     --eta_infer 1e-2 --infer_steps 1   10.0%       22 / 1 / 1 / 1 / 1                 reversal 6, unstable 7, chance 7
                                                    (167 at epoch 6, 6132 at epoch 7)
 
-lambda_max runs away only in the two collapsing ePC cells. Under backprop and
-under ePC at infer_steps 1 it drifts about 1% per epoch, and the Frobenius
-norm of every convolution weight falls in all four runs, so the growth is
-driven by ePC's relaxation, not by the weight scale: the lever is eta_infer
-and infer_steps (or a rate that follows lambda_max), not weight-norm control.
+lambda_max runs away only in the two collapsing ePC cells. Under backprop,
+under ePC at infer_steps 1, and at this demo's defaults (3e-4, 5) it drifts 1
+to 1.5% per epoch, and the Frobenius norm of every convolution weight falls in
+all five runs, so the growth is driven by ePC's relaxation, not by the weight
+scale: the lever is eta_infer and infer_steps (or a rate that follows
+lambda_max), not weight-norm control.
 In both collapses the reversal flag fired one probe before the stability
 crossing, and f_bar had crossed 0.1 two to three epochs before the reversal
 while accuracy was still improving, so f_bar is the early warning to read off
 the CSV. Per-epoch tables and the mechanism:
 docs/reports/epc_regime_and_stability_report.md, Sections 5.8 and 5.9.
 
-Smoke Test (2 epochs)
+Smoke Test (2 epochs; eta_infer 3e-4, infer_steps 5)
 python examples/resnet18_cifar10_demo.py --inference epc
-Test Accuracy: 39.26%
+Test Accuracy: 38.57%
 
 python examples/resnet18_cifar10_demo.py --inference spc
 Test Accuracy: 33.89%
 
-============================================================
+ePC at this demo's defaults, 100 epochs:
 python examples/resnet18_cifar10_demo.py --num_epochs 100 --eval_every 10 --augment --activation gelu --inference epc --eta_infer 3e-4 --infer_steps 5
-ePC at --infer_steps 5 and --eta_infer 3e-4 is stable and backprop-like. Higher infer_steps or inference rate that would lead to ePC convergence are currently unstable over long training runs.
+ePC at eta_infer 3e-4 and infer_steps 5 is stable and backprop-like over the
+full schedule. Larger eta_infer or infer_steps, the direction that would
+relax the errors toward the PC equilibrium, collapses partway through long
+runs (the sweep and the control runs above).
 
 ePC regime at init: eta*T*lambda_max = 0.0247 (gradient-weighted relaxed fraction 0.00, fastest mode 0.02): backprop-like spectrum on a 64-sample test batch: lambda_max 16.4 (eta_max = 2/lambda_max = 0.122), lambda_min -0.425, f_bar 0.003, gradient weight on negative curvature 0.012, Ritz residual 4.57e-04
 Training for 100 epochs (JIT compilation on first batch)...
@@ -273,25 +288,26 @@ def get_activation(name):
     return factories[name]()
 
 
+# Inference settings used when --eta_infer / --infer_steps are unset. The ePC
+# point is the one that stays stable and backprop-like over the 100-epoch runs
+# recorded in the module docstring.
+EPC_DEFAULTS = {"eta_infer": 3e-4, "infer_steps": 5}
+SPC_DEFAULTS = {"eta_infer": 0.2, "infer_steps": 120}
+
+
 def make_inference(args):
     """PC solver from --inference. Unset --eta_infer/--infer_steps fall back
-    to the solver's defaults."""
+    to EPC_DEFAULTS for epc and SPC_DEFAULTS for spc."""
+    defaults = EPC_DEFAULTS if args.inference == "epc" else SPC_DEFAULTS
+    eta_infer = defaults["eta_infer"] if args.eta_infer is None else args.eta_infer
+    infer_steps = (
+        defaults["infer_steps"] if args.infer_steps is None else args.infer_steps
+    )
     if args.inference == "epc":
-        overrides = {
-            k: v
-            for k, v in [
-                ("eta_infer", args.eta_infer),
-                ("infer_steps", args.infer_steps),
-            ]
-            if v is not None
-        }
-        return EPCInference(**overrides)
-    else:
-        return InferenceSGDNormClip(
-            eta_infer=0.2 if args.eta_infer is None else args.eta_infer,
-            infer_steps=120 if args.infer_steps is None else args.infer_steps,
-            max_norm=1.0,
-        )
+        return EPCInference(eta_infer=eta_infer, infer_steps=infer_steps)
+    return InferenceSGDNormClip(
+        eta_infer=eta_infer, infer_steps=infer_steps, max_norm=1.0
+    )
 
 
 PROBE_BATCH = 64
@@ -785,13 +801,15 @@ def parse_args():
         "--infer_steps",
         type=int,
         default=None,
-        help="Inference steps (default: 120 for spc, EPCInference's default for epc)",
+        help=f"Inference steps (default: {EPC_DEFAULTS['infer_steps']} for epc, "
+        f"{SPC_DEFAULTS['infer_steps']} for spc)",
     )
     parser.add_argument(
         "--eta_infer",
         type=float,
         default=None,
-        help="Inference rate (default: 0.2 for spc, EPCInference's default for epc)",
+        help=f"Inference rate (default: {EPC_DEFAULTS['eta_infer']:g} for epc, "
+        f"{SPC_DEFAULTS['eta_infer']:g} for spc)",
     )
     parser.add_argument(
         "--lr", type=float, default=0.001, help="Learning rate (default: 0.001)"
